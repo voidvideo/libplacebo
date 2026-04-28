@@ -1090,3 +1090,40 @@ bool pl_queue_peek(pl_queue p, int idx, struct pl_source_frame *out)
     pl_mutex_unlock(&p->lock_weak);
     return ok;
 }
+
+bool pl_queue_peek_mapped(pl_queue p, int idx, struct pl_frame *out)
+{
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+
+    bool ok = false;
+    if (idx >= 0 && idx < p->queue.num) {
+        struct entry *entry = p->queue.elem[idx];
+        if (map_entry(p, entry)) {
+            *out = entry->frame;
+            ok = true;
+        }
+    }
+
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return ok;
+}
+
+void pl_queue_advance(pl_queue p, double pts)
+{
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+
+    int culled = 0;
+    for (int i = 1; i < p->queue.num; i++) {
+        if (p->queue.elem[i]->pts <= pts) {
+            entry_cull(p, p->queue.elem[i - 1], true);
+            culled++;
+        }
+    }
+    PL_ARRAY_REMOVE_RANGE(p->queue, 0, culled);
+
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+}

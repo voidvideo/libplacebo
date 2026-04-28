@@ -239,6 +239,30 @@ PL_API double pl_queue_pts_offset(pl_queue queue);
 // it is done being used by the user.
 PL_API bool pl_queue_peek(pl_queue queue, int idx, struct pl_source_frame *out);
 
+// Inspect the contents of the Nth queued frame as a fully-mapped pl_frame,
+// without advancing or culling the queue. Returns false if `idx` is out of
+// range or if mapping the frame failed.
+//
+// This is intended for callers that want to drive their own frame selection
+// (custom mixer, cadence-locked playback, motion compensation) instead of
+// using `pl_queue_update`. Walk the queue with `pl_queue_peek_mapped(idx, ...)`,
+// pick the frame you want, render it via `pl_render_image`. Use
+// `pl_queue_advance` to control culling on your own schedule.
+//
+// Note: triggers GPU upload of the frame's textures via the source's `map`
+// callback, identical to the upload path used internally by `pl_queue_update`.
+PL_API bool pl_queue_peek_mapped(pl_queue queue, int idx, struct pl_frame *out);
+
+// Cull frames from the queue whose pts is <= `pts`, keeping the most recent
+// past frame as idx 0 (matching the invariant of `pl_queue_update`'s internal
+// advance logic). This is the cull half of `pl_queue_update` exposed without
+// the selection/interpolation logic.
+//
+// Use this in conjunction with `pl_queue_peek_mapped` to implement custom
+// mixers: peek to inspect/render frames, advance to release frames you no
+// longer need.
+PL_API void pl_queue_advance(pl_queue queue, double pts);
+
 PL_API_END
 
 #endif // LIBPLACEBO_FRAME_QUEUE_H
