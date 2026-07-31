@@ -92,6 +92,36 @@ struct pl_custom_shader {
     // Optional, if left as 0, means the shader can be dispatched at any size.
     int output_w;
     int output_h;
+
+    // Promises that `prelude`, `header` and `body` point at storage that is
+    // IMMUTABLE and never freed, and that no two distinct texts ever share an
+    // address. Optional; defaults to false, which is always safe.
+    //
+    // WHAT IT BUYS. `pl_dispatch` finds an already-compiled pass by hashing the
+    // shader source it just assembled. Normally these three strings are copied
+    // into that hash input, so re-dispatching an unchanged shader re-copies and
+    // re-hashes the whole program text on every single dispatch, purely to
+    // arrive at a key that has not changed. With this set, only the POINTERS
+    // enter the key (see `pl_str_builder_const_str`), so the cost of the lookup
+    // stops scaling with the size of the shader. For a caller dispatching many
+    // large compute passes per frame this is the difference between the pass
+    // cache being free and it being the frame budget.
+    //
+    // WHAT IT COSTS IF THE PROMISE IS BROKEN, and why it is off by default:
+    //
+    //   * Text that CHANGES behind a stable address keeps running the program
+    //     compiled from the OLD text, because the key does not change. This
+    //     fails silently and looks like the edit did not take.
+    //   * Two DIFFERENT texts at the same address -- which is what happens if
+    //     the storage is freed and reused -- collide in the same way.
+    //   * The same text at two addresses merely compiles twice. Wasteful, not
+    //     wrong.
+    //
+    // So the intended storage is a string literal, or an append-only arena that
+    // is never written to again and never freed. It is NOT enough for the
+    // pointer to be stable only until the next dispatch: `pl_dispatch` may keep
+    // the compiled pass, and therefore the key, for its whole lifetime.
+    bool static_text;
 };
 
 // Append custom shader code, including extra descriptors and variables, to an
