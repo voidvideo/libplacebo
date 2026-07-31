@@ -222,6 +222,12 @@ size_t sh_buf_desc_size(const struct pl_shader_desc *buf_desc);
 #define sh_append_str(sh, buf, str) \
     pl_str_builder_str((sh)->buffers[buf], str)
 
+// Append text BY REFERENCE. Only the pointer is recorded, so the caller must
+// guarantee the text is immutable and outlives every pass generated from it --
+// see `pl_custom_shader.static_text`, which is the only thing that sets this.
+#define sh_append_const_str(sh, buf, str) \
+    pl_str_builder_const_str((sh)->buffers[buf], str)
+
 #define GLSLP(...) sh_append(sh, SH_BUF_PRELUDE, __VA_ARGS__)
 #define GLSLH(...) sh_append(sh, SH_BUF_HEADER, __VA_ARGS__)
 #define GLSL(...)  sh_append(sh, SH_BUF_BODY, __VA_ARGS__)

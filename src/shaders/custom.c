@@ -55,10 +55,30 @@ bool pl_shader_custom(pl_shader sh, const struct pl_custom_shader *params)
         GLSLP("#define %s "$"\n", sc.name, sh_const(sh, sc));
     }
 
-    if (params->prelude)
-        GLSLP("// pl_shader_custom prelude: \n%s\n", params->prelude);
-    if (params->header)
-        GLSLH("// pl_shader_custom header: \n%s\n", params->header);
+    // `static_text` routes the three source strings through
+    // `pl_str_builder_const_str`, which records the POINTER rather than copying
+    // the text. The pass signature is a hash of what was recorded, so this is
+    // what stops the lookup cost scaling with the size of the shader. See the
+    // contract on `pl_custom_shader.static_text` -- it is the caller's promise
+    // that address identity is text identity.
+    if (params->prelude) {
+        GLSLP("// pl_shader_custom prelude: \n");
+        if (params->static_text) {
+            sh_append_const_str(sh, SH_BUF_PRELUDE, params->prelude);
+            GLSLP("\n");
+        } else {
+            GLSLP("%s\n", params->prelude);
+        }
+    }
+    if (params->header) {
+        GLSLH("// pl_shader_custom header: \n");
+        if (params->static_text) {
+            sh_append_const_str(sh, SH_BUF_HEADER, params->header);
+            GLSLH("\n");
+        } else {
+            GLSLH("%s\n", params->header);
+        }
+    }
 
     if (params->description)
         sh_describef(sh, "%s", params->description);
@@ -77,12 +97,21 @@ bool pl_shader_custom(pl_shader sh, const struct pl_custom_shader *params)
             }
         }
 
-        GLSL("// pl_shader_custom \n"
-             "%s                  \n"
-             "{                   \n"
-             "%s                  \n"
-             "}                   \n",
-             output_decl, params->body);
+        if (params->static_text) {
+            GLSL("// pl_shader_custom \n"
+                 "%s                  \n"
+                 "{                   \n",
+                 output_decl);
+            sh_append_const_str(sh, SH_BUF_BODY, params->body);
+            GLSL("\n}                 \n");
+        } else {
+            GLSL("// pl_shader_custom \n"
+                 "%s                  \n"
+                 "{                   \n"
+                 "%s                  \n"
+                 "}                   \n",
+                 output_decl, params->body);
+        }
     }
 
     return true;
