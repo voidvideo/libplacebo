@@ -687,9 +687,21 @@ void gl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
 
     case PL_PASS_COMPUTE:
         gl_timer_begin(gpu, params->timer);
-        gl->DispatchCompute(params->compute_groups[0],
-                            params->compute_groups[1],
-                            params->compute_groups[2]);
+        if (params->indirect_buf) {
+            // Visibility for the command processor is established by the
+            // GL_COMMAND_BARRIER_BIT that gl_buf_create() folds into
+            // `buf_gl->barrier`; unbind_desc() issues that glMemoryBarrier as
+            // soon as the writing pass releases the SSBO binding.
+            struct pl_buf_gl *ind_gl = PL_PRIV(params->indirect_buf);
+            gl->BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ind_gl->buffer);
+            gl->DispatchComputeIndirect((GLintptr) (ind_gl->offset +
+                                                    params->indirect_offset));
+            gl->BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+        } else {
+            gl->DispatchCompute(params->compute_groups[0],
+                                params->compute_groups[1],
+                                params->compute_groups[2]);
+        }
         gl_timer_end(gpu, params->timer);
         break;
 

@@ -215,6 +215,7 @@ pl_gpu pl_gpu_finalize(struct pl_gpu_t *gpu)
         LOG(PRIu32, max_group_size[2]);
     }
     LOG(PRIu32, subgroup_size);
+    LOG("d", fp16_storage);
     LOG(PRIi16, min_gather_offset);
     LOG(PRIi16, max_gather_offset);
 #undef LOG_STRUCT

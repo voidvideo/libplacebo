@@ -592,6 +592,8 @@ pl_buf pl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
     require(!params->uniform || params->size <= gpu->limits.max_ubo_size);
     require(!params->storable || params->size <= gpu->limits.max_ssbo_size);
     require(!params->drawable || params->size <= gpu->limits.max_vbo_size);
+    require(!params->indirect || gpu->limits.indirect_dispatch);
+
     if (params->host_mapped) {
         require(params->size <= gpu->limits.max_mapped_size);
         require(params->memory_type != PL_BUF_MEM_DEVICE ||
@@ -1243,9 +1245,17 @@ void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
         break;
     }
     case PL_PASS_COMPUTE:
-        for (int i = 0; i < PL_ARRAY_SIZE(params->compute_groups); i++) {
-            require(params->compute_groups[i] >= 0);
-            require(params->compute_groups[i] <= gpu->limits.max_dispatch[i]);
+        if (params->indirect_buf) {
+            pl_buf ind = params->indirect_buf;
+            require(gpu->limits.indirect_dispatch);
+            require(ind->params.indirect);
+            require(params->indirect_offset % 4 == 0);
+            require(params->indirect_offset + 3 * sizeof(uint32_t) <= ind->params.size);
+        } else {
+            for (int i = 0; i < PL_ARRAY_SIZE(params->compute_groups); i++) {
+                require(params->compute_groups[i] >= 0);
+                require(params->compute_groups[i] <= gpu->limits.max_dispatch[i]);
+            }
         }
         break;
     case PL_PASS_INVALID:
