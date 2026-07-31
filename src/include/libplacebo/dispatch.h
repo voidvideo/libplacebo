@@ -131,7 +131,16 @@ struct pl_dispatch_compute_params {
     // The number of work groups to dispatch in each dimension. If this is left
     // as [0} and `width/height` are both set, the number of work groups will
     // be inferred from the shader's `compute_group_sizes`.
+    //
+    // Ignored if `indirect_buf` is set.
     int dispatch_size[3];
+
+    // Optional. If set, the work group count is read from GPU memory instead
+    // of from `dispatch_size`: three consecutive `uint32_t` values (X, Y, Z)
+    // at byte offset `indirect_offset`. See `pl_pass_run_params.indirect_buf`
+    // for the full semantics and requirements.
+    pl_buf indirect_buf;
+    size_t indirect_offset;
 
     // If set, simulate vertex attributes (similar to `pl_dispatch_finish`)
     // according to the given dimensions. The first two components of the

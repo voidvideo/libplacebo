@@ -520,6 +520,26 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
         gpu->glsl.max_gather_offset = limits.maxTexelGatherOffset;
     }
 
+    // fp16 storage. Requested as a *recommended* (optional) feature, so this
+    // reports what the device actually granted; devices without it simply
+    // report false rather than failing device creation.
+    //
+    // Both spellings must be checked: vk_features_normalize() emits
+    // VkPhysicalDeviceVulkan11Features on Vulkan >= 1.1 and the standalone
+    // VkPhysicalDevice16BitStorageFeatures below that.
+    {
+        const VkPhysicalDeviceVulkan11Features *vk11_feats;
+        vk11_feats = vk_find_struct(&vk->features,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
+        const VkPhysicalDevice16BitStorageFeatures *storage16;
+        storage16 = vk_find_struct(&vk->features,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES);
+
+        gpu->glsl.fp16_storage =
+            (vk11_feats && vk11_feats->storageBuffer16BitAccess) ||
+            (storage16 && storage16->storageBuffer16BitAccess);
+    }
+
     const size_t max_size = vk_malloc_avail(vk->ma, 0);
     const size_t max_vram = vk_malloc_avail(vk->ma, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     gpu->limits = (struct pl_gpu_limits) {
@@ -561,6 +581,8 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
             limits.maxComputeWorkGroupCount[1],
             limits.maxComputeWorkGroupCount[2],
         },
+        // vkCmdDispatchIndirect is core Vulkan 1.0, unconditionally available
+        .indirect_dispatch  = true,
         .fragment_queues    = vk->pool_graphics->num_queues,
         .compute_queues     = vk->pool_compute->num_queues,
     };

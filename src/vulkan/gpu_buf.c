@@ -164,6 +164,14 @@ pl_buf vk_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
         mem_type = PL_BUF_MEM_DEVICE;
     }
 
+    if (params->indirect) {
+        mparams.buf_usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        // vkCmdDispatchIndirect requires the effective offset to be a multiple
+        // of 4; since we suballocate, the slice base must be aligned too.
+        *align = pl_lcm(*align, 4);
+        mem_type = PL_BUF_MEM_DEVICE;
+    }
+
     if (params->host_writable || params->initial_data) {
         // Buffers should be written using mapped memory if possible
         mparams.optimal = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;

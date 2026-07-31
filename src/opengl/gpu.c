@@ -220,6 +220,11 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     if (glsl->compute) {
         for (int i = 0; i < 3; i++)
             geti(GL_MAX_COMPUTE_WORK_GROUP_COUNT, i, &limits->max_dispatch[i]);
+
+        // glDispatchComputeIndirect ships with compute shaders themselves
+        // (GL 4.3 / GL_ARB_compute_shader), so this is implied by glsl->compute
+        // above; the function pointer check guards against a partial loader.
+        limits->indirect_dispatch = gl->DispatchComputeIndirect != NULL;
     }
 
     // Query import/export support
@@ -429,6 +434,8 @@ pl_buf gl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
             buf_gl->barrier |= GL_UNIFORM_BARRIER_BIT;
         if (params->drawable)
             buf_gl->barrier |= GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT;
+        if (params->indirect)
+            buf_gl->barrier |= GL_COMMAND_BARRIER_BIT;
     }
 
     RELEASE_CURRENT();

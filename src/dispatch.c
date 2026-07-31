@@ -1344,6 +1344,10 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
         rparams->compute_groups[0] = num_x;
         rparams->compute_groups[1] = num_y;
         rparams->compute_groups[2] = 1;
+        // `pass` is cached; clear any indirect source left over from a
+        // previous `pl_dispatch_compute` on the same cached pass.
+        rparams->indirect_buf = NULL;
+        rparams->indirect_offset = 0;
     } else {
         // Update the scissors for performance
         rparams->scissors = rc_norm;
@@ -1423,6 +1427,12 @@ bool pl_dispatch_compute(pl_dispatch dp, const struct pl_dispatch_compute_params
     for (int i = 0; i < sh->vars.num; i++)
         update_pass_var(dp, pass, &sh->vars.elem[i], &pass->vars[i]);
 
+    // Update the indirect source. Always assigned (even when NULL) because
+    // `pass` is cached and reused across dispatches, so a stale buffer from a
+    // previous indirect dispatch must not leak into a direct one.
+    rparams->indirect_buf = params->indirect_buf;
+    rparams->indirect_offset = params->indirect_offset;
+
     // Update the dispatch size
     int groups = 1;
     for (int i = 0; i < 3; i++) {
@@ -1430,7 +1440,7 @@ bool pl_dispatch_compute(pl_dispatch dp, const struct pl_dispatch_compute_params
         rparams->compute_groups[i] = params->dispatch_size[i];
     }
 
-    if (!groups) {
+    if (!groups && !params->indirect_buf) {
         pl_assert(params->width && params->height);
         int block_w = sh->group_size[0],
             block_h = sh->group_size[1],

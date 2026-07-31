@@ -950,9 +950,33 @@ void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
         break;
     }
     case PL_PASS_COMPUTE:
-        vk->CmdDispatch(cmd->buf, params->compute_groups[0],
-                        params->compute_groups[1],
-                        params->compute_groups[2]);
+        if (params->indirect_buf) {
+            pl_buf ind = params->indirect_buf;
+            struct pl_buf_vk *ind_vk = PL_PRIV(ind);
+
+            // The work group counts are consumed by the command processor, not
+            // by a shader stage, so the producing access (typically a
+            // VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT from a previous compute
+            // pass, recorded in this buffer's vk_sem) must be made available
+            // to VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT at
+            // VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT. vk_buf_barrier() looks up
+            // the last access scope and emits exactly that dependency.
+            //
+            // The barrier covers the whole buffer, not just the 12 bytes we
+            // read: `vk_sem` tracking is per-buffer, so a narrower range would
+            // let the read-coalescing in vk_sem_barrier() skip a later barrier
+            // for a *different* offset in the same buffer.
+            vk_buf_barrier(gpu, cmd, ind, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                           VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+                           0, ind->params.size, false);
+
+            vk->CmdDispatchIndirect(cmd->buf, ind_vk->mem.buf,
+                                    ind_vk->mem.offset + params->indirect_offset);
+        } else {
+            vk->CmdDispatch(cmd->buf, params->compute_groups[0],
+                            params->compute_groups[1],
+                            params->compute_groups[2]);
+        }
         break;
     case PL_PASS_INVALID:
     case PL_PASS_TYPE_COUNT:

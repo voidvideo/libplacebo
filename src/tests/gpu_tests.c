@@ -328,6 +328,209 @@ static void pl_planar_tests(pl_gpu gpu)
     pl_tex_destroy(gpu, &tex);
 }
 
+// Tests GPU-computed, indirectly-dispatched compute work group counts.
+//
+// Round structure, mirroring the intended real usage (an iterative pass whose
+// next round's size is decided on-GPU and which must dispatch *nothing* once it
+// converges):
+//
+//   1. host writes the desired count into `cfg` (a plain SSBO)
+//   2. pass "writer" (1 work group) reads `cfg` and writes uvec3(count, 1, 1)
+//      into `ctrl`, which is both `storable` and `indirect`
+//   3. pass "counter" is dispatched indirectly from `ctrl`, and each work
+//      group does an atomicAdd on `out`
+//   4. host reads `out` back and requires it to equal the desired count
+//
+// Step 2 -> step 3 is the write-then-indirect-read hazard: if the barrier
+// before vkCmdDispatchIndirect does not name INDIRECT_COMMAND_READ at
+// DRAW_INDIRECT, the command processor may observe stale contents of `ctrl`.
+static void pl_indirect_dispatch_tests(pl_gpu gpu)
+{
+    if (!gpu->limits.indirect_dispatch || !gpu->glsl.compute)
+        return;
+    if (gpu->glsl.version < 430 && !gpu->glsl.vulkan)
+        return;
+    printf("pl_indirect_dispatch_tests:\n");
+
+    // 3 x uint32 work group counts, plus padding to keep the layout obvious
+    const size_t ctrl_size = 4 * sizeof(uint32_t);
+    if (ctrl_size > gpu->limits.max_ssbo_size)
+        return;
+
+    void *tmp = pl_tmp(NULL);
+    const char *ver = pl_asprintf(tmp, "#version %d\n", PL_MAX(gpu->glsl.version, 430));
+
+    const char *writer_glsl = pl_asprintf(tmp,
+        "%s"
+        "layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;   \n"
+        "layout(std430, binding = 0) readonly buffer Cfg { uint desired; }; \n"
+        "layout(std430, binding = 1) writeonly buffer Ctrl { uint groups[4]; };\n"
+        "void main() {                                                      \n"
+        "    groups[0] = desired;                                           \n"
+        "    groups[1] = 1u;                                                \n"
+        "    groups[2] = 1u;                                                \n"
+        "    groups[3] = 0u;                                                \n"
+        "}", ver);
+
+    const char *counter_glsl = pl_asprintf(tmp,
+        "%s"
+        "layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;   \n"
+        "layout(std430, binding = 0) buffer Out { uint tally; };            \n"
+        "void main() {                                                      \n"
+        "    atomicAdd(tally, 1u);                                          \n"
+        "}", ver);
+
+    pl_buf cfg = pl_buf_create(gpu, pl_buf_params(
+        .size          = sizeof(uint32_t),
+        .storable      = true,
+        .host_writable = true,
+    ));
+
+    pl_buf ctrl = pl_buf_create(gpu, pl_buf_params(
+        .size          = ctrl_size,
+        .storable      = true,
+        .indirect      = true,
+        .host_readable = true,
+    ));
+
+    pl_buf out = pl_buf_create(gpu, pl_buf_params(
+        .size          = sizeof(uint32_t),
+        .storable      = true,
+        .host_writable = true,
+        .host_readable = true,
+    ));
+
+    REQUIRE(cfg);
+    REQUIRE(ctrl);
+    REQUIRE(out);
+    REQUIRE(ctrl->params.indirect);
+
+    pl_pass writer = pl_pass_create(gpu, pl_pass_params(
+        .type            = PL_PASS_COMPUTE,
+        .glsl_shader     = writer_glsl,
+        .num_descriptors = 2,
+        .descriptors     = (struct pl_desc[]) {{
+            .name    = "Cfg",
+            .type    = PL_DESC_BUF_STORAGE,
+            .binding = 0,
+            .access  = PL_DESC_ACCESS_READONLY,
+        }, {
+            .name    = "Ctrl",
+            .type    = PL_DESC_BUF_STORAGE,
+            .binding = 1,
+            .access  = PL_DESC_ACCESS_WRITEONLY,
+        }},
+    ));
+
+    pl_pass counter = pl_pass_create(gpu, pl_pass_params(
+        .type            = PL_PASS_COMPUTE,
+        .glsl_shader     = counter_glsl,
+        .num_descriptors = 1,
+        .descriptors     = (struct pl_desc[]) {{
+            .name    = "Out",
+            .type    = PL_DESC_BUF_STORAGE,
+            .binding = 0,
+            .access  = PL_DESC_ACCESS_READWRITE,
+        }},
+    ));
+
+    REQUIRE(writer);
+    REQUIRE(counter);
+
+    // Deliberately includes 0 twice: once cold, and once right after a
+    // non-zero round, which is the case a stale indirect read would pass by
+    // accident if only tested from a zeroed buffer.
+    static const uint32_t rounds[] = { 7, 0, 1, 64, 0, 0, 3 };
+
+    for (int r = 0; r < PL_ARRAY_SIZE(rounds); r++) {
+        const uint32_t desired = rounds[r];
+
+        // Reset the tally and publish the desired count
+        const uint32_t zero = 0;
+        pl_buf_write(gpu, out, 0, &zero, sizeof(zero));
+        pl_buf_write(gpu, cfg, 0, &desired, sizeof(desired));
+
+        // Round 1: compute the work group count on the GPU
+        pl_pass_run(gpu, pl_pass_run_params(
+            .pass = writer,
+            .desc_bindings = (struct pl_desc_binding[]) {
+                { .object = cfg },
+                { .object = ctrl },
+            },
+            .compute_groups = { 1, 1, 1 },
+        ));
+
+        // Round 2: dispatch from that count without ever reading it back
+        pl_pass_run(gpu, pl_pass_run_params(
+            .pass = counter,
+            .desc_bindings = (struct pl_desc_binding[]) {
+                { .object = out },
+            },
+            .indirect_buf    = ctrl,
+            .indirect_offset = 0,
+            // Poison: must be ignored entirely in favour of `ctrl`
+            .compute_groups  = { 999, 999, 999 },
+        ));
+
+        uint32_t tally = 0xDEADBEEF;
+        REQUIRE(pl_buf_read(gpu, out, 0, &tally, sizeof(tally)));
+
+        uint32_t groups[4] = {0};
+        REQUIRE(pl_buf_read(gpu, ctrl, 0, groups, sizeof(groups)));
+
+        printf("- round %d: requested %"PRIu32" groups, buffer held (%"PRIu32
+               ", %"PRIu32", %"PRIu32"), shader ran %"PRIu32" times%s\n",
+               r, desired, groups[0], groups[1], groups[2], tally,
+               desired == 0 ? "  [zero-workgroup case]" : "");
+
+        REQUIRE_CMP(groups[0], ==, desired, PRIu32);
+        REQUIRE_CMP(tally, ==, desired, PRIu32);
+    }
+
+    // Non-zero indirect offset, to prove the offset is honoured rather than
+    // the buffer base being used
+    if (ctrl->params.size >= 4 * sizeof(uint32_t)) {
+        pl_buf ctrl2 = pl_buf_create(gpu, pl_buf_params(
+            .size          = 8 * sizeof(uint32_t),
+            .storable      = true,
+            .indirect      = true,
+            .host_writable = true,
+        ));
+        REQUIRE(ctrl2);
+
+        // groups at byte offset 16 say 5; base of the buffer says 999
+        const uint32_t contents[8] = { 999, 999, 999, 0, 5, 1, 1, 0 };
+        pl_buf_write(gpu, ctrl2, 0, contents, sizeof(contents));
+
+        const uint32_t zero = 0;
+        pl_buf_write(gpu, out, 0, &zero, sizeof(zero));
+
+        pl_pass_run(gpu, pl_pass_run_params(
+            .pass = counter,
+            .desc_bindings = (struct pl_desc_binding[]) {
+                { .object = out },
+            },
+            .indirect_buf    = ctrl2,
+            .indirect_offset = 4 * sizeof(uint32_t),
+        ));
+
+        uint32_t tally = 0xDEADBEEF;
+        REQUIRE(pl_buf_read(gpu, out, 0, &tally, sizeof(tally)));
+        printf("- host-written buffer at offset 16: shader ran %"PRIu32" times\n",
+               tally);
+        REQUIRE_CMP(tally, ==, 5u, PRIu32);
+
+        pl_buf_destroy(gpu, &ctrl2);
+    }
+
+    pl_pass_destroy(gpu, &counter);
+    pl_pass_destroy(gpu, &writer);
+    pl_buf_destroy(gpu, &out);
+    pl_buf_destroy(gpu, &ctrl);
+    pl_buf_destroy(gpu, &cfg);
+    pl_free(tmp);
+}
+
 static void pl_shader_tests(pl_gpu gpu)
 {
     if (gpu->glsl.version < 410)
@@ -1745,6 +1948,7 @@ void gpu_shader_tests(pl_gpu gpu)
     pl_buffer_tests(gpu);
     pl_texture_tests(gpu);
     pl_planar_tests(gpu);
+    pl_indirect_dispatch_tests(gpu);
     pl_shader_tests(gpu);
     pl_scaler_tests(gpu);
     pl_render_tests(gpu);

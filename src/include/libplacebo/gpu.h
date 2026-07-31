@@ -82,6 +82,16 @@ struct pl_glsl_version {
     // - GL_KHR_shader_subgroup_shuffle
     uint32_t subgroup_size;
 
+    // If true, 16-bit floats may be *declared* in shader storage buffers, i.e.
+    // GL_EXT_shader_16bit_storage's storageBuffer16BitAccess. Nothing in
+    // libplacebo uses this; it is reported so a caller can choose an fp16
+    // buffer layout rather than assume one.
+    //
+    // Note: This is only about storage. 16-bit *arithmetic* is a separate
+    // capability (`shaderFloat16`), and a shader may declare fp16 storage while
+    // doing all its math by converting to fp32.
+    bool fp16_storage;
+
     // Miscellaneous shader limits
     int16_t min_gather_offset;  // minimum `textureGatherOffset` offset
     int16_t max_gather_offset;  // maximum `textureGatherOffset` offset
@@ -136,6 +146,14 @@ struct pl_gpu_limits {
     size_t max_pushc_size;      // maximum `push_constants_size`
     size_t align_vertex_stride; // alignment of `pl_pass_params.vertex_stride`
     uint32_t max_dispatch[3];   // maximum dispatch size per dimension
+
+    // If true, `pl_pass_run_params.indirect_buf` (and the corresponding
+    // `pl_dispatch_compute_params.indirect_buf`) may be used to source the
+    // compute work group count from GPU memory, and `pl_buf_params.indirect`
+    // may be set. If false, neither is legal; there is deliberately no
+    // host-side fallback, because silently substituting a host-supplied count
+    // would defeat the entire point of a GPU-computed (possibly zero) count.
+    bool indirect_dispatch;
 
     // Note: At least one of `max_variable_comps` or `max_ubo_size` is
     // guaranteed to be nonzero.
@@ -462,6 +480,11 @@ struct pl_buf_params {
 
     // May be used as the source of vertex data for `pl_pass_run`.
     bool drawable;
+
+    // May be used as the source of indirect command parameters, i.e. as
+    // `pl_pass_run_params.indirect_buf` / `pl_dispatch_compute_params.indirect_buf`.
+    // Requires `pl_gpu_limits.indirect_dispatch`.
+    bool indirect;
 
     // Provide a hint for the memory type you want to use when allocating
     // this buffer's memory.
@@ -1352,7 +1375,25 @@ struct pl_pass_run_params {
 
     // Number of work groups to dispatch per dimension (X/Y/Z). Must be <= the
     // corresponding index of limits.max_dispatch
+    //
+    // Ignored if `indirect_buf` is set.
     int compute_groups[3];
+
+    // Optional. If set, the work group count is read from GPU memory instead
+    // of from `compute_groups`: three consecutive `uint32_t` values (X, Y, Z)
+    // are fetched from `indirect_buf` at byte offset `indirect_offset`. A
+    // count of zero in any dimension dispatches no work at all.
+    //
+    // Requires `pl_gpu_limits.indirect_dispatch` and
+    // `indirect_buf->params.indirect`. `indirect_offset` must be a multiple of
+    // 4, and `indirect_offset + 12` must be <= `indirect_buf->params.size`.
+    //
+    // Note: The contents are read by the GPU at execution time. Any shader
+    // writing these values must be a *previous* pass; writing them from the
+    // same pass that consumes them is undefined behavior. Synchronization
+    // against the producing pass is handled internally.
+    pl_buf indirect_buf;
+    size_t indirect_offset;
 };
 
 #define pl_pass_run_params(...) (&(struct pl_pass_run_params) { __VA_ARGS__ })

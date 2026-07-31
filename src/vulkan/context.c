@@ -273,6 +273,10 @@ static const VkPhysicalDeviceVulkan11Features recommended_vk11 = {
     .pNext = (void *) &recommended_vk12,
     .samplerYcbcrConversion = true,
     .storagePushConstant16 = true,
+    // fp16 *storage* (declaring float16_t in an SSBO). fp16 arithmetic is
+    // requested separately via shaderFloat16 in recommended_vk12; the two are
+    // independent, and enabling storage does not change any computation.
+    .storageBuffer16BitAccess = true,
 };
 
 const VkPhysicalDeviceFeatures2 pl_vulkan_recommended_features = {
@@ -351,6 +355,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(CmdCopyImage),
     PL_VK_DEV_FUN(CmdCopyImageToBuffer),
     PL_VK_DEV_FUN(CmdDispatch),
+    PL_VK_DEV_FUN(CmdDispatchIndirect),
     PL_VK_DEV_FUN(CmdDraw),
     PL_VK_DEV_FUN(CmdDrawIndexed),
     PL_VK_DEV_FUN(CmdEndDebugUtilsLabelEXT),

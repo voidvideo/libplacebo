@@ -141,6 +141,7 @@ struct vk_ctx {
     PL_VK_FUN(CmdCopyImage);
     PL_VK_FUN(CmdCopyImageToBuffer);
     PL_VK_FUN(CmdDispatch);
+    PL_VK_FUN(CmdDispatchIndirect);
     PL_VK_FUN(CmdDraw);
     PL_VK_FUN(CmdDrawIndexed);
     PL_VK_FUN(CmdEndDebugUtilsLabelEXT);
