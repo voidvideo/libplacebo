@@ -42,6 +42,9 @@ void vk_tex_barrier(pl_gpu gpu, struct vk_cmd *cmd, pl_tex tex,
     struct vk_sync_scope last;
     bool is_trans = layout != tex_vk->layout, is_xfer = qf != tex_vk->qf;
     last = vk_sem_barrier(cmd, &tex_vk->sem, stage, access, is_trans || is_xfer);
+    VkPipelineStageFlags2 ext_stage = stage;
+    if (tex_vk->ext_deps.num && !ext_stage)
+        ext_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkImageMemoryBarrier2 barr = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -71,7 +74,7 @@ void vk_tex_barrier(pl_gpu gpu, struct vk_cmd *cmd, pl_tex tex,
         // before the barrier begins executing. The easiest way to ensure this
         // is to add the stage mask at which we wait for the external dependency
         // to the source stage mask of the image barrier.
-        barr.srcStageMask |= stage;
+        barr.srcStageMask |= ext_stage;
     }
 
     if (last.access || is_trans || is_xfer) {
@@ -87,7 +90,7 @@ void vk_tex_barrier(pl_gpu gpu, struct vk_cmd *cmd, pl_tex tex,
     vk_cmd_callback(cmd, VK_CB_FUNC(vk_tex_deref), gpu, tex);
 
     for (int i = 0; i < tex_vk->ext_deps.num; i++)
-        vk_cmd_dep(cmd, stage, tex_vk->ext_deps.elem[i]);
+        vk_cmd_dep(cmd, ext_stage, tex_vk->ext_deps.elem[i]);
     tex_vk->ext_deps.num = 0;
 }
 
