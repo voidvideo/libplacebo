@@ -190,6 +190,24 @@ static bool vk_init_image(pl_gpu gpu, pl_tex tex, pl_debug_tag debug_tag)
         // Framebuffers need to be created against a specific render pass
         // layout, so we need to temporarily create a skeleton/dummy render
         // pass for vulkan to figure out the compatibility
+        const VkSubpassDependency dependencies[2] = {
+            {
+                .srcSubpass = VK_SUBPASS_EXTERNAL,
+                .dstSubpass = 0,
+                .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            }, {
+                .srcSubpass = 0,
+                .dstSubpass = VK_SUBPASS_EXTERNAL,
+                .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstAccessMask = 0,
+            },
+        };
         VkRenderPassCreateInfo rinfo = {
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
             .attachmentCount = 1,
@@ -210,6 +228,8 @@ static bool vk_init_image(pl_gpu gpu, pl_tex tex, pl_debug_tag debug_tag)
                     .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 },
             },
+            .dependencyCount = PL_ARRAY_SIZE(dependencies),
+            .pDependencies = dependencies,
         };
 
         VK(vk->CreateRenderPass(vk->dev, &rinfo, PL_VK_ALLOC, &dummyPass));
