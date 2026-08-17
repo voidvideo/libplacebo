@@ -46,6 +46,7 @@ void vk_dev_callback(struct vk_ctx *vk, vk_cb callback,
 // Thread-safety: Unsafe
 struct vk_cmd {
     struct vk_cmdpool *pool; // pool it was allocated from
+    VkCommandPool command_pool; // exclusively owns this command buffer
     pl_vulkan_sem sync;      // pending execution, tied to lifetime of device
     VkQueue queue;           // the submission queue (for recording/pending)
     int qindex;              // the index of `queue` in `pool`
@@ -99,10 +100,8 @@ struct vk_sync_scope vk_sem_barrier(struct vk_cmd *cmd, struct vk_sem *sem,
 // Command pool / queue family hybrid abstraction
 struct vk_cmdpool {
     struct vk_ctx *vk;
-    pl_mutex lock; // externally synchronizes all VkCommandPool operations
     VkQueueFamilyProperties props;
     int qf; // queue family index
-    VkCommandPool pool;
     VkQueue *queues;
     int num_queues;
     int idx_queues;

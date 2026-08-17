@@ -65,9 +65,7 @@ static void vk_cmd_destroy(struct vk_cmd *cmd)
     vk_cmd_poll(cmd, UINT64_MAX);
     vk_cmd_reset(cmd);
     vk->DestroySemaphore(vk->dev, cmd->sync.sem, PL_VK_ALLOC);
-    pl_mutex_lock(&cmd->pool->lock);
-    vk->FreeCommandBuffers(vk->dev, cmd->pool->pool, 1, &cmd->buf);
-    pl_mutex_unlock(&cmd->pool->lock);
+    vk->DestroyCommandPool(vk->dev, cmd->command_pool, PL_VK_ALLOC);
 
     pl_free(cmd);
 }
@@ -78,17 +76,23 @@ static struct vk_cmd *vk_cmd_create(struct vk_cmdpool *pool)
     struct vk_cmd *cmd = pl_zalloc_ptr(NULL, cmd);
     cmd->pool = pool;
 
+    VkCommandPoolCreateInfo cinfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+                 VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = pool->qf,
+    };
+    VK(vk->CreateCommandPool(
+        vk->dev, &cinfo, PL_VK_ALLOC, &cmd->command_pool));
+
     VkCommandBufferAllocateInfo ainfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = pool->pool,
+        .commandPool = cmd->command_pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
 
-    pl_mutex_lock(&pool->lock);
-    VkResult res = vk->AllocateCommandBuffers(vk->dev, &ainfo, &cmd->buf);
-    pl_mutex_unlock(&pool->lock);
-    VK(res);
+    VK(vk->AllocateCommandBuffers(vk->dev, &ainfo, &cmd->buf));
 
     static const VkSemaphoreTypeCreateInfo stinfo = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
@@ -338,25 +342,10 @@ struct vk_cmdpool *vk_cmdpool_create(struct vk_ctx *vk, int qf, int qnum,
         .queues     = pl_calloc(pool, qnum, sizeof(VkQueue)),
         .num_queues = qnum,
     };
-    pl_mutex_init(&pool->lock);
 
     for (int n = 0; n < qnum; n++)
         vk->GetDeviceQueue(vk->dev, qf, n, &pool->queues[n]);
-
-    VkCommandPoolCreateInfo cinfo = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
-                 VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = qf,
-    };
-
-    VK(vk->CreateCommandPool(vk->dev, &cinfo, PL_VK_ALLOC, &pool->pool));
     return pool;
-
-error:
-    vk_cmdpool_destroy(pool);
-    vk->failed = true;
-    return NULL;
 }
 
 void vk_cmdpool_destroy(struct vk_cmdpool *pool)
@@ -367,11 +356,6 @@ void vk_cmdpool_destroy(struct vk_cmdpool *pool)
     for (int i = 0; i < pool->cmds.num; i++)
         vk_cmd_destroy(pool->cmds.elem[i]);
 
-    struct vk_ctx *vk = pool->vk;
-    pl_mutex_lock(&pool->lock);
-    vk->DestroyCommandPool(vk->dev, pool->pool, PL_VK_ALLOC);
-    pl_mutex_unlock(&pool->lock);
-    pl_mutex_destroy(&pool->lock);
     pl_free(pool);
 }
 
@@ -402,10 +386,7 @@ struct vk_cmd *vk_cmd_begin(struct vk_cmdpool *pool, pl_debug_tag debug_tag)
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
 
-    pl_mutex_lock(&pool->lock);
-    VkResult res = vk->BeginCommandBuffer(cmd->buf, &binfo);
-    pl_mutex_unlock(&pool->lock);
-    VK(res);
+    VK(vk->BeginCommandBuffer(cmd->buf, &binfo));
 
     debug_tag = PL_DEF(debug_tag, "vk_cmd");
     PL_VK_NAME_HANDLE(COMMAND_BUFFER, cmd->buf, debug_tag);
@@ -488,10 +469,7 @@ bool vk_cmd_submit(struct vk_cmd **pcmd)
     struct vk_cmdpool *pool = cmd->pool;
     struct vk_ctx *vk = pool->vk;
 
-    pl_mutex_lock(&pool->lock);
-    VkResult end_res = vk->EndCommandBuffer(cmd->buf);
-    pl_mutex_unlock(&pool->lock);
-    VK(end_res);
+    VK(vk->EndCommandBuffer(cmd->buf));
 
     VkSubmitInfo2 sinfo = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
