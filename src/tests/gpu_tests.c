@@ -35,6 +35,22 @@ void pl_buffer_tests(pl_gpu gpu)
     REQUIRE_MEMEQ(test_src, test_dst, buf_size);
     pl_buf_destroy(gpu, &buf);
 
+    printf("- test dedicated buffer creation, update and readback\n");
+    memset(test_dst, 0, buf_size);
+    buf = pl_buf_create(gpu, pl_buf_params(
+        .size = buf_size,
+        .host_writable = true,
+        .host_readable = true,
+        .allocation_mode = PL_BUF_ALLOCATION_DEDICATED,
+    ));
+
+    REQUIRE(buf);
+    REQUIRE(buf->params.allocation_mode == PL_BUF_ALLOCATION_DEDICATED);
+    pl_buf_write(gpu, buf, 0, test_src, buf_size);
+    REQUIRE(pl_buf_read(gpu, buf, 0, test_dst, buf_size));
+    REQUIRE_MEMEQ(test_src, test_dst, buf_size);
+    pl_buf_destroy(gpu, &buf);
+
     printf("- test buffer empty creation, update and readback\n");
     memset(test_dst, 0, buf_size);
     buf = pl_buf_create(gpu, pl_buf_params(

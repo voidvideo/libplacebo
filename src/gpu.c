@@ -589,6 +589,8 @@ pl_buf pl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
     }
 
     require(params->size > 0 && params->size <= gpu->limits.max_buf_size);
+    require(params->allocation_mode >= PL_BUF_ALLOCATION_AUTO &&
+            params->allocation_mode < PL_BUF_ALLOCATION_MODE_COUNT);
     require(!params->uniform || params->size <= gpu->limits.max_ubo_size);
     require(!params->storable || params->size <= gpu->limits.max_ssbo_size);
     require(!params->drawable || params->size <= gpu->limits.max_vbo_size);
@@ -634,6 +636,7 @@ static bool pl_buf_params_superset(struct pl_buf_params a, struct pl_buf_params 
 {
     return a.size            >= b.size &&
            a.memory_type     == b.memory_type &&
+           a.allocation_mode == b.allocation_mode &&
            a.format          == b.format &&
            (a.host_writable  || !b.host_writable) &&
            (a.host_readable  || !b.host_readable) &&
