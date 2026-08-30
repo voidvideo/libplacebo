@@ -463,6 +463,17 @@ enum pl_buf_mem_type {
     // Note: This distinction only matters for discrete GPUs
 };
 
+enum pl_buf_allocation_mode {
+    // Let the backend choose between suballocation and a dedicated allocation.
+    PL_BUF_ALLOCATION_AUTO = 0,
+
+    // Give this buffer its own backing allocation. This is intended for large,
+    // long-lived buffers whose lifetime and size make slab reservation wasteful.
+    PL_BUF_ALLOCATION_DEDICATED,
+
+    PL_BUF_ALLOCATION_MODE_COUNT,
+};
+
 // Structure describing a buffer.
 struct pl_buf_params {
     size_t size;        // size in bytes (must be <= `pl_gpu_limits.max_buf_size`)
@@ -493,6 +504,11 @@ struct pl_buf_params {
     // particular, allocating buffers with `uniform` or `storable` enabled from
     // non-device memory will almost surely fail.
     enum pl_buf_mem_type memory_type;
+
+    // Controls whether this buffer may share a backing allocation with other
+    // buffers. Backends which already allocate every buffer independently
+    // naturally satisfy PL_BUF_ALLOCATION_DEDICATED.
+    enum pl_buf_allocation_mode allocation_mode;
 
     // Setting this to a format with the `PL_FMT_CAP_TEXEL_*` capability allows
     // this buffer to be used as a `PL_DESC_BUF_TEXEL_*`, when `uniform` and

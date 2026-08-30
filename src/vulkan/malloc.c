@@ -1034,7 +1034,8 @@ bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
     struct vk_slab *slab;
     VkDeviceSize offset;
 
-    if (params->ded_image || size > ma->maximum_page_size) {
+    if (params->dedicated || params->ded_image ||
+        size > ma->maximum_page_size) {
         slab = slab_alloc(ma, params);
         if (!slab)
             return false;

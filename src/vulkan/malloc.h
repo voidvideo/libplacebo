@@ -49,6 +49,7 @@ struct vk_malloc_params {
     VkMemoryPropertyFlags optimal;
     VkBufferUsageFlags buf_usage;
     VkImage ded_image; // for dedicated image allocations
+    bool dedicated;    // force a dedicated slab for this allocation
     enum pl_handle_type export_handle;
     enum pl_handle_type import_handle;
     struct pl_shared_mem shared_mem; // for `import_handle`
