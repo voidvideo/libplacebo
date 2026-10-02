@@ -896,6 +896,7 @@ static pl_str pl_stage_to_mp(enum pl_hook_stage stage)
     case PL_HOOK_SCALED:        return pl_str0("SCALED");
     case PL_HOOK_PRE_OUTPUT:    return pl_str0("PREOUTPUT");
     case PL_HOOK_OUTPUT:        return pl_str0("OUTPUT");
+    case PL_HOOK_COLOR_MAP:     return pl_str0(""); // programmatic replacement only
     };
 
     pl_unreachable();

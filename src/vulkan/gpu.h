@@ -142,6 +142,7 @@ struct pl_buf_vk {
 
     // synchronization and current state
     struct vk_sem sem;
+    uint32_t external_qf; // owner used for external buffer acquire/release
     bool exported;
     bool needs_flush;
 };

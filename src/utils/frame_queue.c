@@ -1130,6 +1130,13 @@ void pl_queue_advance(pl_queue p, double pts)
     }
     PL_ARRAY_REMOVE_RANGE(p->queue, 0, culled);
 
+    // pl_queue_push_block waits for this condition whenever the prefetch
+    // window is full. Custom cadence drivers use pl_queue_advance instead of
+    // pl_queue_update, so advancing must provide the same producer wakeup as
+    // the normal update path after it frees queue capacity.
+    if (culled)
+        pl_cond_signal(&p->wakeup);
+
     pl_mutex_unlock(&p->lock_weak);
     pl_mutex_unlock(&p->lock_strong);
 }

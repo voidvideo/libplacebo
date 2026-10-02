@@ -99,6 +99,21 @@ int main()
     REQUIRE(pl_options_load(test, "cone=yes,cone_preset=deuteranomaly"));
     REQUIRE_STREQ(pl_options_save(test), "cone=yes,cones=m,cone_strength=0.5");
 
+    // Changing quality presets must preserve application-owned color mapping.
+    pl_options_reset(test, NULL);
+    const struct pl_hook color_hook = { .stages = PL_HOOK_COLOR_MAP };
+    const struct pl_hook *color_hooks[] = { &color_hook };
+    test->params.color_map_hooks = color_hooks;
+    test->params.num_color_map_hooks = PL_ARRAY_SIZE(color_hooks);
+    REQUIRE(pl_options_load(test, "preset=fast"));
+    REQUIRE(test->params.color_map_hooks == color_hooks);
+    REQUIRE(test->params.num_color_map_hooks == 1);
+    REQUIRE_STREQ(pl_options_save(test), "");
+    REQUIRE(pl_options_load(test, "preset=high_quality"));
+    REQUIRE(test->params.color_map_hooks == color_hooks);
+    REQUIRE(test->params.num_color_map_hooks == 1);
+    REQUIRE_STREQ(pl_options_save(test), hq_opts);
+
     // Test error paths
     pl_options bad = pl_options_alloc(NULL);
     REQUIRE(!pl_options_load(bad, "scale_preset=help"));

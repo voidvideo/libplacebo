@@ -235,6 +235,18 @@ struct pl_render_params {
     const struct pl_hook * const *hooks;
     int num_hooks;
 
+    // Optional replacement for the complete image -> target color mapping.
+    // Empty preserves native tone/gamut mapping, LUT and ICC behavior.
+    // A non-empty chain replaces those operations; every entry must declare
+    // PL_HOOK_COLOR_MAP and its final result must describe target RGB.
+    // The chain runs after scaling, with independent alpha, before the
+    // existing per-frame cache. Source decoding and presentation are unchanged.
+    // Do not also register these entries in 'hooks'. Descriptors and private
+    // resources are borrowed until rendering returns. Descriptor/signature
+    // changes invalidate cached pixels just like ordinary non-output hooks.
+    const struct pl_hook * const *color_map_hooks;
+    int num_color_map_hooks;
+
     // Color mapping LUT. If present, this will be applied as part of the
     // image being rendered, in normalized RGB space.
     //

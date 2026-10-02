@@ -7,11 +7,128 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
 
+// Exercise producer-complete imports without requiring a capture device. The
+// producer uses the same GPU allocation but explicitly hands ownership away;
+// this proves buffer data and ownership transitions, not V4L2 driver interop.
+static void vulkan_buffer_import_tests(pl_vulkan vk,
+                                      enum pl_handle_type handle_type,
+                                      uint32_t external_qf)
+{
+    pl_gpu gpu = vk->gpu;
+    if (handle_type != PL_HANDLE_DMA_BUF) {
+        printf("skipping buffer import 0x%x: allocator has no implementation\n",
+               handle_type);
+        return;
+    }
+    if (!(gpu->export_caps.buf & handle_type) ||
+        !(gpu->import_caps.buf & handle_type)) {
+        printf("skipping buffer import 0x%x: device capability unavailable\n",
+               handle_type);
+        return;
+    }
+
+    if (external_qf == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+        bool enabled = false;
+        for (int i = 0; i < vk->num_extensions; i++)
+            enabled |= strcmp(vk->extensions[i], VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0;
+        if (!enabled) {
+            printf("skipping FOREIGN ownership: extension not enabled\n");
+            return;
+        }
+    }
+
+    printf("testing externally owned buffer 0x%x, owner 0x%x\n",
+           handle_type, external_qf);
+    uint32_t expected[256], actual[256];
+    pl_buf source = pl_buf_create(gpu, pl_buf_params(
+        .size = sizeof(expected),
+        .storable = true,
+        .host_writable = true,
+        .export_handle = handle_type,
+    ));
+    REQUIRE(source);
+    struct pl_buf_vk *source_vk = PL_PRIV(source);
+    REQUIRE_CMP(source_vk->external_qf, ==, VK_QUEUE_FAMILY_EXTERNAL, "u");
+    source_vk->external_qf = external_qf;
+
+    struct pl_buf_params params = *pl_buf_params(
+        .size = sizeof(expected),
+        .storable = true,
+        .import_handle = handle_type,
+        .shared_mem = source->shared_mem,
+    );
+    pl_buf imported = pl_vulkan_buf_import(gpu, &params, external_qf);
+    REQUIRE(imported);
+    struct pl_buf_vk *imported_vk = PL_PRIV(imported);
+    REQUIRE(imported_vk->exported); // first use must acquire, too
+    REQUIRE_CMP(imported_vk->external_qf, ==, external_qf, "u");
+
+    pl_buf readback = pl_buf_create(gpu, pl_buf_params(
+        .size = sizeof(expected),
+        .host_readable = true,
+    ));
+    REQUIRE(readback);
+    for (int cycle = 0; cycle < 4; cycle++) {
+        for (int i = 0; i < PL_ARRAY_SIZE(expected); i++)
+            expected[i] = 0x12345678u ^ (cycle * 333 + i * 113);
+
+        pl_buf_write(gpu, source, 0, expected, sizeof(expected));
+        REQUIRE(pl_buf_export(gpu, source));
+        pl_gpu_finish(gpu); // synchronous producer-complete test fixture only
+        REQUIRE(!pl_buf_poll(gpu, source, 0));
+
+        // A partial first read still acquires ownership for the full buffer.
+        pl_buf_copy(gpu, readback, 16, imported, 16, 100);
+        REQUIRE(!imported_vk->exported);
+        pl_buf_copy(gpu, readback, 0, imported, 0, sizeof(expected));
+        REQUIRE(pl_buf_export(gpu, imported));
+        REQUIRE(pl_buf_export(gpu, imported)); // harmless repeated export
+        REQUIRE(imported_vk->exported);
+        pl_gpu_finish(gpu);
+        REQUIRE(!pl_buf_poll(gpu, imported, 0));
+        REQUIRE(pl_buf_read(gpu, readback, 0, actual, sizeof(actual)));
+        REQUIRE(memcmp(actual, expected, sizeof(actual)) == 0);
+    }
+
+    pl_buf_destroy(gpu, &readback);
+    pl_buf_destroy(gpu, &imported);
+    pl_buf_destroy(gpu, &source);
+    REQUIRE(!pl_gpu_is_failed(gpu));
+}
+
+static void vulkan_buffer_import_rejections(pl_vulkan vk)
+{
+    pl_gpu gpu = vk->gpu;
+    struct pl_buf_params params = *pl_buf_params(.size = 64);
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    params.import_handle = PL_HANDLE_HOST_PTR;
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    params.import_handle = PL_HANDLE_FD;
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    params.import_handle = PL_HANDLE_DMA_BUF;
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_IGNORED));
+    params.initial_data = &params;
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    params.initial_data = NULL;
+    params.export_handle = PL_HANDLE_FD;
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    params.export_handle = 0;
+    params.import_handle = PL_HANDLE_FD | PL_HANDLE_DMA_BUF;
+    REQUIRE(!pl_vulkan_buf_import(gpu, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    REQUIRE(!pl_vulkan_buf_import(NULL, &params, VK_QUEUE_FAMILY_EXTERNAL));
+    REQUIRE(!pl_vulkan_buf_import(gpu, NULL, VK_QUEUE_FAMILY_EXTERNAL));
+}
+
 static void vulkan_interop_tests(pl_vulkan pl_vk,
-                                 enum pl_handle_type handle_type)
+                                 enum pl_handle_type handle_type,
+                                 bool buffer_only)
 {
     pl_gpu gpu = pl_vk->gpu;
     printf("testing vulkan interop for handle type 0x%x\n", handle_type);
+    vulkan_buffer_import_tests(pl_vk, handle_type, VK_QUEUE_FAMILY_EXTERNAL);
+    vulkan_buffer_import_tests(pl_vk, handle_type, VK_QUEUE_FAMILY_FOREIGN_EXT);
+    if (buffer_only)
+        return;
 
     if (gpu->export_caps.buf & handle_type) {
         pl_buf buf = pl_buf_create(gpu, pl_buf_params(
@@ -115,8 +232,9 @@ static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
     pl_swapchain_destroy(&sw);
 }
 
-int main()
+int main(int argc, char **argv)
 {
+    const bool buffer_only = argc == 2 && !strcmp(argv[1], "--buffer-interop");
     pl_log log = pl_test_logger();
     pl_vk_inst inst = pl_vk_inst_create(log, pl_vk_inst_params(
         .debug = true,
@@ -148,7 +266,7 @@ int main()
     VkSurfaceKHR surf = VK_NULL_HANDLE;
 
     PL_VK_LOAD_FUN(inst->instance, CreateHeadlessSurfaceEXT, inst->get_proc_addr);
-    if (CreateHeadlessSurfaceEXT) {
+    if (CreateHeadlessSurfaceEXT && !buffer_only) {
         VkHeadlessSurfaceCreateInfoEXT info = {
             .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
         };
@@ -173,7 +291,7 @@ int main()
         VkPhysicalDeviceProperties props = {0};
         GetPhysicalDeviceProperties(devices[i], &props);
 #ifndef CI_ALLOW_SW
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !buffer_only) {
             printf("Skipping device %d: %s\n", i, props.deviceName);
             continue;
         }
@@ -200,8 +318,11 @@ int main()
         if (!vk)
             continue;
 
-        gpu_shader_tests(vk->gpu);
-        vulkan_swapchain_tests(vk, surf);
+        vulkan_buffer_import_rejections(vk);
+        if (!buffer_only) {
+            gpu_shader_tests(vk->gpu);
+            vulkan_swapchain_tests(vk, surf);
+        }
 
         // Print heap statistics
         pl_vk_print_heap(vk->gpu, PL_LOG_DEBUG);
@@ -225,14 +346,15 @@ int main()
 
         // Run these tests last because they disable some validation layers
 #ifdef PL_HAVE_UNIX
-        vulkan_interop_tests(vk, PL_HANDLE_FD);
-        vulkan_interop_tests(vk, PL_HANDLE_DMA_BUF);
+        vulkan_interop_tests(vk, PL_HANDLE_FD, buffer_only);
+        vulkan_interop_tests(vk, PL_HANDLE_DMA_BUF, buffer_only);
 #endif
 #ifdef PL_HAVE_WIN32
-        vulkan_interop_tests(vk, PL_HANDLE_WIN32);
-        vulkan_interop_tests(vk, PL_HANDLE_WIN32_KMT);
+        vulkan_interop_tests(vk, PL_HANDLE_WIN32, buffer_only);
+        vulkan_interop_tests(vk, PL_HANDLE_WIN32_KMT, buffer_only);
 #endif
-        gpu_interop_tests(vk->gpu);
+        if (!buffer_only)
+            gpu_interop_tests(vk->gpu);
         pl_vulkan_destroy(&vk);
 
         // Re-run the same export/import tests with async queues disabled
@@ -242,14 +364,15 @@ int main()
         REQUIRE(vk); // it succeeded the first time
 
 #ifdef PL_HAVE_UNIX
-        vulkan_interop_tests(vk, PL_HANDLE_FD);
-        vulkan_interop_tests(vk, PL_HANDLE_DMA_BUF);
+        vulkan_interop_tests(vk, PL_HANDLE_FD, buffer_only);
+        vulkan_interop_tests(vk, PL_HANDLE_DMA_BUF, buffer_only);
 #endif
 #ifdef PL_HAVE_WIN32
-        vulkan_interop_tests(vk, PL_HANDLE_WIN32);
-        vulkan_interop_tests(vk, PL_HANDLE_WIN32_KMT);
+        vulkan_interop_tests(vk, PL_HANDLE_WIN32, buffer_only);
+        vulkan_interop_tests(vk, PL_HANDLE_WIN32_KMT, buffer_only);
 #endif
-        gpu_interop_tests(vk->gpu);
+        if (!buffer_only)
+            gpu_interop_tests(vk->gpu);
         pl_vulkan_destroy(&vk);
 
         // Reduce log spam after first tested device

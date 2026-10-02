@@ -2426,6 +2426,25 @@ done:
     GLSL("}\n");
 }
 
+void pl_shader_color_convert(pl_shader sh, const struct pl_color_space *src,
+                              const struct pl_color_space *dst)
+{
+    struct pl_color_space source = *src, target = *dst;
+    pl_color_space_infer(&source);
+    pl_color_space_infer(&target);
+    pl_shader_linearize(sh, &source);
+    if (source.primaries != target.primaries) {
+        pl_matrix3x3 mat = pl_get_color_mapping_matrix(
+            pl_raw_primaries_get(source.primaries),
+            pl_raw_primaries_get(target.primaries), PL_INTENT_RELATIVE_COLORIMETRIC);
+        GLSL("color.rgb = "$" * color.rgb; \n", sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_mat3("rgb_conversion"),
+            .data = PL_TRANSPOSE_3X3(mat.m),
+        }));
+    }
+    pl_shader_delinearize(sh, &target);
+}
+
 // Backwards compatibility wrapper around `pl_shader_color_map_ex`
 void pl_shader_color_map(pl_shader sh, const struct pl_color_map_params *params,
                          struct pl_color_space src, struct pl_color_space dst,

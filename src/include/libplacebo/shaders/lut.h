@@ -29,6 +29,11 @@ PL_API_BEGIN
 //
 // Note: Users may freely create their own instances of this struct, there is
 // nothing particularly special about `pl_lut_parse_cube`.
+enum pl_lut_interpolation {
+    PL_LUT_TETRAHEDRAL = 0, // preserves the historic default
+    PL_LUT_LINEAR,
+};
+
 struct pl_custom_lut {
     // Some unique signature identifying this LUT, needed to detect state
     // changes (for cache invalidation). This should ideally be a hash of the
@@ -54,6 +59,8 @@ struct pl_custom_lut {
     // Note: This is purely informative, `pl_shader_custom_lut` ignores it.
     struct pl_color_repr repr_in, repr_out;
     struct pl_color_space color_in, color_out;
+    // Three-dimensional sampling. One-dimensional LUTs always use linear.
+    enum pl_lut_interpolation interpolation;
 };
 
 // Parse a 3DLUT in .cube format. Returns NULL if the file fails parsing.

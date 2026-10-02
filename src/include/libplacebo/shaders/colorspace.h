@@ -415,6 +415,14 @@ PL_API void pl_shader_color_map_ex(pl_shader sh,
                                    const struct pl_color_map_params *params,
                                    const struct pl_color_map_args *args);
 
+// Transfer decode, relative-colorimetric RGB/white-point conversion, and
+// transfer encode only. No tone/gamut compression, peak adaptation or state.
+// Linear light preserves libplacebo's absolute scale (1 = PL_COLOR_SDR_WHITE).
+// Descriptions are borrowed, inferred locally, and never modified.
+PL_API void pl_shader_color_convert(pl_shader sh,
+                                    const struct pl_color_space *src,
+                                    const struct pl_color_space *dst);
+
 // Backwards compatibility wrapper around `pl_shader_color_map_ex`
 PL_API void pl_shader_color_map(pl_shader sh, const struct pl_color_map_params *params,
                                 struct pl_color_space src, struct pl_color_space dst,

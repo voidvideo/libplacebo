@@ -578,6 +578,8 @@ static bool parse_preset(opt_ctx p, pl_str str, void *out)
                 params->lut = prev.lut;
                 params->hooks = prev.hooks;
                 params->num_hooks = prev.num_hooks;
+                params->color_map_hooks = prev.color_map_hooks;
+                params->num_color_map_hooks = prev.num_color_map_hooks;
                 params->info_callback = prev.info_callback;
                 params->info_priv = prev.info_priv;
             } else {

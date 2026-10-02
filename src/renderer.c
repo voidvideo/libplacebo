@@ -1055,8 +1055,10 @@ static pl_tex get_hook_tex(void *priv, int width, int height)
 }
 
 // Returns if any hook was applied (even if there were errors)
-static bool pass_hook(struct pass_state *pass, struct img *img,
-                      enum pl_hook_stage stage)
+static bool pass_hook_list(struct pass_state *pass, struct img *img,
+                           enum pl_hook_stage stage,
+                           const struct pl_hook *const *hooks, int num_hooks,
+                           const struct pl_color_map_args *color_map)
 {
     const struct pl_render_params *params = pass->params;
     pl_renderer rr = pass->rr;
@@ -1065,8 +1067,8 @@ static bool pass_hook(struct pass_state *pass, struct img *img,
 
     bool ret = false;
 
-    for (int n = 0; n < params->num_hooks; n++) {
-        const struct pl_hook *hook = params->hooks[n];
+    for (int n = 0; n < num_hooks; n++) {
+        const struct pl_hook *hook = hooks[n];
         if (!(hook->stages & stage))
             continue;
 
@@ -1095,6 +1097,8 @@ static bool pass_hook(struct pass_state *pass, struct img *img,
             .components = img->comps,
             .src_rect = pass->ref_rect,
             .dst_rect = pass->dst_rect,
+            .color_map = color_map,
+            .color_map_params = color_map ? params->color_map_params : NULL,
         };
 
         // TODO: Add some sort of `test` API function to the hooks that allows
@@ -1200,6 +1204,13 @@ hook_error:
     if (!img->tex && !img->sh)
         img->sh = pl_dispatch_begin(rr->dp);
     return ret;
+}
+
+static bool pass_hook(struct pass_state *pass, struct img *img,
+                      enum pl_hook_stage stage)
+{
+    return pass_hook_list(pass, img, stage, pass->params->hooks,
+                          pass->params->num_hooks, NULL);
 }
 
 static void hdr_update_peak(struct pass_state *pass)
@@ -2346,6 +2357,25 @@ static void pass_convert_colors(struct pass_state *pass)
 
     // Do all processing in independent alpha, to avoid nonlinear distortions
     pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+
+    if (params->num_color_map_hooks) {
+        if (pass->need_peak_fbo && !img_tex(pass, img))
+            return;
+        pl_tex feature_map = get_feature_map(pass);
+        const struct pl_color_map_args args = {
+            .src = image->color,
+            .dst = target->color,
+            .prelinearized = prelinearized,
+            .state = &rr->tone_map_state,
+            .feature_map = feature_map,
+        };
+        pass_hook_list(pass, img, PL_HOOK_COLOR_MAP, params->color_map_hooks,
+                       params->num_color_map_hooks, &args);
+        // Both cache population and direct rendering consume a shader.
+        // Texture-returning hooks use the same materialization as all hooks.
+        img_sh(pass, img);
+        return;
+    }
 
     // Apply color blindness simulation if requested
     if (params->cone_params)
@@ -3580,6 +3610,10 @@ static void pass_begin_frame(struct pass_state *pass)
         if (params->hooks[i]->reset)
             params->hooks[i]->reset(params->hooks[i]->priv);
     }
+    for (int i = 0; i < params->num_color_map_hooks; i++) {
+        if (params->color_map_hooks[i]->reset)
+            params->color_map_hooks[i]->reset(params->color_map_hooks[i]->priv);
+    }
 
     size_t size = rr->fbos[pass->info.stage].num * sizeof(bool);
     pass->fbos_used = pl_realloc(pass->tmp, pass->fbos_used, size);
@@ -3776,10 +3810,16 @@ static struct params_info render_params_info(const struct pl_render_params *para
         info.trivial = false;
     }
     params.hooks = NULL;
+    for (int i = 0; i < params.num_color_map_hooks; i++) {
+        pl_hash_merge(&info.hash, pl_var_hash(*params.color_map_hooks[i]));
+        info.trivial = false;
+    }
+    params.color_map_hooks = NULL;
 
     // Hash the LUT by only looking at the signature
     if (params.lut) {
         pl_hash_merge(&info.hash, params.lut->signature);
+        pl_hash_merge(&info.hash, params.lut->interpolation);
         info.trivial = false;
         params.lut = NULL;
     }

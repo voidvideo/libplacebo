@@ -968,7 +968,6 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
         .qf         = VK_QUEUE_FAMILY_IGNORED,
         .semaphore  = { sem_out },
     ));
-
     if (!held) {
         PL_ERR(gpu, "Failed holding swapchain image for presentation");
         pl_mutex_unlock(&p->lock);
@@ -988,7 +987,6 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
         pl_mutex_unlock(&p->lock);
         return false;
     }
-
     struct vk_cmdpool *pool = vk->pool_graphics;
     VkQueue queue = pool->queues[qidx];
 
