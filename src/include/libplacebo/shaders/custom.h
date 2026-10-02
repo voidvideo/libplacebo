@@ -156,6 +156,9 @@ enum pl_hook_stage {
     PL_HOOK_SCALED          = 1 << 13, // After scaling, before color management
     PL_HOOK_PRE_OUTPUT      = 1 << 14, // After color management, before blending/rotation
     PL_HOOK_OUTPUT          = 1 << 15, // After blending/rotation, before dithering
+    // Exclusive color-mapping chain, before the renderer's frame cache.
+    // Only dispatched through pl_render_params.color_map_hooks.
+    PL_HOOK_COLOR_MAP       = 1 << 16,
 };
 
 // Returns true if a given hook stage is resizable
@@ -179,6 +182,7 @@ static inline bool pl_hook_stage_resizable(enum pl_hook_stage stage) {
     case PL_HOOK_SCALED:
     case PL_HOOK_PRE_OUTPUT:
     case PL_HOOK_OUTPUT:
+    case PL_HOOK_COLOR_MAP:
         return false;
     }
 
@@ -193,6 +197,9 @@ enum pl_hook_sig {
     PL_HOOK_SIG_TEX,    // `pl_tex` containing the image data
     PL_HOOK_SIG_COUNT,
 };
+
+struct pl_color_map_args;
+struct pl_color_map_params;
 
 struct pl_hook_params {
     // GPU objects associated with the `pl_renderer`, which the user may
@@ -253,6 +260,15 @@ struct pl_hook_params {
     // a result of previous hooks being executed. (e.g. prescalers)
     pl_rect2df src_rect;
     pl_rect2d dst_rect;
+
+    // Non-NULL only for PL_HOOK_COLOR_MAP. Borrowed for this invocation.
+    // The prepared native mapping describes the original image, real target,
+    // prelinearization and renderer-owned peak/contrast state. A replacement
+    // can delegate to pl_shader_color_map_ex without creating another state.
+    // Later hooks must use 'color' for their current pixels, not blindly
+    // reapply this original-source mapping.
+    const struct pl_color_map_args *color_map;
+    const struct pl_color_map_params *color_map_params;
 };
 
 struct pl_hook_res {

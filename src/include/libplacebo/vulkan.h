@@ -298,6 +298,26 @@ PL_API void pl_vulkan_destroy(pl_vulkan *vk);
 // the underlying `pl_vulkan`. Returns NULL for any other type of `gpu`.
 PL_API pl_vulkan pl_vulkan_get(pl_gpu gpu);
 
+// Import externally owned buffer memory, acquiring ownership on its first GPU
+// use. `params` follows pl_buf_create(), but must specify PL_HANDLE_DMA_BUF,
+// no export handle and no initial_data. The current Vulkan allocator does not
+// implement opaque FD or Win32 memory imports. The external producer
+// must have completed all access before this call and each subsequent GPU use.
+//
+// `qf` must be VK_QUEUE_FAMILY_EXTERNAL or VK_QUEUE_FAMILY_FOREIGN_EXT. The
+// latter requires VK_EXT_queue_family_foreign enabled on the VkDevice, not
+// merely supported by the physical device. The selected owner is retained for
+// every subsequent pl_buf_export() and implicit reacquire of this buffer.
+//
+// After the last GPU read, call pl_buf_export() and wait for pl_buf_poll() to
+// return false before allowing the external producer to reuse the allocation.
+// This API does not import a fence or wait for the external producer. It does
+// not change handle ownership or the normal pl_buf_create() defaults.
+// Returns NULL if the GPU, parameters or ownership protocol are unsupported.
+#define PL_HAVE_VULKAN_BUF_IMPORT 1
+PL_API pl_buf pl_vulkan_buf_import(pl_gpu gpu, const struct pl_buf_params *params,
+                                  uint32_t qf);
+
 struct pl_vulkan_device_params {
     // The instance to use. Required!
     //

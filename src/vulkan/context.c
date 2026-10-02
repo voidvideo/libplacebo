@@ -116,6 +116,9 @@ static const struct vk_ext vk_device_extensions[] = {
             PL_VK_DEV_FUN(GetMemoryFdPropertiesKHR),
             {0}
         },
+    }, {
+        .name = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) { {0} },
 #ifdef PL_HAVE_WIN32
     }, {
         .name = VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
@@ -207,6 +210,7 @@ const char * const pl_vulkan_recommended_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
 #ifdef PL_HAVE_WIN32
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,

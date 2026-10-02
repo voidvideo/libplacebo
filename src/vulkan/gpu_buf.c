@@ -51,8 +51,15 @@ void vk_buf_barrier(pl_gpu gpu, struct vk_cmd *cmd, pl_buf buf,
     // CONCURRENT buffers require transitioning to/from IGNORED, EXCLUSIVE
     // buffers require transitioning to/from the concrete QF index
     uint32_t qf = vk->pools.num > 1 ? VK_QUEUE_FAMILY_IGNORED : cmd->pool->qf;
-    uint32_t src_qf = buf_vk->exported ? VK_QUEUE_FAMILY_EXTERNAL_KHR : qf;
-    uint32_t dst_qf = export ? VK_QUEUE_FAMILY_EXTERNAL_KHR : qf;
+    uint32_t src_qf = buf_vk->exported ? buf_vk->external_qf : qf;
+    uint32_t dst_qf = export ? buf_vk->external_qf : qf;
+
+    // Ownership is tracked per buffer, so transfer the full buffer even when
+    // the first operation only accesses a subrange of its imported allocation.
+    if (src_qf != dst_qf) {
+        offset = 0;
+        size = buf->params.size;
+    }
 
     if (last.access || src_qf != dst_qf) {
         vk_cmd_barrier(cmd, &(VkDependencyInfo) {
@@ -105,6 +112,7 @@ pl_buf vk_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
 
     struct pl_buf_vk *buf_vk = PL_PRIV(buf);
     pl_rc_init(&buf_vk->rc);
+    buf_vk->external_qf = VK_QUEUE_FAMILY_EXTERNAL;
 
     struct vk_malloc_params mparams = {
         .reqs = {
@@ -261,6 +269,48 @@ pl_buf vk_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
 error:
     vk_buf_deref(gpu, buf);
     return NULL;
+}
+
+pl_buf pl_vulkan_buf_import(pl_gpu gpu, const struct pl_buf_params *params,
+                            uint32_t qf)
+{
+    pl_vulkan vk = gpu ? pl_vulkan_get(gpu) : NULL;
+    if (!vk || !params)
+        return NULL;
+
+    if (params->import_handle != PL_HANDLE_DMA_BUF ||
+        !(params->import_handle & gpu->import_caps.buf) ||
+        params->export_handle || params->initial_data ||
+        (qf != VK_QUEUE_FAMILY_EXTERNAL && qf != VK_QUEUE_FAMILY_FOREIGN_EXT))
+    {
+        PL_ERR(gpu, "Invalid externally owned buffer import parameters");
+        return NULL;
+    }
+
+    if (qf == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+        bool enabled = false;
+        for (int i = 0; i < vk->num_extensions; i++) {
+            if (strcmp(vk->extensions[i], VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0) {
+                enabled = true;
+                break;
+            }
+        }
+        if (!enabled) {
+            PL_ERR(gpu, "Foreign buffer ownership requires enabled "
+                        "VK_EXT_queue_family_foreign");
+            return NULL;
+        }
+    }
+
+    pl_buf buf = pl_buf_create(gpu, params);
+    if (!buf)
+        return NULL;
+
+    // No initial_data operation may run before the first ownership acquire.
+    struct pl_buf_vk *buf_vk = PL_PRIV(buf);
+    buf_vk->external_qf = qf;
+    buf_vk->exported = true;
+    return buf;
 }
 
 static void invalidate_buf(pl_gpu gpu, pl_buf buf)
