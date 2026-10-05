@@ -344,6 +344,53 @@ struct pl_hook_par {
     const char * const *names;
 };
 
+// Texture transport for explicit description/strict execution callbacks. A
+// description has texture == NULL and supplies metadata, never a fake GPU
+// handle. Execution supplies a real texture with matching metadata.
+struct pl_hook_texture {
+    pl_tex texture;
+    struct pl_tex_params params;
+    enum pl_sampler_type sampler_type;
+};
+
+struct pl_hook_prepare_params {
+    pl_gpu gpu;
+    pl_dispatch dispatch;
+    void *context;
+    pl_shader (*begin)(void *context, pl_dispatch destination, bool unique);
+    enum pl_dispatch_result (*finish)(void *context, pl_dispatch destination,
+        const struct pl_dispatch_params *params, const struct pl_tex_params *target);
+    enum pl_dispatch_result (*compute)(void *context, pl_dispatch destination,
+        const struct pl_dispatch_compute_params *params);
+    const struct pl_hook_texture *(*get_tex)(void *context, int width, int height);
+    enum pl_hook_stage stage;
+    pl_shader sh;
+    struct pl_hook_texture tex;
+    pl_rect2df rect;
+    struct pl_color_repr repr;
+    struct pl_color_space color;
+    const struct pl_color_repr *orig_repr;
+    const struct pl_color_space *orig_color;
+    int components;
+    int width, height; // current image allocation extent, also for NONE input
+    pl_rect2df src_rect;
+    pl_rect2d dst_rect;
+    // No live renderer-owned color-map state is exposed during description.
+    const struct pl_color_map_args *color_map;
+    const struct pl_color_map_params *color_map_params;
+};
+
+struct pl_hook_prepare_result {
+    enum pl_dispatch_result status;
+    enum pl_hook_sig output;
+    pl_shader sh;
+    struct pl_hook_texture tex;
+    struct pl_color_repr repr;
+    struct pl_color_space color;
+    int components;
+    pl_rect2df rect;
+};
+
 // Struct describing a hook.
 //
 // Note: Users may freely create their own instances of this struct, there is
@@ -370,6 +417,22 @@ struct pl_hook {
     // All hooks with the same signature will be disabled, should they fail to
     // execute during run-time.
     uint64_t signature;
+
+    // Explicit strict-path callbacks. Both are required for preparation.
+    // describe may only emit shaders and inspect frozen metadata. It must not
+    // invoke ordinary hooks/reset, submit GPU work, read analysis, mutate live
+    // resources, or publish results. All auxiliary passes, including passes
+    // for another dispatch, must use the supplied routed operations.
+    // execute_prepared emits the same graph/variants from the same immutable
+    // configuration, with real bindings; execution-only resets/analysis are
+    // permitted here. Direct dispatch/GPU submission is forbidden in both
+    // callbacks. A routed failure is latched even if a callback ignores it.
+    // priv and all structural inputs belong to the retained renderer snapshot.
+    // Runtime uniform/resource inputs must be frozen across preflight and run.
+    struct pl_hook_prepare_result (*describe)(void *priv,
+        const struct pl_hook_prepare_params *params);
+    struct pl_hook_prepare_result (*execute_prepared)(void *priv,
+        const struct pl_hook_prepare_params *params);
 };
 
 // Compatibility layer with `mpv` user shaders. See the mpv man page for more

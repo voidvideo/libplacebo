@@ -42,8 +42,16 @@ struct pl_sample_src {
     pl_rect2df rect;        // sub-rect to sample from (optional)
     enum pl_tex_address_mode address_mode; // preferred texture address mode
 
-    // 2. Have the shader take it as an argument. Doing this requires
-    // specifying the missing metadata of the texture backing the sampler, so
+    // Description-only equivalent of a bound texture. Used only when tex is
+    // NULL. The format belongs to the shader's GPU. This preserves the bound
+    // texture signature, sampler selection and coordinates, without inventing
+    // a GPU resource. The descriptor cannot be executed until rebuilt with a
+    // real texture. Existing stateful filter LUT setup is unchanged.
+    const struct pl_tex_params *texture;
+    enum pl_sampler_type sampler_type;
+
+    // 2. Have the shader take it as an argument (tex and texture both NULL).
+    // This requires specifying the missing metadata of the texture backing the sampler, so
     // that the shader generation can generate the correct code.
     int tex_w, tex_h;             // dimensions of the actual texture
     enum pl_fmt_type format;      // format of the sampler being accepted

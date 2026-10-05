@@ -517,23 +517,37 @@ ident_t sh_attr_vec2(pl_shader sh, const char *name, const pl_rect2df *rc)
     });
 }
 
-ident_t sh_bind(pl_shader sh, pl_tex tex,
-                enum pl_tex_address_mode address_mode,
-                enum pl_tex_sample_mode sample_mode,
-                const char *name, const pl_rect2df *rect,
-                ident_t *out_pos, ident_t *out_pt)
+ident_t sh_bind_metadata(pl_shader sh, pl_tex tex,
+                         const struct pl_tex_params *texture,
+                         enum pl_sampler_type sampler_type,
+                         enum pl_tex_address_mode address_mode,
+                         enum pl_tex_sample_mode sample_mode,
+                         const char *name, const pl_rect2df *rect,
+                         ident_t *out_pos, ident_t *out_pt)
 {
-    if (pl_tex_params_dimension(tex->params) != 2) {
+    if (tex) {
+        texture = &tex->params;
+        sampler_type = tex->sampler_type;
+    }
+    if (!texture || !texture->format || texture->w <= 0 || texture->h <= 0 ||
+        pl_tex_params_dimension(*texture) != 2) {
         SH_FAIL(sh, "Failed binding texture '%s': not a 2D texture!", name);
         return NULL_IDENT;
     }
 
-    if (!tex->params.sampleable) {
+    if (!texture->sampleable) {
         SH_FAIL(sh, "Failed binding texture '%s': texture not sampleable!", name);
         return NULL_IDENT;
     }
 
+    if (sampler_type < 0 || sampler_type >= PL_SAMPLER_TYPE_COUNT) {
+        SH_FAIL(sh, "Failed binding texture '%s': invalid sampler type!", name);
+        return NULL_IDENT;
+    }
+
     ident_t itex = sh_desc(sh, (struct pl_shader_desc) {
+        .texture = texture,
+        .sampler_type = sampler_type,
         .desc = {
             .name = name,
             .type = PL_DESC_SAMPLED_TEX,
@@ -546,18 +560,18 @@ ident_t sh_bind(pl_shader sh, pl_tex tex,
     });
 
     float sx, sy;
-    if (tex->sampler_type == PL_SAMPLER_RECT) {
+    if (sampler_type == PL_SAMPLER_RECT) {
         sx = 1.0;
         sy = 1.0;
     } else {
-        sx = 1.0 / tex->params.w;
-        sy = 1.0 / tex->params.h;
+        sx = 1.0 / texture->w;
+        sy = 1.0 / texture->h;
     }
 
     if (out_pos) {
         pl_rect2df full = {
-            .x1 = tex->params.w,
-            .y1 = tex->params.h,
+            .x1 = texture->w,
+            .y1 = texture->h,
         };
 
         rect = PL_DEF(rect, &full);
@@ -575,6 +589,16 @@ ident_t sh_bind(pl_shader sh, pl_tex tex,
     }
 
     return itex;
+}
+
+ident_t sh_bind(pl_shader sh, pl_tex tex,
+                enum pl_tex_address_mode address_mode,
+                enum pl_tex_sample_mode sample_mode,
+                const char *name, const pl_rect2df *rect,
+                ident_t *out_pos, ident_t *out_pt)
+{
+    return sh_bind_metadata(sh, tex, NULL, PL_SAMPLER_NORMAL,
+                            address_mode, sample_mode, name, rect, out_pos, out_pt);
 }
 
 bool sh_buf_desc_append(void *alloc, pl_gpu gpu,

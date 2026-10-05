@@ -31,6 +31,8 @@ PL_API_BEGIN
 // Thread-safety: Unsafe
 typedef struct pl_shader_t *pl_shader;
 
+typedef struct pl_shader_obj_t *pl_shader_obj;
+
 struct pl_shader_params {
     // The `id` represents an abstract identifier for the shader, to avoid
     // collisions with other shaders being used as part of the same larger,
@@ -63,6 +65,16 @@ struct pl_shader_params {
     // dynamic variables. This is mainly useful to avoid recompilation for
     // shaders which expect to have their values change constantly.
     bool dynamic_constants;
+
+    // Build resource descriptions only. Shader objects must be candidate-owned,
+    // never shared with a live renderer. LUT generation retains CPU data and
+    // reports the LUT object for explicit resource staging before readiness;
+    // it does not create/upload textures. Matching already staged candidate
+    // LUTs may be described read-only, but changed LUTs require a new candidate.
+    // This flag is not permission to replay arbitrary custom shader hooks.
+    bool description_only;
+    void (*describe_lut)(void *priv, pl_shader_obj lut);
+    void *describe_priv;
 };
 
 #define pl_shader_params(...) (&(struct pl_shader_params) { __VA_ARGS__ })
@@ -272,7 +284,6 @@ PL_API const struct pl_shader_res *pl_shader_finalize(pl_shader sh);
 // after them and passing them to the right shader passes.
 //
 // Note: pl_shader_obj objects must be initialized to NULL by the caller.
-typedef struct pl_shader_obj_t *pl_shader_obj;
 
 PL_API void pl_shader_obj_destroy(pl_shader_obj *obj);
 

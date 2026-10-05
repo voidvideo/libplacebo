@@ -202,6 +202,17 @@ ident_t sh_bind(pl_shader sh, pl_tex tex,
                 const char *name, const pl_rect2df *rect,
                 ident_t *out_pos, ident_t *out_pt);
 
+// Shared binding implementation for actual textures and description-only
+// metadata. Actual texture metadata takes precedence. A NULL texture emits a
+// descriptor with no GPU object, suitable only for dispatch description.
+ident_t sh_bind_metadata(pl_shader sh, pl_tex tex,
+                         const struct pl_tex_params *texture,
+                         enum pl_sampler_type sampler_type,
+                         enum pl_tex_address_mode address_mode,
+                         enum pl_tex_sample_mode sample_mode,
+                         const char *name, const pl_rect2df *rect,
+                         ident_t *out_pos, ident_t *out_pt);
+
 // Incrementally build up a buffer by adding new variable elements to the
 // buffer, resizing buf.buffer_vars if necessary. Returns whether or not the
 // variable could be successfully added (which may fail if you try exceeding
@@ -362,6 +373,12 @@ struct sh_lut_params {
 // unless the method is `SH_LUT_LINEAR`, in which case it's a float vector that
 // gets interpolated and clamped as needed. Returns NULL on error.
 ident_t sh_lut(pl_shader sh, const struct sh_lut_params *params);
+
+// Materialize a candidate-owned LUT described by sh_lut. No shader compilation
+// occurs. Call before publishing readiness, never as an execution fallback.
+// Idempotent for already staged objects; false on resource creation failure.
+// Uniform and literal LUTs have no GPU allocation but are sealed by staging.
+bool sh_lut_stage(pl_shader_obj object);
 
 static inline uint8_t sh_num_comps(uint8_t mask)
 {

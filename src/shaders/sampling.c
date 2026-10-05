@@ -27,11 +27,18 @@ static inline struct pl_tex_params src_params(const struct pl_sample_src *src)
 {
     if (src->tex)
         return src->tex->params;
+    if (src->texture)
+        return *src->texture;
 
     return (struct pl_tex_params) {
         .w = src->tex_w,
         .h = src->tex_h,
     };
+}
+
+static inline bool src_bound(const struct pl_sample_src *src)
+{
+    return src->tex || src->texture;
 }
 
 enum filter {
@@ -51,10 +58,15 @@ static bool setup_src(pl_shader sh, const struct pl_sample_src *src,
     enum pl_shader_sig sig;
     float src_w, src_h;
     enum pl_tex_sample_mode sample_mode;
-    if (src->tex) {
-        pl_fmt fmt = src->tex->params.format;
+    const struct pl_tex_params texture = src_params(src);
+    if (src_bound(src)) {
+        pl_fmt fmt = texture.format;
+        if (!fmt || texture.w <= 0 || texture.h <= 0 ||
+            pl_tex_params_dimension(texture) != 2 || !texture.sampleable) {
+            SH_FAIL(sh, "Sampling requires a sampleable 2D texture description!");
+            return false;
+        }
         bool can_linear = fmt->caps & PL_FMT_CAP_LINEAR;
-        pl_assert(pl_tex_params_dimension(src->tex->params) == 2);
         sig = PL_SHADER_SIG_NONE;
         src_w = pl_rect_w(src->rect);
         src_h = pl_rect_h(src->rect);
@@ -109,14 +121,14 @@ static bool setup_src(pl_shader sh, const struct pl_sample_src *src,
         *scale = PL_DEF(src->scale, 1.0);
 
     // Support only formats with all components with the same depth
-    if (src->tex && src->tex->params.format->type == PL_FMT_UINT)
-        *scale *= 1.0 / ((1ull << (src->tex->params.format->component_depth[0])) - 1);
+    if (src_bound(src) && texture.format->type == PL_FMT_UINT)
+        *scale *= 1.0 / ((1ull << texture.format->component_depth[0]) - 1);
 
     if (comp_mask) {
         uint8_t tex_mask = 0x0Fu;
-        if (src->tex) {
+        if (src_bound(src)) {
             // Mask containing only the number of components in the texture
-            tex_mask = (1 << src->tex->params.format->num_components) - 1;
+            tex_mask = (1 << texture.format->num_components) - 1;
         }
 
         uint8_t src_mask = src->component_mask;
@@ -133,7 +145,7 @@ static bool setup_src(pl_shader sh, const struct pl_sample_src *src,
     if (!sh_require(sh, sig, out_w, out_h))
         return false;
 
-    if (src->tex) {
+    if (src_bound(src)) {
         pl_rect2df rect = {
             .x0 = src->rect.x0,
             .y0 = src->rect.y0,
@@ -141,8 +153,11 @@ static bool setup_src(pl_shader sh, const struct pl_sample_src *src,
             .y1 = src->rect.y0 + src_h,
         };
 
-        *src_tex = sh_bind(sh, src->tex, src->address_mode, sample_mode,
-                           "src_tex", &rect, pos, pt);
+        *src_tex = sh_bind_metadata(sh, src->tex, &texture, src->sampler_type,
+                                    src->address_mode, sample_mode,
+                                    "src_tex", &rect, pos, pt);
+        if (!*src_tex)
+            return false;
     } else {
         if (pt) {
             float sx = 1.0 / src->tex_w, sy = 1.0 / src->tex_h;
@@ -822,7 +837,7 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
                 bool use_gather = PL_MAX(xx, xx1) + PL_MAX(yy, yy1) < radius2;
                 use_gather &= PL_MAX(x, y) <= sh_glsl(sh).max_gather_offset;
                 use_gather &= PL_MIN(x, y) >= sh_glsl(sh).min_gather_offset;
-                use_gather &= !src->tex || src->tex->params.format->gatherable;
+                use_gather &= !src_bound(src) || src_params(src).format->gatherable;
 
                 // Gathering from components other than the R channel requires
                 // support for GLSL 400, which introduces the overload of
@@ -830,7 +845,7 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
                 //
                 // This is also the minimum requirement if we don't know the
                 // texture format capabilities, for the sampler2D interface
-                if (cmask != 0x1 || !src->tex)
+                if (cmask != 0x1 || !src_bound(src))
                     use_gather &= sh_glsl(sh).version >= 400;
 
                 if (!use_gather) {

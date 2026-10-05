@@ -91,6 +91,41 @@ struct pl_renderer_t {
     struct icc_state icc_fallback[2];
 };
 
+// Candidate-owned strict traversal. GPU handles are never fabricated: logical
+// intermediates retain metadata until submit stages their actual storage.
+struct prepared_render_pass {
+    pl_dispatch destination;
+    pl_dispatch_description description;
+    pl_dispatch_preparation request;
+    pl_dispatch_prepared ready;
+};
+
+struct prepared_frame_shape {
+    int w, h, d;
+    pl_fmt format;
+    bool sampleable, renderable, storable;
+    enum pl_sampler_type sampler_type;
+    struct pl_plane plane; // texture is always NULL; only scalar metadata retained
+    pl_rect2df crop;
+};
+
+struct pl_renderer_preparation_t {
+    pl_renderer rr;
+    struct pl_renderer_snapshot snapshot;
+    PL_ARRAY(struct prepared_render_pass) passes;
+    PL_ARRAY(struct pl_hook_texture *) textures;
+    PL_ARRAY(pl_shader_obj) luts;
+    enum pl_renderer_prepare_result result;
+    const char *error;
+    bool submitted;
+    bool executing;
+    bool checking;
+    int pass_index, texture_index;
+    uint8_t shader_id, frame_index;
+    struct pass_state *current;
+    struct prepared_frame_shape image_shape, target_shape;
+};
+
 enum {
     // Index into `lut_state`
     LUT_IMAGE,
@@ -255,6 +290,7 @@ struct img {
     // Exactly *one* of these two is set:
     pl_shader sh;
     pl_tex tex;
+    const struct pl_hook_texture *prepared_tex;
 
     // If true, created shaders will be set to unique
     bool unique;
@@ -337,6 +373,7 @@ static inline enum plane_type detect_plane_type(const struct pl_plane *plane,
 struct pass_state {
     void *tmp;
     pl_renderer rr;
+    pl_renderer_preparation preparation;
     const struct pl_render_params *params;
     struct pl_render_info info; // for info callback
 
@@ -378,6 +415,143 @@ struct pass_state {
         bool target, image, prev, next;
     } acquired;
 };
+
+static void prepare_fail(pl_renderer_preparation p,
+                         enum pl_renderer_prepare_result result, const char *error)
+{
+    if (p && p->result == PL_RENDERER_PREPARE_OK) {
+        p->result = result;
+        p->error = error;
+    }
+}
+
+static void prepare_lut(void *priv, pl_shader_obj lut)
+{
+    pl_renderer_preparation p = priv;
+    for (int i = 0; i < p->luts.num; i++)
+        if (p->luts.elem[i] == lut)
+            return;
+    if (p->checking) {
+        prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "new LUT during preflight");
+        return;
+    }
+    PL_ARRAY_APPEND(p, p->luts, lut);
+}
+
+static pl_shader prepared_begin(void *priv, pl_dispatch destination, bool unique)
+{
+    pl_renderer_preparation p = priv;
+    // destination identifies the eventual owner, not a source of mutable IDs.
+    if (!destination) {
+        prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "missing dispatch owner");
+        return NULL;
+    }
+    return pl_shader_alloc(p->rr->log, pl_shader_params(
+        .gpu = p->rr->gpu,
+        .id = unique ? p->shader_id++ : 0,
+        .index = p->frame_index,
+        .dynamic_constants = p->snapshot.params->dynamic_constants,
+        .description_only = !p->executing,
+        .describe_lut = prepare_lut,
+        .describe_priv = p,
+    ));
+}
+
+static pl_shader pass_shader(struct pass_state *pass, bool unique)
+{
+    return pass->preparation ? prepared_begin(pass->preparation, pass->rr->dp, unique)
+                             : pl_dispatch_begin_ex(pass->rr->dp, unique);
+}
+
+static enum pl_dispatch_result prepared_dispatch(pl_renderer_preparation p,
+    pl_dispatch dp, const struct pl_dispatch_params *finish,
+    const struct pl_dispatch_compute_params *compute,
+    const struct pl_tex_params *target)
+{
+    enum pl_dispatch_result result;
+    if (p->result != PL_RENDERER_PREPARE_OK) {
+        pl_dispatch_abort(dp, finish ? finish->shader : compute->shader);
+        return PL_DISPATCH_FAILED;
+    }
+    int index = p->pass_index++;
+    if (p->executing) {
+        if (index >= p->passes.num || p->passes.elem[index].destination != dp) {
+            prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "dispatch graph changed");
+            pl_dispatch_abort(dp, finish ? finish->shader : compute->shader);
+            return PL_DISPATCH_NOT_READY;
+        }
+        result = finish ? pl_dispatch_finish_prepared(dp, p->passes.elem[index].ready, finish)
+                        : pl_dispatch_compute_prepared(dp, p->passes.elem[index].ready, compute);
+    } else {
+        pl_dispatch_description desc = NULL;
+        result = finish ? pl_dispatch_describe_finish(dp, finish, target, &desc)
+                        : pl_dispatch_describe_compute(dp, compute, &desc);
+        if (result == PL_DISPATCH_OK) {
+            if (p->checking) {
+                if (index >= p->passes.num || p->passes.elem[index].destination != dp ||
+                    !pl_dispatch_prepared_matches(desc, p->passes.elem[index].ready))
+                    result = PL_DISPATCH_NOT_READY;
+                pl_dispatch_description_destroy(&desc);
+            } else {
+                PL_ARRAY_APPEND(p, p->passes, (struct prepared_render_pass) {
+                    .destination = dp, .description = desc,
+                });
+            }
+        }
+    }
+    if (result != PL_DISPATCH_OK)
+        prepare_fail(p, result == PL_DISPATCH_NOT_READY ? PL_RENDERER_PREPARE_NOT_READY
+                                                       : PL_RENDERER_PREPARE_FAILED,
+                     "required dispatch failed or was not prepared");
+    return result;
+}
+
+static enum pl_dispatch_result prepared_finish(void *priv, pl_dispatch dp,
+    const struct pl_dispatch_params *params, const struct pl_tex_params *target)
+{
+    return prepared_dispatch(priv, dp, params, NULL, target);
+}
+
+static enum pl_dispatch_result prepared_compute(void *priv, pl_dispatch dp,
+    const struct pl_dispatch_compute_params *params)
+{
+    return prepared_dispatch(priv, dp, NULL, params, NULL);
+}
+
+static const struct pl_hook_texture *prepared_texture(struct pass_state *pass,
+                                                      int w, int h, pl_fmt fmt, int comps)
+{
+    pl_renderer_preparation p = pass->preparation;
+    fmt = PL_DEF(fmt, pass->fbofmt[PL_DEF(comps, 4)]);
+    if (!fmt || w <= 0 || h <= 0) {
+        prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "invalid intermediate texture");
+        return NULL;
+    }
+    int index = p->texture_index++;
+    if (p->checking || p->executing) {
+        if (index >= p->textures.num) {
+            prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "intermediate graph changed");
+            return NULL;
+        }
+        const struct pl_hook_texture *tex = p->textures.elem[index];
+        if (tex->params.w != w || tex->params.h != h || tex->params.format != fmt) {
+            prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "intermediate layout changed");
+            return NULL;
+        }
+        return tex;
+    }
+    struct pl_hook_texture *tex = pl_zalloc_ptr(p, tex);
+    tex->params = (struct pl_tex_params) {
+        .w = w, .h = h, .format = fmt, .sampleable = true,
+        .renderable = true, .storable = fmt->caps & PL_FMT_CAP_STORABLE,
+        .blit_src = fmt->caps & PL_FMT_CAP_BLITTABLE,
+    };
+    tex->sampler_type = PL_SAMPLER_NORMAL;
+    PL_ARRAY_APPEND(p, p->textures, tex);
+    return tex;
+}
+
+static bool img_source(struct pass_state *pass, struct img *img, struct pl_sample_src *src);
 
 static void find_fbo_format(struct pass_state *pass)
 {
@@ -448,6 +622,10 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
                       int comps, pl_debug_tag debug_tag)
 {
     pl_renderer rr = pass->rr;
+    if (pass->preparation) {
+        prepare_fail(pass->preparation, PL_RENDERER_PREPARE_UNSUPPORTED, "unconverted FBO path");
+        return NULL;
+    }
     const int n = pass->info.stage;
     comps = PL_DEF(comps, 4);
     fmt = PL_DEF(fmt, pass->fbofmt[comps]);
@@ -509,6 +687,10 @@ static pl_tex _img_tex(struct pass_state *pass, struct img *img, pl_debug_tag ta
     }
 
     pl_renderer rr = pass->rr;
+    if (pass->preparation) {
+        prepare_fail(pass->preparation, PL_RENDERER_PREPARE_UNSUPPORTED, "unconverted image materialization");
+        return NULL;
+    }
     pl_tex tex = get_fbo(pass, img->w, img->h, img->fmt, img->comps, tag);
     img->fmt = NULL;
 
@@ -536,7 +718,7 @@ static pl_tex _img_tex(struct pass_state *pass, struct img *img, pl_debug_tag ta
     if (!ok) {
         PL_ERR(rr, "%s", PL_DEF(err_msg, "Failed dispatching intermediate pass!"));
         rr->errors |= err_enum;
-        img->sh = pl_dispatch_begin(rr->dp);
+        img->sh = pass_shader(pass, false);
         img->tex = err_tex;
         return img->tex;
     }
@@ -547,19 +729,53 @@ static pl_tex _img_tex(struct pass_state *pass, struct img *img, pl_debug_tag ta
 
 #define img_tex(pass, img) _img_tex(pass, img, PL_DEBUG_TAG)
 
-// Forcibly convert an img to `sh`, sampling where necessary
+// Materialize a logical intermediate through the selected dispatch route.
+static bool img_source(struct pass_state *pass, struct img *img, struct pl_sample_src *src)
+{
+    if (!pass->preparation) {
+        src->tex = img_tex(pass, img);
+        return src->tex != NULL;
+    }
+    pl_renderer_preparation p = pass->preparation;
+    if (img->sh) {
+        const struct pl_hook_texture *tex = prepared_texture(pass, img->w, img->h,
+                                                            img->fmt, img->comps);
+        if (!tex)
+            return false;
+        if (prepared_finish(p, pass->rr->dp, pl_dispatch_params(
+                .shader = &img->sh, .target = p->executing ? tex->texture : NULL,
+            ), &tex->params) != PL_DISPATCH_OK)
+            return false;
+        img->prepared_tex = tex;
+        img->fmt = NULL;
+    }
+    if (img->prepared_tex) {
+        src->texture = &img->prepared_tex->params;
+        src->sampler_type = img->prepared_tex->sampler_type;
+        src->tex = p->executing ? img->prepared_tex->texture : NULL;
+    } else if (img->tex) {
+        src->texture = &img->tex->params;
+        src->sampler_type = img->tex->sampler_type;
+        src->tex = p->executing ? img->tex : NULL;
+    } else {
+        prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "missing image transport");
+        return false;
+    }
+    return true;
+}
+
+// Forcibly convert an img to `sh`, sampling where necessary.
 static pl_shader img_sh(struct pass_state *pass, struct img *img)
 {
-    if (img->sh) {
-        pl_assert(!img->tex);
+    if (img->sh)
         return img->sh;
-    }
-
-    pl_assert(img->tex);
-    img->sh = pl_dispatch_begin_ex(pass->rr->dp, img->unique);
-    pl_shader_sample_direct(img->sh, pl_sample_src( .tex = img->tex ));
-
+    struct pl_sample_src src = {0};
+    if (!img_source(pass, img, &src))
+        return NULL;
+    img->sh = pass_shader(pass, img->unique);
+    pl_shader_sample_direct(img->sh, &src);
     img->tex = NULL;
+    img->prepared_tex = NULL;
     return img->sh;
 }
 
@@ -655,7 +871,8 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
         info.type = SAMPLER_COMPLEX;
 
         // Try using faster replacements for GPU built-in scalers
-        pl_fmt texfmt = src->tex ? src->tex->params.format : pass->fbofmt[4];
+        pl_fmt texfmt = src->tex ? src->tex->params.format :
+                        src->texture ? src->texture->format : pass->fbofmt[4];
         bool can_linear = texfmt->caps & PL_FMT_CAP_LINEAR;
         bool can_fast = info.dir == SAMPLER_UP || params->skip_anti_aliasing;
 
@@ -745,13 +962,13 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
     } else if (info.dir_sep[0] && info.dir_sep[1]) {
         // Scaling is needed in both directions
         struct pl_sample_src src1 = *src, src2 = *src;
-        src1.new_w = src->tex->params.w;
+        src1.new_w = src->tex ? src->tex->params.w : src->texture->w;
         src1.rect.x0 = 0;
         src1.rect.x1 = src1.new_w;;
         src2.rect.y0 = 0;
         src2.rect.y1 = src1.new_h;
 
-        pl_shader tsh = pl_dispatch_begin(rr->dp);
+        pl_shader tsh = pass_shader(pass, false);
         ok = pl_shader_sample_ortho2(tsh, &src1, &fparams);
         if (!ok) {
             pl_dispatch_abort(rr->dp, &tsh);
@@ -765,9 +982,9 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
             .comps = src->components,
         };
 
-        src2.tex = img_tex(pass, &img);
+        ok = img_source(pass, &img, &src2);
         src2.scale = 1.0;
-        ok = src2.tex && pl_shader_sample_ortho2(sh, &src2, &fparams);
+        ok = ok && pl_shader_sample_ortho2(sh, &src2, &fparams);
     } else {
         // Scaling is needed only in one direction
         ok = pl_shader_sample_ortho2(sh, src, &fparams);
@@ -775,6 +992,10 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
 
 done:
     if (!ok) {
+        if (pass->preparation) {
+            prepare_fail(pass->preparation, PL_RENDERER_PREPARE_FAILED, "required scaler failed");
+            return;
+        }
         PL_ERR(rr, "Failed dispatching scaler.. disabling");
         rr->errors |= PL_RENDER_ERR_SAMPLING;
         goto fallback;
@@ -928,7 +1149,7 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
         }
 
         // Draw parts
-        pl_shader sh = pl_dispatch_begin(rr->dp);
+        pl_shader sh = pass_shader(pass, false);
         ident_t tex = sh_desc(sh, (struct pl_shader_desc) {
             .desc = {
                 .name = "osd_tex",
@@ -1018,6 +1239,113 @@ static pl_tex get_hook_tex(void *priv, int width, int height)
     return get_fbo(pass, width, height, NULL, 4, PL_DEBUG_TAG);
 }
 
+static const struct pl_hook_texture *prepared_hook_texture(void *priv, int w, int h)
+{
+    pl_renderer_preparation p = priv;
+    const struct pl_hook_texture *tex = prepared_texture(p->current, w, h, NULL, 4);
+    if (!tex || p->executing)
+        return tex;
+    struct pl_hook_texture *view = pl_memdup(p->current->tmp, tex, sizeof(*view));
+    view->texture = NULL;
+    return view;
+}
+
+static bool pass_hook_prepared(struct pass_state *pass, struct img *img,
+    enum pl_hook_stage stage, const struct pl_hook *const *hooks, int count,
+    const struct pl_color_map_args *color_map)
+{
+    pl_renderer_preparation p = pass->preparation;
+    bool applied = false;
+    for (int i = 0; i < count && p->result == PL_RENDERER_PREPARE_OK; i++) {
+        const struct pl_hook *hook = hooks[i];
+        if (!(hook->stages & stage))
+            continue;
+        if (!hook->describe || !hook->execute_prepared) {
+            prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED, "hook lacks explicit preparation callbacks");
+            break;
+        }
+        struct pl_color_map_args mapping = color_map ? *color_map : (struct pl_color_map_args) {0};
+        if (!p->executing)
+            mapping.state = NULL;
+        struct pl_hook_prepare_params hp = {
+            .gpu = pass->rr->gpu, .dispatch = pass->rr->dp, .context = p,
+            .begin = prepared_begin, .finish = prepared_finish, .compute = prepared_compute,
+            .get_tex = prepared_hook_texture, .stage = stage,
+            .rect = img->rect, .repr = img->repr, .color = img->color,
+            .orig_repr = &pass->image.repr, .orig_color = &pass->image.color,
+            .components = img->comps, .width = img->w, .height = img->h,
+            .src_rect = pass->ref_rect, .dst_rect = pass->dst_rect,
+            .color_map = color_map ? &mapping : NULL,
+            .color_map_params = color_map ? pass->params->color_map_params : NULL,
+        };
+        if (hook->input == PL_HOOK_SIG_TEX) {
+            struct pl_sample_src src = {0};
+            if (!img_source(pass, img, &src))
+                break;
+            hp.tex = (struct pl_hook_texture) {
+                .texture = src.tex,
+                .params = src.tex ? src.tex->params : *src.texture,
+                .sampler_type = src.tex ? src.tex->sampler_type : src.sampler_type,
+            };
+            hp.tex.params.initial_data = NULL;
+        } else if (hook->input == PL_HOOK_SIG_COLOR) {
+            hp.sh = img_sh(pass, img);
+        } else if (hook->input != PL_HOOK_SIG_NONE) {
+            prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "invalid hook input signature");
+            break;
+        }
+        struct pl_hook_prepare_result res = p->executing
+            ? hook->execute_prepared(hook->priv, &hp) : hook->describe(hook->priv, &hp);
+        if (res.status != PL_DISPATCH_OK) {
+            prepare_fail(p, res.status == PL_DISPATCH_NOT_READY ? PL_RENDERER_PREPARE_NOT_READY :
+                            res.status == PL_DISPATCH_UNSUPPORTED ? PL_RENDERER_PREPARE_UNSUPPORTED
+                                                                 : PL_RENDERER_PREPARE_FAILED,
+                         "explicit hook callback failed");
+            break;
+        }
+        if (res.output == PL_HOOK_SIG_NONE) {
+            applied = true;
+            continue;
+        }
+        int w, h;
+        if (res.output == PL_HOOK_SIG_TEX) {
+            if (!res.tex.params.format || (p->executing && !res.tex.texture)) {
+                prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "hook returned invalid texture transport");
+                break;
+            }
+            w = res.tex.params.w;
+            h = res.tex.params.h;
+        } else if (res.output == PL_HOOK_SIG_COLOR && res.sh) {
+            w = res.sh->output_w;
+            h = res.sh->output_h;
+        } else {
+            prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "hook returned invalid output signature");
+            break;
+        }
+        if (w <= 0 || h <= 0 || (!pl_hook_stage_resizable(stage) &&
+            (w != img->w || h != img->h || !pl_rect2d_eq(res.rect, img->rect)))) {
+            prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "hook output dimensions are incompatible");
+            break;
+        }
+        bool unique = img->unique;
+        *img = (struct img) {
+            .w = w, .h = h, .repr = res.repr, .color = res.color,
+            .comps = res.components, .rect = res.rect, .unique = unique,
+        };
+        if (res.output == PL_HOOK_SIG_COLOR) {
+            img->sh = res.sh;
+        } else {
+            struct pl_hook_texture *view = pl_memdup(pass->tmp, &res.tex, sizeof(res.tex));
+            view->params.initial_data = NULL;
+            if (!p->executing)
+                view->texture = NULL;
+            img->prepared_tex = view;
+        }
+        applied = true;
+    }
+    return applied;
+}
+
 // Returns if any hook was applied (even if there were errors)
 static bool pass_hook_list(struct pass_state *pass, struct img *img,
                            enum pl_hook_stage stage,
@@ -1026,6 +1354,8 @@ static bool pass_hook_list(struct pass_state *pass, struct img *img,
 {
     const struct pl_render_params *params = pass->params;
     pl_renderer rr = pass->rr;
+    if (pass->preparation)
+        return pass_hook_prepared(pass, img, stage, hooks, num_hooks, color_map);
     if (!pass->fbofmt[4] || !stage)
         return false;
 
@@ -1166,7 +1496,7 @@ hook_error:
     // Make sure the state remains as valid as possible, even if the resulting
     // shaders might end up nonsensical, to prevent segfaults
     if (!img->tex && !img->sh)
-        img->sh = pl_dispatch_begin(rr->dp);
+        img->sh = pass_shader(pass, false);
     return ret;
 }
 
@@ -1336,7 +1666,7 @@ static bool plane_deband(struct pass_state *pass, struct img *img, float neutral
     memcpy(dparams.grain_neutral, neutral, sizeof(dparams.grain_neutral));
 
     img->tex = NULL;
-    img->sh = pl_dispatch_begin_ex(rr->dp, true);
+    img->sh = pass_shader(pass, true);
     pl_shader_deband(img->sh, &src, &dparams);
     img->err_msg = "Failed applying debanding... disabling!";
     img->err_enum = PL_RENDER_ERR_DEBANDING;
@@ -1406,7 +1736,7 @@ static bool plane_film_grain(struct pass_state *pass, int plane_idx,
     if (!grain_params.tex)
         return false;
 
-    img->sh = pl_dispatch_begin_ex(rr->dp, true);
+    img->sh = pass_shader(pass, true);
     if (!pl_shader_film_grain(img->sh, &rr->grain_state[plane_idx], &grain_params)) {
         pl_dispatch_abort(rr->dp, &img->sh);
         rr->errors |= PL_RENDER_ERR_FILM_GRAIN;
@@ -1597,7 +1927,7 @@ static bool pass_read_image(struct pass_state *pass)
             };
 
             img->tex = NULL;
-            img->sh = pl_dispatch_begin_ex(pass->rr->dp, true);
+            img->sh = pass_shader(pass, true);
             pl_shader_deinterlace(img->sh, &src, params->deinterlace_params);
             img->err_msg = "Failed deinterlacing plane.. disabling!";
             img->err_enum = PL_RENDER_ERR_DEINTERLACING;
@@ -1634,14 +1964,14 @@ static bool pass_read_image(struct pass_state *pass)
             PL_TRACE(rr, "Merging plane %d into plane %d", j, i);
             pl_shader sh = sti->img.sh;
             if (!sh) {
-                sh = sti->img.sh = pl_dispatch_begin_ex(pass->rr->dp, true);
+                sh = sti->img.sh = pass_shader(pass, true);
                 pl_shader_sample_direct(sh, pl_sample_src( .tex = sti->img.tex ));
                 sti->img.tex = NULL;
             }
 
             pl_shader psh = NULL;
             if (!stj->img.sh) {
-                psh = pl_dispatch_begin_ex(pass->rr->dp, true);
+                psh = pass_shader(pass, true);
                 pl_shader_sample_direct(psh, pl_sample_src( .tex = stj->img.tex ));
             }
 
@@ -1779,7 +2109,7 @@ static bool pass_read_image(struct pass_state *pass)
         }
     }
 
-    pl_shader sh = pl_dispatch_begin_ex(rr->dp, true);
+    pl_shader sh = pass_shader(pass, true);
     sh_require(sh, PL_SHADER_SIG_NONE, 0, 0);
 
     // Initialize the color to black
@@ -1852,9 +2182,11 @@ static bool pass_read_image(struct pass_state *pass)
         {
             // Image rects are already equal, no indirect scaling needed
         } else {
-            src.tex = img_tex(pass, &st->img);
+            if (!img_source(pass, &st->img, &src))
+                return false;
             st->img.tex = NULL;
-            st->img.sh = pl_dispatch_begin_ex(rr->dp, true);
+            st->img.prepared_tex = NULL;
+            st->img.sh = pass_shader(pass, true);
             dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
                              SAMPLER_PLANE, NULL, &src);
             st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
@@ -2053,14 +2385,14 @@ static bool pass_scale_main(struct pass_state *pass)
 
     pass_hook(pass, img, PL_HOOK_PRE_KERNEL);
 
-    src.tex = img_tex(pass, img);
-    if (!src.tex)
+    if (!img_source(pass, img, &src))
         return false;
     pass->need_peak_fbo = false;
 
-    pl_shader sh = pl_dispatch_begin_ex(rr->dp, true);
+    pl_shader sh = pass_shader(pass, true);
     dispatch_sampler(pass, sh, &rr->sampler_main, SAMPLER_MAIN, NULL, &src);
     img->tex  = NULL;
+    img->prepared_tex = NULL;
     img->sh   = sh;
     img->w    = src.new_w;
     img->h    = src.new_h;
@@ -2109,7 +2441,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
     if (!inter_tex || !out_tex)
         goto error;
 
-    pl_shader sh = pl_dispatch_begin(rr->dp);
+    pl_shader sh = pass_shader(pass, false);
     pl_shader_sample_direct(sh, pl_sample_src( .tex = img->tex ));
     pl_shader_extract_features(sh, img->color);
     bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
@@ -2128,7 +2460,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
         .new_h        = cr_h,
     };
 
-    sh = pl_dispatch_begin(rr->dp);
+    sh = pass_shader(pass, false);
     dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_LOWPASS, out_tex, &src);
     ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
         .shader = &sh,
@@ -2323,7 +2655,7 @@ static bool pass_error_diffusion(struct pass_state *pass, pl_shader *sh,
     if (!edpars.input_tex || !edpars.output_tex)
         goto error;
 
-    pl_shader dsh = pl_dispatch_begin(rr->dp);
+    pl_shader dsh = pass_shader(pass, false);
     if (!pl_shader_error_diffusion(dsh, &edpars)) {
         pl_dispatch_abort(rr->dp, &dsh);
         goto error;
@@ -2342,7 +2674,7 @@ static bool pass_error_diffusion(struct pass_state *pass, pl_shader *sh,
         ));
     }
 
-    *sh = pl_dispatch_begin(rr->dp);
+    *sh = pass_shader(pass, false);
     pl_shader_sample_direct(*sh, pl_sample_src(
         .tex = ok ? edpars.output_tex : edpars.input_tex,
     ));
@@ -2393,7 +2725,7 @@ static pl_tex pass_blur(struct pass_state *pass, pl_tex src_tex, int comps,
     h = prev->params.h;
 
     for (int i = 0; i < passes; i++) {
-        pl_shader sh = pl_dispatch_begin(rr->dp);
+        pl_shader sh = pass_shader(pass, false);
         sh_describef(sh, "blur downscale pass %d", i+1);
         sh->output = PL_SHADER_SIG_COLOR;
 
@@ -2431,7 +2763,7 @@ static pl_tex pass_blur(struct pass_state *pass, pl_tex src_tex, int comps,
         return prev; // upscaling won't change result
 
     for (int i = passes - 1; i >= 0; i--) {
-        pl_shader sh = pl_dispatch_begin(rr->dp);
+        pl_shader sh = pass_shader(pass, false);
         sh_describef(sh, "blur upscale pass %d", passes - i);
         sh->output = PL_SHADER_SIG_COLOR;
 
@@ -2738,7 +3070,7 @@ static bool pass_output_target(struct pass_state *pass)
         img->w = abs(pl_rect_w(dst_rect));
         img->h = abs(pl_rect_h(dst_rect));
         img->tex = NULL;
-        img->sh = sh = pl_dispatch_begin(rr->dp);
+        img->sh = sh = pass_shader(pass, false);
         pl_shader_distort(sh, tex, img->w, img->h, &dpars);
     }
 
@@ -2922,7 +3254,7 @@ static bool pass_output_target(struct pass_state *pass)
                      src.rect.x0, src.rect.y0,
                      src.rect.x1, src.rect.y1);
 
-            sh = pl_dispatch_begin(rr->dp);
+            sh = pass_shader(pass, false);
             dispatch_sampler(pass, sh, &rr->samplers_dst[p], SAMPLER_PLANE,
                              plane->texture, &src);
 
@@ -2932,7 +3264,8 @@ static bool pass_output_target(struct pass_state *pass)
             // it's incompatible with the FBO capabilities
             bool is_comp = pl_shader_is_compute(img_sh(pass, img));
             if (is_comp && !plane->texture->params.storable) {
-                if (!img_tex(pass, img)) {
+                struct pl_sample_src intermediate = {0};
+                if (!img_source(pass, img, &intermediate)) {
                     PL_ERR(rr, "Rendering requires compute shaders, but output "
                            "is not storable, and FBOs are unavailable. This "
                            "combination is unsupported.");
@@ -2962,7 +3295,8 @@ static bool pass_output_target(struct pass_state *pass)
             }
         }
 
-        if (applied_dither != rr->prev_dither) {
+        if ((!pass->preparation || pass->preparation->executing) &&
+            applied_dither != rr->prev_dither) {
             if (applied_dither) {
                 PL_INFO(rr, "Dithering to %d bit depth", applied_dither);
             } else {
@@ -2999,12 +3333,15 @@ static bool pass_output_target(struct pass_state *pass)
             tscale.c[1] += plane->texture->params.h;
         }
 
-        bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
+        struct pl_dispatch_params dispatch = {
             .shader = &sh,
             .target = plane->texture,
             .blend_params = params->blend_params,
             .rect = plane_rect,
-        ));
+        };
+        bool ok = pass->preparation
+            ? prepared_finish(pass->preparation, rr->dp, &dispatch, NULL) == PL_DISPATCH_OK
+            : pl_dispatch_finish(rr->dp, &dispatch);
 
         if (!ok)
             return false;
@@ -3379,6 +3716,14 @@ void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
 
 static bool pass_init(struct pass_state *pass, bool acquire_image)
 {
+    if (pass->preparation) {
+        if (!validate_structs(pass->rr, &pass->image, &pass->target))
+            return false;
+        find_fbo_format(pass);
+        pass_fix_frames(pass);
+        pass->tmp = pl_tmp(NULL);
+        return true;
+    }
     struct pl_frame *image = pass->src_ref < 0 ? NULL : &pass->image;
     struct pl_frame *target = &pass->target;
 
@@ -4296,4 +4641,268 @@ void pl_renderer_reset_errors(pl_renderer rr,
         if (rr->disabled_hooks.num)
             rr->errors |= PL_RENDER_ERR_HOOKS;
         return;
+}
+
+static bool preparation_shape(struct prepared_frame_shape *stored,
+                               const struct pl_frame *frame, bool compare)
+{
+    const struct pl_plane *plane = &frame->planes[0];
+    const struct pl_tex_params *tex = &plane->texture->params;
+    if (!compare) {
+        *stored = (struct prepared_frame_shape) {
+            .w = tex->w, .h = tex->h, .d = tex->d, .format = tex->format,
+            .sampleable = tex->sampleable, .renderable = tex->renderable,
+            .storable = tex->storable, .sampler_type = plane->texture->sampler_type,
+            .plane = *plane, .crop = frame->crop,
+        };
+        stored->plane.texture = NULL;
+        return true;
+    }
+    return stored->w == tex->w && stored->h == tex->h && stored->d == tex->d &&
+        stored->format == tex->format && stored->sampleable == tex->sampleable &&
+        stored->renderable == tex->renderable && stored->storable == tex->storable &&
+        stored->sampler_type == plane->texture->sampler_type &&
+        stored->plane.address_mode == plane->address_mode &&
+        stored->plane.flipped == plane->flipped && stored->plane.components == plane->components &&
+        !memcmp(stored->plane.component_mapping, plane->component_mapping, sizeof(plane->component_mapping)) &&
+        stored->plane.shift_x == plane->shift_x && stored->plane.shift_y == plane->shift_y &&
+        pl_rect2d_eq(stored->crop, frame->crop);
+}
+
+static bool preparation_admit(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target)
+{
+    const struct pl_render_params *params = p->snapshot.params;
+    if (!image || !target || image->num_planes != 1 || target->num_planes != 1 ||
+        image->acquire || image->release || target->acquire || target->release ||
+        image->prev || image->next || image->field != PL_FIELD_NONE ||
+        image->film_grain.type || image->repr.dovi || target->repr.dovi ||
+        image->icc || target->icc ||
+        image->profile.data || target->profile.data || image->lut || target->lut ||
+        image->num_overlays || target->num_overlays || image->rotation || target->rotation ||
+        params->deband_params || params->deinterlace_params || params->peak_detect_params ||
+        params->error_diffusion || params->distort_params || params->lut ||
+        params->frame_mixer || params->disable_fbos ||
+        (params->color_map_params && params->color_map_params->contrast_recovery))
+    {
+        prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED,
+                     "selected feature is outside the current strict image subset");
+        return false;
+    }
+    if (params->num_hooks < 0 || params->num_color_map_hooks < 0 ||
+        (params->num_hooks && !params->hooks) ||
+        (params->num_color_map_hooks && !params->color_map_hooks)) {
+        prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "invalid hook arrays");
+        return false;
+    }
+    const enum pl_hook_stage plane_stages = PL_HOOK_RGB_INPUT | PL_HOOK_LUMA_INPUT |
+        PL_HOOK_CHROMA_INPUT | PL_HOOK_ALPHA_INPUT | PL_HOOK_XYZ_INPUT |
+        PL_HOOK_CHROMA_SCALED | PL_HOOK_ALPHA_SCALED;
+    for (int list = 0; list < 2; list++) {
+        int count = list ? params->num_color_map_hooks : params->num_hooks;
+        const struct pl_hook *const *hooks = list ? params->color_map_hooks : params->hooks;
+        for (int i = 0; i < count; i++) {
+            if (!hooks[i] || !hooks[i]->describe || !hooks[i]->execute_prepared ||
+                (hooks[i]->stages & plane_stages)) {
+                prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED,
+                             "selected hook lacks supported explicit preparation");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target)
+{
+    if (!preparation_admit(p, image, target))
+        return p->result;
+    p->pass_index = p->texture_index = 0;
+    p->shader_id = 0;
+    struct pass_state pass = {
+        .rr = p->rr, .preparation = p, .params = p->snapshot.params,
+        .image = *image, .target = *target, .info.stage = PL_RENDER_STAGE_FRAME,
+    };
+    p->current = &pass;
+    if (!pass_init(&pass, false)) {
+        prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "invalid source or target frame");
+        goto done;
+    }
+    if (!pass.fbofmt[4] || pl_frame_is_cropped(&pass.target) ||
+        !pl_rect_w(pass.dst_rect) || !pl_rect_h(pass.dst_rect)) {
+        prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED,
+                     "target clear/cropped/empty path is not yet described");
+        goto done;
+    }
+    if (!pass.params->num_color_map_hooks &&
+        !pl_color_space_equal(&pass.image.color, &pass.target.color)) {
+        prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED,
+                     "native color-map variants are not yet described");
+        goto done;
+    }
+    if (!preparation_shape(&p->image_shape, &pass.image, p->checking || p->executing) ||
+        !preparation_shape(&p->target_shape, &pass.target, p->checking || p->executing)) {
+        prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "frame shape differs from prepared generation");
+        goto done;
+    }
+    if (p->executing)
+        pl_dispatch_callback(p->rr->dp, &pass, info_callback);
+    if (!pass_read_image(&pass) || p->result != PL_RENDERER_PREPARE_OK)
+        goto failed;
+    if (!pass_scale_main(&pass) || p->result != PL_RENDERER_PREPARE_OK)
+        goto failed;
+    pass_convert_colors(&pass);
+    if (p->result != PL_RENDERER_PREPARE_OK || !pass_output_target(&pass))
+        goto failed;
+    if (p->rr->errors || p->rr->disabled_hooks.num)
+        goto failed;
+    if ((p->checking || p->executing) &&
+        (p->pass_index != p->passes.num || p->texture_index != p->textures.num))
+        prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "selected graph lost a required pass or resource");
+    goto done;
+failed:
+    prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "strict renderer shader generation failed");
+done:
+    if (p->executing)
+        pl_dispatch_callback(p->rr->dp, NULL, NULL);
+    pass_uninit(&pass);
+    p->current = NULL;
+    return p->result;
+}
+
+enum pl_renderer_prepare_result pl_renderer_describe_image(pl_renderer renderer,
+    const struct pl_frame *image, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out)
+{
+    if (out)
+        *out = NULL;
+    if (!out || !renderer || !snapshot || !snapshot->params ||
+        !snapshot->retain || !snapshot->release)
+        return PL_RENDERER_PREPARE_INVALID;
+    if (!pl_pass_prepare_supported(renderer->gpu))
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
+    pl_renderer_preparation p = pl_zalloc_ptr(NULL, p);
+    p->snapshot = *snapshot;
+    snapshot->retain(snapshot->owner);
+    p->rr = pl_renderer_create(renderer->log, renderer->gpu);
+    enum pl_renderer_prepare_result result = preparation_traverse(p, image, target);
+    if (result != PL_RENDERER_PREPARE_OK) {
+        pl_renderer_prepare_destroy(&p);
+        return result;
+    }
+    *out = p;
+    return PL_RENDERER_PREPARE_OK;
+}
+
+enum pl_renderer_prepare_result pl_renderer_prepare_submit(pl_renderer_preparation p)
+{
+    if (!p || p->submitted)
+        return PL_RENDERER_PREPARE_INVALID;
+    if (p->result != PL_RENDERER_PREPARE_OK)
+        return p->result;
+    p->submitted = true;
+    for (int i = 0; i < p->textures.num; i++) {
+        struct pl_hook_texture *tex = p->textures.elem[i];
+        tex->texture = pl_tex_create(p->rr->gpu, &tex->params);
+        if (!tex->texture) {
+            prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "intermediate resource staging failed");
+            return p->result;
+        }
+    }
+    for (int i = 0; i < p->luts.num; i++) {
+        if (!sh_lut_stage(p->luts.elem[i])) {
+            prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "LUT resource staging failed");
+            return p->result;
+        }
+    }
+    for (int i = 0; i < p->passes.num; i++) {
+        struct prepared_render_pass *pass = &p->passes.elem[i];
+        if (pl_dispatch_prepare_submit(&pass->description, &pass->request) != PL_PASS_PREPARE_ACCEPTED) {
+            prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "dispatch preparation admission rejected");
+            return p->result;
+        }
+    }
+    return PL_RENDERER_PREPARE_OK;
+}
+
+enum pl_pass_prepare_state pl_renderer_prepare_poll(pl_renderer_preparation p)
+{
+    if (!p || p->result != PL_RENDERER_PREPARE_OK)
+        return PL_PASS_PREPARE_FAILED;
+    if (!p->submitted)
+        return PL_PASS_PREPARE_PENDING;
+    bool pending = false;
+    for (int i = 0; i < p->passes.num; i++) {
+        struct prepared_render_pass *pass = &p->passes.elem[i];
+        if (pass->ready)
+            continue;
+        enum pl_pass_prepare_state state = pl_dispatch_prepare_poll(pass->request);
+        if (state == PL_PASS_PREPARE_FAILED || state == PL_PASS_PREPARE_CANCELLED) {
+            const char *error = pl_dispatch_prepare_error(pass->request);
+            prepare_fail(p, PL_RENDERER_PREPARE_FAILED,
+                         error ? pl_strdup0(p, pl_str0(error)) : "dispatch preparation cancelled");
+            return state;
+        }
+        if (state == PL_PASS_PREPARE_READY)
+            pl_dispatch_prepare_take(&pass->request, &pass->ready);
+        else
+            pending = true;
+    }
+    return pending ? PL_PASS_PREPARE_PENDING : PL_PASS_PREPARE_READY;
+}
+
+const char *pl_renderer_prepare_error(pl_renderer_preparation p)
+{
+    return p ? p->error : "invalid preparation";
+}
+
+void pl_renderer_prepare_destroy(pl_renderer_preparation *ptr)
+{
+    pl_renderer_preparation p = *ptr;
+    if (!p)
+        return;
+    for (int i = 0; i < p->passes.num; i++) {
+        struct prepared_render_pass *pass = &p->passes.elem[i];
+        pl_dispatch_description_destroy(&pass->description);
+        pl_dispatch_prepare_release(&pass->request);
+        pl_dispatch_prepared_destroy(&pass->ready);
+    }
+    for (int i = 0; i < p->textures.num; i++)
+        pl_tex_destroy(p->rr->gpu, &p->textures.elem[i]->texture);
+    pl_renderer_destroy(&p->rr);
+    p->snapshot.release(p->snapshot.owner);
+    pl_free(p);
+    *ptr = NULL;
+}
+
+enum pl_renderer_prepare_result pl_renderer_preflight_image(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target)
+{
+    if (!p)
+        return PL_RENDERER_PREPARE_INVALID;
+    if (pl_renderer_prepare_poll(p) != PL_PASS_PREPARE_READY)
+        return p->result == PL_RENDERER_PREPARE_OK ? PL_RENDERER_PREPARE_NOT_READY : p->result;
+    p->checking = true;
+    p->error = NULL;
+    enum pl_render_error prior_errors = p->rr->errors;
+    enum pl_renderer_prepare_result result = preparation_traverse(p, image, target);
+    p->checking = false;
+    p->rr->errors = prior_errors;
+    p->result = PL_RENDERER_PREPARE_OK;
+    return result;
+}
+
+enum pl_renderer_prepare_result pl_render_image_prepared(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target)
+{
+    enum pl_renderer_prepare_result result = pl_renderer_preflight_image(p, image, target);
+    if (result != PL_RENDERER_PREPARE_OK)
+        return result;
+    p->executing = true;
+    result = preparation_traverse(p, image, target);
+    p->executing = false;
+    if (result == PL_RENDERER_PREPARE_OK)
+        p->frame_index++;
+    return result;
 }
