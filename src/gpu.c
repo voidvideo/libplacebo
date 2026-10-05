@@ -26,6 +26,7 @@ void pl_gpu_destroy(pl_gpu gpu)
         return;
 
     struct pl_gpu_fns *impl = PL_PRIV(gpu);
+    pl_pass_prepare_uninit(gpu);
     pl_dispatch_destroy(&impl->dp);
     impl->destroy(gpu);
 }
@@ -1027,12 +1028,19 @@ static void log_spec_constants(pl_log log, enum pl_log_level lev,
     }
 }
 
-pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
+bool pl_pass_params_valid(pl_gpu gpu, const struct pl_pass_params *params)
 {
+    require(params);
     require(params->glsl_shader);
+    require(params->type > PL_PASS_INVALID && params->type < PL_PASS_TYPE_COUNT);
+    require(params->num_variables >= 0 && (!params->num_variables || params->variables));
+    require(params->num_descriptors >= 0 && (!params->num_descriptors || params->descriptors));
+    require(params->num_constants >= 0 && (!params->num_constants || params->constants));
+    require(params->num_vertex_attribs >= 0 && (!params->num_vertex_attribs || params->vertex_attribs));
     switch(params->type) {
     case PL_PASS_RASTER:
         require(params->vertex_shader);
+        require(params->vertex_type >= 0 && params->vertex_type < PL_PRIM_TYPE_COUNT);
         require(params->vertex_stride % gpu->limits.align_vertex_stride == 0);
         for (int i = 0; i < params->num_vertex_attribs; i++) {
             struct pl_vertex_attrib va = params->vertex_attribs[i];
@@ -1065,12 +1073,18 @@ pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
     require(num_var_comps <= gpu->limits.max_variable_comps);
 
     require(params->num_constants <= gpu->limits.max_constants);
-    for (int i = 0; i < params->num_constants; i++)
-        require(params->constants[i].type);
+    for (int i = 0; i < params->num_constants; i++) {
+        const struct pl_constant *c = &params->constants[i];
+        require(c->type == PL_VAR_SINT || c->type == PL_VAR_UINT || c->type == PL_VAR_FLOAT);
+        require(c->offset <= SIZE_MAX - pl_var_type_size(c->type));
+    }
 
     for (int i = 0; i < params->num_descriptors; i++) {
         struct pl_desc desc = params->descriptors[i];
         require(desc.name);
+        require(desc.type > PL_DESC_INVALID && desc.type < PL_DESC_TYPE_COUNT);
+        require(desc.access >= 0 && desc.access < PL_DESC_ACCESS_COUNT);
+        require(desc.binding >= 0);
 
         // enforce disjoint descriptor bindings for each namespace
         int namespace = pl_desc_namespace(gpu, desc.type);
@@ -1083,6 +1097,16 @@ pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
 
     require(params->push_constants_size <= gpu->limits.max_pushc_size);
     require(params->push_constants_size == PL_ALIGN2(params->push_constants_size, 4));
+
+    return true;
+error:
+    return false;
+}
+
+pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
+{
+    if (!pl_pass_params_valid(gpu, params))
+        return NULL;
 
     log_shader_sources(gpu->log, PL_LOG_DEBUG, params);
     log_spec_constants(gpu->log, PL_LOG_DEBUG, params, params->constant_data);
@@ -1113,7 +1137,17 @@ void pl_pass_destroy(pl_gpu gpu, pl_pass *pass)
 
 void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
 {
+    (void) pl_pass_run_checked(gpu, params, false);
+}
+
+enum pl_prepared_pass_run_result pl_pass_run_checked(
+    pl_gpu gpu, const struct pl_pass_run_params *params, bool prepared)
+{
+    require(params && params->pass);
     pl_pass pass = params->pass;
+    require(!pass->params.num_descriptors || params->desc_bindings);
+    require(params->num_var_updates >= 0);
+    require(!params->num_var_updates || params->var_updates);
     struct pl_pass_run_params new = *params;
 
     for (int i = 0; i < pass->params.num_descriptors; i++) {
@@ -1236,7 +1270,7 @@ void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
         // Scissors wholly outside target -> silently drop pass (also needed
         // to ensure we don't cause UB by specifying invalid scissors)
         if (!pl_rect_w(*sc) || !pl_rect_h(*sc))
-            return;
+            return PL_PREPARED_PASS_RUN_OK;
 
         require(pl_rect_w(*vp) > 0);
         require(pl_rect_h(*vp) > 0);
@@ -1267,10 +1301,15 @@ void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
     }
 
     const struct pl_gpu_fns *impl = PL_PRIV(gpu);
+    if (prepared) {
+        return impl->pass_run_prepared(gpu, &new)
+                   ? PL_PREPARED_PASS_RUN_OK : PL_PREPARED_PASS_RUN_FAILED;
+    }
     impl->pass_run(gpu, &new);
+    return PL_PREPARED_PASS_RUN_OK;
 
 error:
-    return;
+    return PL_PREPARED_PASS_RUN_INVALID;
 }
 
 void pl_gpu_flush(pl_gpu gpu)

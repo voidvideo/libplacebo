@@ -283,6 +283,7 @@ pl_gpu pl_gpu_finalize(struct pl_gpu_t *gpu)
     struct pl_gpu_fns *impl = PL_PRIV(gpu);
     atomic_init(&impl->cache, NULL);
     impl->dp = pl_dispatch_create(gpu->log, gpu);
+    pl_pass_prepare_init(gpu);
     return gpu;
 }
 
@@ -1166,11 +1167,18 @@ error:
 
 void pl_pass_run_vbo(pl_gpu gpu, const struct pl_pass_run_params *params)
 {
+    (void) pl_pass_run_vbo_checked(gpu, params, false);
+}
+
+enum pl_prepared_pass_run_result pl_pass_run_vbo_checked(
+    pl_gpu gpu, const struct pl_pass_run_params *params, bool prepared)
+{
     if (!params->vertex_data && !params->index_data)
-        return pl_pass_run(gpu, params);
+        return pl_pass_run_checked(gpu, params, prepared);
 
     struct pl_pass_run_params newparams = *params;
     pl_buf vert = NULL, index = NULL;
+    enum pl_prepared_pass_run_result result = PL_PREPARED_PASS_RUN_FAILED;
 
     if (params->vertex_data) {
         vert = pl_buf_create(gpu, pl_buf_params(
@@ -1181,7 +1189,7 @@ void pl_pass_run_vbo(pl_gpu gpu, const struct pl_pass_run_params *params)
 
         if (!vert) {
             PL_ERR(gpu, "Failed allocating vertex buffer!");
-            return;
+            goto done;
         }
 
         newparams.vertex_buf = vert;
@@ -1197,16 +1205,18 @@ void pl_pass_run_vbo(pl_gpu gpu, const struct pl_pass_run_params *params)
 
         if (!index) {
             PL_ERR(gpu, "Failed allocating index buffer!");
-            return;
+            goto done;
         }
 
         newparams.index_buf = index;
         newparams.index_data = NULL;
     }
 
-    pl_pass_run(gpu, &newparams);
+    result = pl_pass_run_checked(gpu, &newparams, prepared);
+done:
     pl_buf_destroy(gpu, &vert);
     pl_buf_destroy(gpu, &index);
+    return result;
 }
 
 struct pl_pass_params pl_pass_params_copy(void *alloc, const struct pl_pass_params *params)

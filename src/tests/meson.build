@@ -2,6 +2,11 @@ gpu_tests = [
   'vulkan.c', 'opengl_surfaceless.c', 'd3d11.c', 'dummy.c'
 ]
 
+tests += 'pass_prepare.c'
+if components.get('vulkan') and components.get('vk-proc-addr')
+  tests += 'pass_prepare_vulkan.c'
+endif
+
 ts = []
 
 foreach t : tests
@@ -9,7 +14,7 @@ foreach t : tests
   if t == 'opengl_surfaceless.c'
     deps += glad_dep
   endif
-  if t == 'vulkan.c'
+  if t == 'vulkan.c' or t == 'pass_prepare_vulkan.c'
     deps += vulkan_headers
   endif
   sources = []

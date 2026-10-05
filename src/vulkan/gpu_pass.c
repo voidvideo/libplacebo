@@ -288,6 +288,14 @@ static VkResult vk_recreate_pipelines(struct vk_ctx *vk, pl_pass pass,
 
 pl_pass vk_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
 {
+    enum pl_pass_prepare_phase phase;
+    return vk_pass_create_prepared(gpu, params, &phase);
+}
+
+pl_pass vk_pass_create_prepared(pl_gpu gpu, const struct pl_pass_params *params,
+                                enum pl_pass_prepare_phase *phase)
+{
+    *phase = PL_PASS_PREPARE_PHASE_RESOURCES;
     struct pl_vk *p = PL_PRIV(gpu);
     struct vk_ctx *vk = p->vk;
     bool success = false;
@@ -454,6 +462,7 @@ no_descriptors: ;
     VK(vk->CreatePipelineLayout(vk->dev, &linfo, PL_VK_ALLOC,
                                 &pass_vk->pipeLayout));
 
+    *phase = PL_PASS_PREPARE_PHASE_TRANSLATION;
     pl_cache_obj vert = {0}, frag = {0}, comp = {0};
     switch (params->type) {
     case PL_PASS_RASTER: ;
@@ -468,6 +477,7 @@ no_descriptors: ;
         pl_unreachable();
     }
 
+    *phase = PL_PASS_PREPARE_PHASE_PIPELINE;
     // Use hash of generated SPIR-V as key for pipeline cache
     const pl_cache cache = pl_gpu_cache(gpu);
     pl_cache_obj pipecache = {0};
@@ -801,7 +811,8 @@ static bool need_respec(pl_pass pass, const struct pl_pass_run_params *params)
     return false;
 }
 
-void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+static bool pass_run(pl_gpu gpu, const struct pl_pass_run_params *params,
+                     bool prepared)
 {
     struct pl_vk *p = PL_PRIV(gpu);
     struct vk_ctx *vk = p->vk;
@@ -809,10 +820,10 @@ void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
     struct pl_pass_vk *pass_vk = PL_PRIV(pass);
 
     if (params->vertex_data || params->index_data)
-        return pl_pass_run_vbo(gpu, params);
+        return pl_pass_run_vbo_checked(gpu, params, prepared) == PL_PREPARED_PASS_RUN_OK;
 
     // Check if we need to re-specialize this pipeline
-    if (need_respec(pass, params)) {
+    if (!prepared && need_respec(pass, params)) {
         pl_clock_t start = pl_clock_now();
         VK(vk_recreate_pipelines(vk, pass, false, pass_vk->base, &pass_vk->pipe));
         pl_log_cpu_time(gpu->log, start, pl_clock_now(), "re-specializing shader");
@@ -1008,8 +1019,18 @@ void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
         vk_release_descriptor(gpu, cmd, pass, params->desc_bindings[i], i);
 
     // submit this command buffer for better intra-frame granularity
-    CMD_SUBMIT(&cmd);
+    return CMD_SUBMIT(&cmd);
 
 error:
-    return;
+    return false;
+}
+
+void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    (void) pass_run(gpu, params, false);
+}
+
+bool vk_pass_run_prepared(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    return pass_run(gpu, params, true);
 }
