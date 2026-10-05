@@ -922,6 +922,25 @@ PL_API enum pl_renderer_prepare_result pl_render_image_prepared(
     pl_renderer_preparation preparation, const struct pl_frame *image,
     const struct pl_frame *target);
 
+// Strict equivalents of pl_render_image_mix for a disabled frame mixer. The
+// nearest input frame is selected; the ordinary skip_caching_single_frame /
+// trivial-parameters rule selects direct rendering or candidate-owned caching.
+// Both cache population and presentation are prepared up front. Repeated input
+// signatures reuse the cached frame and do not rerun source/analysis hooks.
+// The caller must change the input signature when source content or upstream
+// hook runtime values change (e.g. combine a content revision with that signature).
+// Enabled mixing and empty input are currently UNSUPPORTED. Preparations made
+// with these APIs must also be preflighted/executed with the mix variants.
+PL_API enum pl_renderer_prepare_result pl_renderer_describe_image_mix(
+    pl_renderer renderer, const struct pl_frame_mix *images, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out);
+PL_API enum pl_renderer_prepare_result pl_renderer_preflight_image_mix(
+    pl_renderer_preparation preparation, const struct pl_frame_mix *images,
+    const struct pl_frame *target);
+PL_API enum pl_renderer_prepare_result pl_render_image_mix_prepared(
+    pl_renderer_preparation preparation, const struct pl_frame_mix *images,
+    const struct pl_frame *target);
+
 PL_API_END
 
 #endif // LIBPLACEBO_RENDERER_H_

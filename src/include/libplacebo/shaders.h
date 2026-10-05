@@ -287,6 +287,13 @@ PL_API const struct pl_shader_res *pl_shader_finalize(pl_shader sh);
 
 PL_API void pl_shader_obj_destroy(pl_shader_obj *obj);
 
+// Stage a candidate-owned LUT collected through pl_shader_params.describe_lut.
+// Ordinary live shader objects and non-LUT objects are rejected. This performs
+// resource creation/upload, never shader compilation. It is idempotent after
+// success; failure returns false and may be retried on the unchanged candidate.
+// Stage all collected LUTs before declaring the containing generation ready.
+PL_API bool pl_shader_lut_stage(pl_shader_obj obj);
+
 PL_API_END
 
 #endif // LIBPLACEBO_SHADERS_H_
