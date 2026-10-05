@@ -72,6 +72,12 @@ struct pass_var {
 };
 
 struct pass {
+    // Independent prepared entries are owned by their generation, not cached.
+    pl_prepared_pass prepared;
+    struct pl_pass_params params;
+    size_t ubo_size;
+    int num_vars;
+    bool quad;
     uint64_t signature;
     pl_pass pass;
     int last_index;
@@ -106,8 +112,62 @@ static void pass_destroy(pl_dispatch dp, struct pass *pass)
 
     pl_buf_destroy(dp->gpu, &pass->ubo);
     pl_pass_destroy(dp->gpu, &pass->pass);
+    pl_prepared_pass_destroy(&pass->prepared);
     pl_timer_destroy(dp->gpu, &pass->timer);
     pl_free(pass);
+}
+
+struct pl_dispatch_description_t {
+    pl_dispatch owner;
+    struct pass *entry;
+};
+
+struct pl_dispatch_preparation_t {
+    pl_dispatch owner;
+    struct pass *entry;
+    pl_pass_preparation request;
+};
+
+struct pl_dispatch_prepared_t {
+    pl_dispatch owner;
+    struct pass *entry;
+};
+
+enum dispatch_mode {
+    DISPATCH_SYNC,
+    DISPATCH_DESCRIBE,
+    DISPATCH_PREPARED,
+};
+
+struct dispatch_build {
+    enum dispatch_mode mode;
+    pl_dispatch_description *description;
+    pl_dispatch_prepared prepared;
+    enum pl_dispatch_result result;
+};
+
+static const struct pl_tex_params *desc_texture(const struct pl_shader_desc *sd)
+{
+    pl_tex tex = sd->binding.object;
+    return tex ? &tex->params : sd->texture;
+}
+
+static enum pl_sampler_type desc_sampler(const struct pl_shader_desc *sd)
+{
+    pl_tex tex = sd->binding.object;
+    return tex ? tex->sampler_type : sd->sampler_type;
+}
+
+static const struct pl_buf_params *desc_buffer(const struct pl_shader_desc *sd)
+{
+    pl_buf buf = sd->binding.object;
+    return buf ? &buf->params : sd->buffer;
+}
+
+static const struct pl_pass_params *pass_params(const struct pass *pass)
+{
+    return pass->prepared ? pl_prepared_pass_params(pass->prepared)
+                          : &pass->pass->params;
 }
 
 pl_dispatch pl_dispatch_create(pl_log log, pl_gpu gpu)
@@ -330,21 +390,21 @@ static void generate_shaders(pl_dispatch dp,
         case PL_DESC_BUF_STORAGE: has_ssbo = true; break;
         case PL_DESC_BUF_TEXEL_UNIFORM: has_texel = true; break;
         case PL_DESC_BUF_TEXEL_STORAGE: {
-            pl_buf buf = sh->descs.elem[i].binding.object;
-            has_nofmt |= !buf->params.format->glsl_format;
+            const struct pl_buf_params *buf = desc_buffer(&sh->descs.elem[i]);
+            has_nofmt |= !buf->format->glsl_format;
             has_texel = true;
             break;
         }
         case PL_DESC_STORAGE_IMG: {
-            pl_tex tex = sh->descs.elem[i].binding.object;
-            has_nofmt |= !tex->params.format->glsl_format;
+            const struct pl_tex_params *tex = desc_texture(&sh->descs.elem[i]);
+            has_nofmt |= !tex->format->glsl_format;
             has_img = true;
             break;
         }
         case PL_DESC_SAMPLED_TEX: {
-            pl_tex tex = sh->descs.elem[i].binding.object;
-            has_gather |= tex->params.format->gatherable;
-            switch (tex->sampler_type) {
+            const struct pl_tex_params *tex = desc_texture(&sh->descs.elem[i]);
+            has_gather |= tex->format->gatherable;
+            switch (desc_sampler(&sh->descs.elem[i])) {
             case PL_SAMPLER_NORMAL: break;
             case PL_SAMPLER_RECT: break;
             case PL_SAMPLER_EXTERNAL: has_ext = true; break;
@@ -411,8 +471,7 @@ static void generate_shaders(pl_dispatch dp,
     for (int i = 0; i < sh->descs.num; i++) {
         if (pass_params->descriptors[i].type != PL_DESC_SAMPLED_TEX)
             continue;
-        pl_tex tex = sh->descs.elem[i].binding.object;
-        if (tex->sampler_type != PL_SAMPLER_NORMAL) {
+        if (desc_sampler(&sh->descs.elem[i]) != PL_SAMPLER_NORMAL) {
             ADD(pre, "#define textureLod(t, p, b) texture(t, p) \n"
                      "#define textureLodOffset(t, p, b, o)    \\\n"
                      "        textureOffset(t, p, o)            \n");
@@ -477,10 +536,10 @@ static void generate_shaders(pl_dispatch dp,
                 [PL_SAMPLER_EXTERNAL][2] = "samplerExternalOES",
             };
 
-            pl_tex tex = sd->binding.object;
-            int dims = pl_tex_params_dimension(tex->params);
-            const char *type = types[tex->sampler_type][dims];
-            char prefix = sampler_prefixes[tex->params.format->type];
+            const struct pl_tex_params *tex = desc_texture(sd);
+            int dims = pl_tex_params_dimension(*tex);
+            const char *type = types[desc_sampler(sd)][dims];
+            char prefix = sampler_prefixes[tex->format->type];
             ident_t id = sh_ident_unpack(desc->name);
             pl_assert(type && prefix);
 
@@ -506,9 +565,9 @@ static void generate_shaders(pl_dispatch dp,
 
             // For better compatibility, we have to explicitly label the
             // type of data we will be reading/writing to this image.
-            pl_tex tex = sd->binding.object;
-            const char *format = tex->params.format->glsl_format;
-            int dims = pl_tex_params_dimension(tex->params);
+            const struct pl_tex_params *tex = desc_texture(sd);
+            const char *format = tex->format->glsl_format;
+            int dims = pl_tex_params_dimension(*tex);
             if (gpu->glsl.vulkan) {
                 if (format) {
                     ADD(pre, "layout(binding=%d, %s) ", desc->binding, format);
@@ -552,8 +611,8 @@ static void generate_shaders(pl_dispatch dp,
             break;
 
         case PL_DESC_BUF_TEXEL_UNIFORM: {
-            pl_buf buf = sd->binding.object;
-            char prefix = sampler_prefixes[buf->params.format->type];
+            const struct pl_buf_params *buf = desc_buffer(sd);
+            char prefix = sampler_prefixes[buf->format->type];
             if (gpu->glsl.vulkan)
                 ADD(pre, "layout(binding=%d) ", desc->binding);
             ADD(pre, "uniform %csamplerBuffer "$";\n", prefix,
@@ -562,9 +621,9 @@ static void generate_shaders(pl_dispatch dp,
         }
 
         case PL_DESC_BUF_TEXEL_STORAGE: {
-            pl_buf buf = sd->binding.object;
-            const char *format = buf->params.format->glsl_format;
-            char prefix = sampler_prefixes[buf->params.format->type];
+            const struct pl_buf_params *buf = desc_buffer(sd);
+            const char *format = buf->format->glsl_format;
+            char prefix = sampler_prefixes[buf->format->type];
             if (gpu->glsl.vulkan) {
                 if (format) {
                     ADD(pre, "layout(binding=%d, %s) ", desc->binding, format);
@@ -737,13 +796,155 @@ static void garbage_collect_passes(pl_dispatch dp)
     }
 }
 
+// Compare normalized fields, never caller pointer values or struct padding.
+static bool pass_matches(const struct pass *a, const struct pass *b)
+{
+    const struct pl_pass_params *x = &a->params, *y = &b->params;
+    if (a->num_vars != b->num_vars ||
+        a->ubo_size != b->ubo_size || a->quad != b->quad ||
+        x->type != y->type || x->push_constants_size != y->push_constants_size ||
+        x->num_variables != y->num_variables ||
+        x->num_descriptors != y->num_descriptors ||
+        x->num_constants != y->num_constants ||
+        strcmp(x->glsl_shader, y->glsl_shader))
+        return false;
+    for (int i = 0; i < a->num_vars; i++) {
+        const struct pass_var *v = &a->vars[i], *w = &b->vars[i];
+        if (v->type != w->type || v->index != w->index ||
+            v->layout.offset != w->layout.offset ||
+            v->layout.stride != w->layout.stride || v->layout.size != w->layout.size)
+            return false;
+    }
+    for (int i = 0; i < x->num_variables; i++) {
+        const struct pl_var *v = &x->variables[i], *w = &y->variables[i];
+        if (v->type != w->type || v->dim_v != w->dim_v ||
+            v->dim_m != w->dim_m || v->dim_a != w->dim_a || strcmp(v->name, w->name))
+            return false;
+    }
+    for (int i = 0; i < x->num_descriptors; i++) {
+        const struct pl_desc *v = &x->descriptors[i], *w = &y->descriptors[i];
+        if (v->type != w->type || v->access != w->access ||
+            v->binding != w->binding || strcmp(v->name, w->name))
+            return false;
+    }
+    for (int i = 0; i < x->num_constants; i++) {
+        const struct pl_constant *v = &x->constants[i], *w = &y->constants[i];
+        if (v->type != w->type || v->id != w->id || v->offset != w->offset ||
+            memcmp((const uint8_t *) x->constant_data + v->offset,
+                   (const uint8_t *) y->constant_data + w->offset,
+                   pl_var_type_size(v->type)))
+            return false;
+    }
+    if (x->type != PL_PASS_RASTER)
+        return true;
+    if (x->vertex_type != y->vertex_type || x->vertex_stride != y->vertex_stride ||
+        x->num_vertex_attribs != y->num_vertex_attribs || x->load_target != y->load_target ||
+        x->target_format->signature != y->target_format->signature ||
+        strcmp(x->vertex_shader, y->vertex_shader) ||
+        !!x->blend_params != !!y->blend_params)
+        return false;
+    if (x->blend_params && (x->blend_params->src_rgb != y->blend_params->src_rgb ||
+        x->blend_params->dst_rgb != y->blend_params->dst_rgb ||
+        x->blend_params->src_alpha != y->blend_params->src_alpha ||
+        x->blend_params->dst_alpha != y->blend_params->dst_alpha))
+        return false;
+    for (int i = 0; i < x->num_vertex_attribs; i++) {
+        const struct pl_vertex_attrib *v = &x->vertex_attribs[i], *w = &y->vertex_attribs[i];
+        if (v->fmt->signature != w->fmt->signature || v->offset != w->offset ||
+            v->location != w->location || strcmp(v->name, w->name))
+            return false;
+    }
+    return true;
+}
+
+static bool pass_resources(pl_dispatch dp, struct pass *pass)
+{
+    const struct pl_pass_params *params = &pass->params;
+    struct pl_pass_run_params *run = &pass->run_params;
+    run->constant_data = params->constant_data;
+    run->push_constants = pl_zalloc(pass, params->push_constants_size);
+    run->desc_bindings = pl_calloc_ptr(pass, params->num_descriptors, run->desc_bindings);
+    if (pass->ubo_size) {
+        pass->ubo = pl_buf_create(dp->gpu, pl_buf_params(
+            .size = pass->ubo_size, .uniform = true, .host_writable = true,
+        ));
+        if (!pass->ubo)
+            return false;
+    }
+    if (pass->quad) {
+        run->vertex_count = 4;
+        run->vertex_data = pl_zalloc(pass, 4 * params->vertex_stride);
+    }
+    pass->timer = pl_timer_create(dp->gpu);
+    return true;
+}
+
+static bool dispatch_inputs(pl_dispatch dp, pl_shader sh, struct dispatch_build *build)
+{
+    if (!sh)
+        return false;
+    // Explicit vertex shaders may be GPU-independent in the legacy API.
+    // Preparation descriptions require an unambiguous originating GPU.
+    if (SH_GPU(sh) != dp->gpu && (SH_GPU(sh) || build->mode != DISPATCH_SYNC))
+        return false;
+    if (build->mode == DISPATCH_PREPARED) {
+        if (!build->prepared) {
+            build->result = PL_DISPATCH_NOT_READY;
+            return false;
+        }
+        if (build->prepared->owner != dp)
+            return false;
+    }
+    for (int i = 0; i < sh->descs.num; i++) {
+        const struct pl_shader_desc *sd = &sh->descs.elem[i];
+        if (!sd->binding.object && build->mode != DISPATCH_DESCRIBE)
+            return false;
+        switch (sd->desc.type) {
+        case PL_DESC_SAMPLED_TEX:
+        case PL_DESC_STORAGE_IMG: {
+            const struct pl_tex_params *tex = desc_texture(sd);
+            if (!tex || !tex->format || tex->w <= 0 || tex->h < 0 || tex->d < 0)
+                return false;
+            if (sd->desc.type == PL_DESC_SAMPLED_TEX) {
+                enum pl_sampler_type type = desc_sampler(sd);
+                if (!tex->sampleable || type < 0 || type >= PL_SAMPLER_TYPE_COUNT ||
+                    (type != PL_SAMPLER_NORMAL && pl_tex_params_dimension(*tex) != 2))
+                    return false;
+            } else if (!tex->storable) {
+                return false;
+            }
+            break;
+        }
+        case PL_DESC_BUF_UNIFORM:
+        case PL_DESC_BUF_STORAGE:
+        case PL_DESC_BUF_TEXEL_UNIFORM:
+        case PL_DESC_BUF_TEXEL_STORAGE: {
+            const struct pl_buf_params *buf = desc_buffer(sd);
+            if (!buf || !buf->size)
+                return false;
+            if ((sd->desc.type == PL_DESC_BUF_TEXEL_UNIFORM ||
+                 sd->desc.type == PL_DESC_BUF_TEXEL_STORAGE) && !buf->format)
+                return false;
+            break;
+        }
+        case PL_DESC_INVALID:
+        case PL_DESC_TYPE_COUNT:
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
 static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
-                                  pl_tex target, int vert_idx,
+                                  const struct pl_tex_params *target, int vert_idx,
                                   const struct pl_blend_params *blend, bool load,
                                   const struct pl_dispatch_vertex_params *vparams,
-                                  const pl_transform2x2 *proj)
+                                  const pl_transform2x2 *proj,
+                                  struct dispatch_build *build)
 {
-    struct pass *pass = pl_alloc_ptr(dp, pass);
+    build->result = PL_DISPATCH_FAILED;
+    struct pass *pass = pl_alloc_ptr(NULL, pass);
     *pass = (struct pass) {
         .signature = 0x0, // updated incrementally below
         .last_index = dp->current_index,
@@ -776,7 +977,7 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
 
     if (params.type == PL_PASS_RASTER) {
         assert(target);
-        params.target_format = target->params.format;
+        params.target_format = target->format;
         params.load_target = load;
 
         // Fill in the vertex attributes array
@@ -810,7 +1011,7 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
         pl_hash_merge(&pass->signature, (uint64_t) params.vertex_type);
         pl_hash_merge(&pass->signature, (uint64_t) params.vertex_stride);
         pl_hash_merge(&pass->signature, (uint64_t) params.load_target);
-        pl_hash_merge(&pass->signature, target->params.format->signature);
+        pl_hash_merge(&pass->signature, target->format->signature);
         if (blend) {
             pl_static_assert(sizeof(*blend) == sizeof(enum pl_blend_mode) * 4);
             pl_hash_merge(&pass->signature, pl_var_hash(*blend));
@@ -864,6 +1065,7 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
     //
     // We go through the list twice, once to place stuff that we definitely
     // want inside PCs, and then a second time to opportunistically place the rest.
+    pass->num_vars = sh->vars.num;
     pass->vars = pl_calloc_ptr(pass, sh->vars.num, pass->vars);
     for (int i = 0; i < sh->vars.num; i++) {
         if (!add_pass_var(dp, tmp, pass, &params, &sh->vars.elem[i], &pass->vars[i], false))
@@ -896,7 +1098,7 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
     // Finalize the shader and look it up in the pass cache
     pl_str_builder vert_builder = NULL, glsl_builder = NULL;
     generate_shaders(dp, &gen_params, &vert_builder, &glsl_builder);
-    for (int i = 0; i < dp->passes.num; i++) {
+    for (int i = 0; build->mode == DISPATCH_SYNC && i < dp->passes.num; i++) {
         struct pass *p = dp->passes.elem[i];
         if (p->signature != pass->signature)
             continue;
@@ -911,7 +1113,7 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
         return p;
     }
 
-    // Need to compile new shader, execute templates now
+    // Materialize owned source text for a new synchronous or strict entry.
     if (vert_builder) {
         pl_str vert = pl_str_builder_exec(vert_builder);
         params.vertex_shader = (char *) vert.buf;
@@ -931,44 +1133,41 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
         FIX_IDENT(params.vertex_attribs[i].name);
 #undef FIX_IDENT
 
-    pass->pass = pl_pass_create(dp->gpu, &params);
-    if (!pass->pass) {
-        PL_ERR(dp, "Failed creating render pass for dispatch");
-        // Add it anyway
+    pass->params = pl_pass_params_copy(pass, &params);
+    pass->params.constant_data = constant_data;
+    pass->ubo_desc = (struct pl_shader_desc) {0};
+    pass->ubo_size = ubo_size;
+    pass->quad = params.type == PL_PASS_RASTER && !vparams;
+
+    if (build->mode == DISPATCH_DESCRIBE) {
+        pl_dispatch_description desc = pl_alloc_ptr(NULL, desc);
+        *desc = (struct pl_dispatch_description_t) { .owner = dp, .entry = pass };
+        *build->description = desc;
+        build->result = PL_DISPATCH_OK;
+        return NULL;
     }
 
-    struct pl_pass_run_params *rparams = &pass->run_params;
-    rparams->pass = pass->pass;
-    rparams->constant_data = constant_data;
-    rparams->push_constants = pl_zalloc(pass, params.push_constants_size);
-    rparams->desc_bindings = pl_calloc_ptr(pass, params.num_descriptors,
-                                           rparams->desc_bindings);
-
-    if (ubo_size && pass->pass) {
-        // Create the UBO
-        pass->ubo = pl_buf_create(dp->gpu, pl_buf_params(
-            .size = ubo_size,
-            .uniform = true,
-            .host_writable = true,
-        ));
-
-        if (!pass->ubo) {
-            PL_ERR(dp, "Failed creating uniform buffer for dispatch");
+    if (build->mode == DISPATCH_PREPARED) {
+        struct pass *ready = build->prepared->entry;
+        if (!pass_matches(pass, ready)) {
+            build->result = PL_DISPATCH_NOT_READY;
             goto error;
         }
+        pass_destroy(dp, pass);
+        if (ready->ubo)
+            sh->descs.elem[ready->ubo_index].binding.object = ready->ubo;
+        return ready;
+    }
 
+    pass->pass = pl_pass_create(dp->gpu, &params);
+    if (!pass->pass)
+        PL_ERR(dp, "Failed creating render pass for dispatch");
+
+    if (!pass_resources(dp, pass))
+        goto error;
+    pass->run_params.pass = pass->pass;
+    if (pass->ubo)
         sh->descs.elem[pass->ubo_index].binding.object = pass->ubo;
-    }
-
-    if (params.type == PL_PASS_RASTER && !vparams) {
-        // Generate the vertex array placeholder
-        rparams->vertex_count = 4; // single quad
-        size_t vert_size = rparams->vertex_count * params.vertex_stride;
-        rparams->vertex_data = pl_zalloc(pass, vert_size);
-    }
-
-    pass->timer = pl_timer_create(dp->gpu);
-
     PL_ARRAY_APPEND(dp, dp->passes, pass);
     return pass;
 
@@ -1086,7 +1285,8 @@ static const char *map_blend_mode(enum pl_blend_mode mode)
 
 static void translate_compute_shader(pl_dispatch dp, pl_shader sh,
                                      const pl_rect2d *rc,
-                                     const struct pl_dispatch_params *params)
+                                     const struct pl_dispatch_params *params,
+                                     const struct pl_tex_params *target)
 {
     int width = abs(pl_rect_w(*rc)), height = abs(pl_rect_h(*rc));
     if (sh->transpose)
@@ -1095,10 +1295,11 @@ static void translate_compute_shader(pl_dispatch dp, pl_shader sh,
     compute_vertex_attribs(dp, sh, width, height, &out_scale);
 
     // Simulate a framebuffer using storage images
-    pl_assert(params->target->params.storable);
+    pl_assert(target->storable);
     pl_assert(sh->output == PL_SHADER_SIG_COLOR);
     ident_t fbo = sh_desc(sh, (struct pl_shader_desc) {
         .binding.object = params->target,
+        .texture = target,
         .desc = {
             .name    = "out_image",
             .type    = PL_DESC_STORAGE_IMG,
@@ -1151,10 +1352,19 @@ static void translate_compute_shader(pl_dispatch dp, pl_shader sh,
     sh->output = PL_SHADER_SIG_NONE;
 }
 
-static void run_pass(pl_dispatch dp, pl_shader sh, struct pass *pass)
+static enum pl_dispatch_result run_pass(pl_dispatch dp, pl_shader sh, struct pass *pass)
 {
     pl_shader_info shader = &sh->info->info;
-    pl_pass_run(dp->gpu, &pass->run_params);
+    if (pass->prepared) {
+        switch (pl_prepared_pass_run(pass->prepared, &pass->run_params)) {
+        case PL_PREPARED_PASS_RUN_OK: break;
+        case PL_PREPARED_PASS_RUN_INVALID: return PL_DISPATCH_INVALID;
+        case PL_PREPARED_PASS_RUN_VARIANT_MISMATCH: return PL_DISPATCH_NOT_READY;
+        case PL_PREPARED_PASS_RUN_FAILED: return PL_DISPATCH_FAILED;
+        }
+    } else {
+        pl_pass_run(dp->gpu, &pass->run_params);
+    }
 
     for (uint64_t ts; (ts = pl_timer_query(dp->gpu, pass->timer));) {
         PL_TRACE(dp, "Spent %.3f ms on shader: %s", ts / 1e6, shader->description);
@@ -1178,7 +1388,7 @@ static void run_pass(pl_dispatch dp, pl_shader sh, struct pass *pass)
     }
 
     if (!dp->info_callback)
-        return;
+        return PL_DISPATCH_OK;
 
     struct pl_dispatch_info info;
     info.signature = pass->signature;
@@ -1202,13 +1412,19 @@ static void run_pass(pl_dispatch dp, pl_shader sh, struct pass *pass)
     info.peak = pass->ts_peak;
     info.average = pass->ts_sum / PL_MAX(info.num_samples, 1);
     dp->info_callback(dp->info_priv, &info);
+    return PL_DISPATCH_OK;
 }
 
-bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
+static enum pl_dispatch_result dispatch_finish(pl_dispatch dp,
+    const struct pl_dispatch_params *params, const struct pl_tex_params *target,
+    struct dispatch_build *build)
 {
     pl_shader sh = *params->shader;
-    bool ret = false;
+    build->result = PL_DISPATCH_INVALID;
     pl_mutex_lock(&dp->lock);
+
+    if (!dispatch_inputs(dp, sh, build))
+        goto error;
 
     if (sh->failed) {
         PL_ERR(sh, "Trying to dispatch a failed shader.");
@@ -1225,8 +1441,11 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
         goto error;
     }
 
-    const struct pl_tex_params *tpars = &params->target->params;
-    if (pl_tex_params_dimension(*tpars) != 2 || !tpars->renderable) {
+    const struct pl_tex_params *tpars = params->target ? &params->target->params : target;
+    if (!tpars || !tpars->format || (!params->target && build->mode != DISPATCH_DESCRIBE))
+        goto error;
+    if (tpars->w <= 0 || tpars->h <= 0 ||
+        pl_tex_params_dimension(*tpars) != 2 || !tpars->renderable) {
         PL_ERR(dp, "Trying to dispatch a shader using an invalid target "
                "texture. The target must be a renderable 2D texture.");
         goto error;
@@ -1275,7 +1494,7 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
     const pl_transform2x2 *proj = NULL;
     if (pl_shader_is_compute(sh)) {
         // Translate the compute shader to simulate vertices etc.
-        translate_compute_shader(dp, sh, &rc, params);
+        translate_compute_shader(dp, sh, &rc, params, tpars);
     } else {
         // Add the vertex information encoding the position
         pl_rect2df vert_rect = {
@@ -1310,11 +1529,11 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
     rc_norm.y1 = PL_MIN(rc_norm.y1, tpars->h);
     bool load = params->blend_params || !pl_rect2d_eq(rc_norm, full);
 
-    struct pass *pass = finalize_pass(dp, sh, params->target, vert_idx,
-                                      params->blend_params, load, NULL, proj);
+    struct pass *pass = finalize_pass(dp, sh, tpars, vert_idx,
+                                      params->blend_params, load, NULL, proj, build);
 
     // Silently return on failed passes
-    if (!pass || !pass->pass)
+    if (!pass || (!pass->pass && !pass->prepared))
         goto error;
 
     struct pl_pass_run_params *rparams = &pass->run_params;
@@ -1331,10 +1550,10 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
     // Update the vertex data
     if (rparams->vertex_data) {
         uintptr_t vert_base = (uintptr_t) rparams->vertex_data;
-        size_t stride = rparams->pass->params.vertex_stride;
+        size_t stride = pass_params(pass)->vertex_stride;
         for (int i = 0; i < sh->vas.num; i++) {
             const struct pl_shader_va *sva = &sh->vas.elem[i];
-            struct pl_vertex_attrib *va = &rparams->pass->params.vertex_attribs[i];
+            struct pl_vertex_attrib *va = &pass_params(pass)->vertex_attribs[i];
 
             size_t size = sva->attr.fmt->texel_size;
             uintptr_t va_base = vert_base + va->offset; // use placed offset
@@ -1370,9 +1589,7 @@ bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
     // Dispatch the actual shader
     rparams->target = params->target;
     rparams->timer = PL_DEF(params->timer, pass->timer);
-    run_pass(dp, sh, pass);
-
-    ret = true;
+    build->result = run_pass(dp, sh, pass);
     // fall through
 
 error:
@@ -1382,14 +1599,18 @@ error:
 
     pl_mutex_unlock(&dp->lock);
     pl_dispatch_abort(dp, params->shader);
-    return ret;
+    return build->result;
 }
 
-bool pl_dispatch_compute(pl_dispatch dp, const struct pl_dispatch_compute_params *params)
+static enum pl_dispatch_result dispatch_compute(pl_dispatch dp,
+    const struct pl_dispatch_compute_params *params, struct dispatch_build *build)
 {
     pl_shader sh = *params->shader;
-    bool ret = false;
+    build->result = PL_DISPATCH_INVALID;
     pl_mutex_lock(&dp->lock);
+
+    if (!dispatch_inputs(dp, sh, build))
+        goto error;
 
     if (sh->failed) {
         PL_ERR(sh, "Trying to dispatch a failed shader.");
@@ -1424,10 +1645,10 @@ bool pl_dispatch_compute(pl_dispatch dp, const struct pl_dispatch_compute_params
                                &(ident_t){0});
     }
 
-    struct pass *pass = finalize_pass(dp, sh, NULL, -1, NULL, false, NULL, NULL);
+    struct pass *pass = finalize_pass(dp, sh, NULL, -1, NULL, false, NULL, NULL, build);
 
     // Silently return on failed passes
-    if (!pass || !pass->pass)
+    if (!pass || (!pass->pass && !pass->prepared))
         goto error;
 
     struct pl_pass_run_params *rparams = &pass->run_params;
@@ -1468,9 +1689,7 @@ bool pl_dispatch_compute(pl_dispatch dp, const struct pl_dispatch_compute_params
 
     // Dispatch the actual shader
     rparams->timer = PL_DEF(params->timer, pass->timer);
-    run_pass(dp, sh, pass);
-
-    ret = true;
+    build->result = run_pass(dp, sh, pass);
     // fall through
 
 error:
@@ -1480,14 +1699,19 @@ error:
 
     pl_mutex_unlock(&dp->lock);
     pl_dispatch_abort(dp, params->shader);
-    return ret;
+    return build->result;
 }
 
-bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *params)
+static enum pl_dispatch_result dispatch_vertex(pl_dispatch dp,
+    const struct pl_dispatch_vertex_params *params, const struct pl_tex_params *target,
+    struct dispatch_build *build)
 {
     pl_shader sh = *params->shader;
-    bool ret = false;
+    build->result = PL_DISPATCH_INVALID;
     pl_mutex_lock(&dp->lock);
+
+    if (!dispatch_inputs(dp, sh, build))
+        goto error;
 
     if (sh->failed) {
         PL_ERR(sh, "Trying to dispatch a failed shader.");
@@ -1504,8 +1728,11 @@ bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *
         goto error;
     }
 
-    const struct pl_tex_params *tpars = &params->target->params;
-    if (pl_tex_params_dimension(*tpars) != 2 || !tpars->renderable) {
+    const struct pl_tex_params *tpars = params->target ? &params->target->params : target;
+    if (!tpars || !tpars->format || (!params->target && build->mode != DISPATCH_DESCRIBE))
+        goto error;
+    if (tpars->w <= 0 || tpars->h <= 0 ||
+        pl_tex_params_dimension(*tpars) != 2 || !tpars->renderable) {
         PL_ERR(dp, "Trying to dispatch a shader using an invalid target "
                "texture. The target must be a renderable 2D texture.");
         goto error;
@@ -1536,7 +1763,7 @@ bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *
     }
 
     int pos_idx = params->vertex_position_idx;
-    if (pos_idx < 0 || pos_idx >= params->num_vertex_attribs) {
+    if (!params->vertex_attribs || pos_idx < 0 || pos_idx >= params->num_vertex_attribs) {
         PL_ERR(dp, "Vertex position index out of range?");
         goto error;
     }
@@ -1572,11 +1799,11 @@ bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *
         break;
     }
 
-    struct pass *pass = finalize_pass(dp, sh, params->target, pos_idx,
-                                      params->blend_params, true, params, &proj);
+    struct pass *pass = finalize_pass(dp, sh, tpars, pos_idx,
+                                      params->blend_params, true, params, &proj, build);
 
     // Silently return on failed passes
-    if (!pass || !pass->pass)
+    if (!pass || (!pass->pass && !pass->prepared))
         goto error;
 
     struct pl_pass_run_params *rparams = &pass->run_params;
@@ -1609,9 +1836,7 @@ bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *
     rparams->index_buf = params->index_buf;
     rparams->index_offset = params->index_offset;
     rparams->timer = PL_DEF(params->timer, pass->timer);
-    run_pass(dp, sh, pass);
-
-    ret = true;
+    build->result = run_pass(dp, sh, pass);
     // fall through
 
 error:
@@ -1621,7 +1846,189 @@ error:
 
     pl_mutex_unlock(&dp->lock);
     pl_dispatch_abort(dp, params->shader);
-    return ret;
+    return build->result;
+}
+
+bool pl_dispatch_finish(pl_dispatch dp, const struct pl_dispatch_params *params)
+{
+    struct dispatch_build build = { .mode = DISPATCH_SYNC };
+    return dispatch_finish(dp, params, NULL, &build) == PL_DISPATCH_OK;
+}
+
+bool pl_dispatch_compute(pl_dispatch dp, const struct pl_dispatch_compute_params *params)
+{
+    struct dispatch_build build = { .mode = DISPATCH_SYNC };
+    return dispatch_compute(dp, params, &build) == PL_DISPATCH_OK;
+}
+
+bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *params)
+{
+    struct dispatch_build build = { .mode = DISPATCH_SYNC };
+    return dispatch_vertex(dp, params, NULL, &build) == PL_DISPATCH_OK;
+}
+
+enum pl_dispatch_result pl_dispatch_describe_finish(pl_dispatch dp,
+    const struct pl_dispatch_params *params, const struct pl_tex_params *target,
+    pl_dispatch_description *out)
+{
+    *out = NULL;
+    struct dispatch_build build = { .mode = DISPATCH_DESCRIBE, .description = out };
+    return dispatch_finish(dp, params, target, &build);
+}
+
+enum pl_dispatch_result pl_dispatch_describe_compute(pl_dispatch dp,
+    const struct pl_dispatch_compute_params *params, pl_dispatch_description *out)
+{
+    *out = NULL;
+    struct dispatch_build build = { .mode = DISPATCH_DESCRIBE, .description = out };
+    return dispatch_compute(dp, params, &build);
+}
+
+enum pl_dispatch_result pl_dispatch_describe_vertex(pl_dispatch dp,
+    const struct pl_dispatch_vertex_params *params, const struct pl_tex_params *target,
+    pl_dispatch_description *out)
+{
+    *out = NULL;
+    struct dispatch_build build = { .mode = DISPATCH_DESCRIBE, .description = out };
+    return dispatch_vertex(dp, params, target, &build);
+}
+
+const struct pl_pass_params *pl_dispatch_description_params(pl_dispatch_description desc)
+{
+    return desc ? &desc->entry->params : NULL;
+}
+
+void pl_dispatch_description_destroy(pl_dispatch_description *ptr)
+{
+    pl_dispatch_description desc = *ptr;
+    if (!desc)
+        return;
+    pass_destroy(desc->owner, desc->entry);
+    pl_free(desc);
+    *ptr = NULL;
+}
+
+static void pass_resources_reset(pl_dispatch dp, struct pass *pass)
+{
+    pl_buf_destroy(dp->gpu, &pass->ubo);
+    pl_timer_destroy(dp->gpu, &pass->timer);
+    pl_free(pass->run_params.push_constants);
+    pl_free(pass->run_params.desc_bindings);
+    pl_free((void *) pass->run_params.vertex_data);
+    pass->run_params = (struct pl_pass_run_params) {0};
+}
+
+enum pl_pass_prepare_result pl_dispatch_prepare_submit(
+    pl_dispatch_description *ptr, pl_dispatch_preparation *out)
+{
+    *out = NULL;
+    pl_dispatch_description desc = *ptr;
+    if (!desc)
+        return PL_PASS_PREPARE_INVALID;
+    if (!pl_pass_prepare_supported(desc->owner->gpu))
+        return PL_PASS_PREPARE_UNSUPPORTED;
+    struct pass *pass = desc->entry;
+    if (!pass_resources(desc->owner, pass)) {
+        pass_resources_reset(desc->owner, pass);
+        return PL_PASS_PREPARE_UNAVAILABLE;
+    }
+    pl_dispatch_preparation request = pl_zalloc_ptr(NULL, request);
+    enum pl_pass_prepare_result result = pl_pass_prepare_submit(
+        desc->owner->gpu, &pass->params, &request->request);
+    if (result != PL_PASS_PREPARE_ACCEPTED) {
+        pass_resources_reset(desc->owner, pass);
+        pl_free(request);
+        return result;
+    }
+    request->owner = desc->owner;
+    request->entry = pass;
+    pl_free(desc);
+    *ptr = NULL;
+    *out = request;
+    return result;
+}
+
+enum pl_pass_prepare_state pl_dispatch_prepare_poll(pl_dispatch_preparation request)
+{
+    return pl_pass_prepare_poll(request->request);
+}
+
+enum pl_pass_prepare_phase pl_dispatch_prepare_failure_phase(pl_dispatch_preparation request)
+{
+    return pl_pass_prepare_failure_phase(request->request);
+}
+
+const char *pl_dispatch_prepare_error(pl_dispatch_preparation request)
+{
+    return pl_pass_prepare_error(request->request);
+}
+
+void pl_dispatch_prepare_cancel(pl_dispatch_preparation request)
+{
+    pl_pass_prepare_cancel(request->request);
+}
+
+void pl_dispatch_prepare_release(pl_dispatch_preparation *ptr)
+{
+    pl_dispatch_preparation request = *ptr;
+    if (!request)
+        return;
+    pl_pass_prepare_release(&request->request);
+    pass_destroy(request->owner, request->entry);
+    pl_free(request);
+    *ptr = NULL;
+}
+
+enum pl_pass_prepare_state pl_dispatch_prepare_take(
+    pl_dispatch_preparation *ptr, pl_dispatch_prepared *out)
+{
+    *out = NULL;
+    pl_dispatch_preparation request = *ptr;
+    if (!request)
+        return PL_PASS_PREPARE_FAILED;
+    enum pl_pass_prepare_state state = pl_pass_prepare_take(
+        &request->request, &request->entry->prepared);
+    if (state != PL_PASS_PREPARE_READY)
+        return state;
+    pl_dispatch_prepared prepared = pl_alloc_ptr(NULL, prepared);
+    *prepared = (struct pl_dispatch_prepared_t) {
+        .owner = request->owner, .entry = request->entry,
+    };
+    pl_free(request);
+    *ptr = NULL;
+    *out = prepared;
+    return state;
+}
+
+void pl_dispatch_prepared_destroy(pl_dispatch_prepared *ptr)
+{
+    pl_dispatch_prepared prepared = *ptr;
+    if (!prepared)
+        return;
+    pass_destroy(prepared->owner, prepared->entry);
+    pl_free(prepared);
+    *ptr = NULL;
+}
+
+enum pl_dispatch_result pl_dispatch_finish_prepared(pl_dispatch dp,
+    pl_dispatch_prepared prepared, const struct pl_dispatch_params *params)
+{
+    struct dispatch_build build = { .mode = DISPATCH_PREPARED, .prepared = prepared };
+    return dispatch_finish(dp, params, NULL, &build);
+}
+
+enum pl_dispatch_result pl_dispatch_compute_prepared(pl_dispatch dp,
+    pl_dispatch_prepared prepared, const struct pl_dispatch_compute_params *params)
+{
+    struct dispatch_build build = { .mode = DISPATCH_PREPARED, .prepared = prepared };
+    return dispatch_compute(dp, params, &build);
+}
+
+enum pl_dispatch_result pl_dispatch_vertex_prepared(pl_dispatch dp,
+    pl_dispatch_prepared prepared, const struct pl_dispatch_vertex_params *params)
+{
+    struct dispatch_build build = { .mode = DISPATCH_PREPARED, .prepared = prepared };
+    return dispatch_vertex(dp, params, NULL, &build);
 }
 
 void pl_dispatch_abort(pl_dispatch dp, pl_shader *psh)

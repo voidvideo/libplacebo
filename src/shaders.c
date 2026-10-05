@@ -362,6 +362,13 @@ ident_t sh_var_mat3(pl_shader sh, const char *name, pl_matrix3x3 val)
 
 ident_t sh_desc(pl_shader sh, struct pl_shader_desc sd)
 {
+    if (sd.texture)
+        sd.texture = sh_memdup(sh, sd.texture, sizeof(*sd.texture),
+                              alignof(struct pl_tex_params));
+    if (sd.buffer)
+        sd.buffer = sh_memdup(sh, sd.buffer, sizeof(*sd.buffer),
+                             alignof(struct pl_buf_params));
+
     switch (sd.desc.type) {
     case PL_DESC_BUF_UNIFORM:
     case PL_DESC_BUF_STORAGE:;

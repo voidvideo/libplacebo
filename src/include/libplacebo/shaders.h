@@ -220,6 +220,14 @@ struct pl_shader_desc {
     struct pl_desc desc; // descriptor type, excluding `int binding`
     struct pl_desc_binding binding; // contents of the descriptor binding
 
+    // Description-only resource metadata. When binding.object is NULL, the
+    // dispatch description APIs use these instead of a GPU resource. They are
+    // copied by shader builders and cannot be submitted for execution. When
+    // binding.object is non-NULL its actual metadata takes precedence.
+    const struct pl_tex_params *texture;
+    enum pl_sampler_type sampler_type;
+    const struct pl_buf_params *buffer;
+
     // For PL_DESC_BUF_UNIFORM/STORAGE, this specifies the layout of the
     // variables contained by a buffer. Ignored for the other descriptor types
     struct pl_buffer_var *buffer_vars;
