@@ -101,6 +101,7 @@ sources = [
   'gamut_mapping.c',
   'glsl/spirv.c',
   'gpu.c',
+  'gpu/pass_prepare.c',
   'gpu/utils.c',
   'log.c',
   'options.c',

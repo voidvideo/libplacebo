@@ -44,6 +44,12 @@ struct pl_gpu_fns {
     // Internal cache, or NULL. Set by the user (via pl_gpu_set_cache).
     _Atomic(pl_cache) cache;
 
+    // Owned preparation service. Only backends with both callbacks opt in.
+    struct pl_pass_prepare_service *prepare;
+    pl_pass (*pass_create_prepared)(pl_gpu, const struct pl_pass_params *,
+                                   enum pl_pass_prepare_phase *);
+    bool (*pass_run_prepared)(pl_gpu, const struct pl_pass_run_params *);
+
     // Destructors: These also free the corresponding objects, but they
     // must not be called on NULL. (The NULL checks are done by the pl_*_destroy
     // wrappers)
@@ -202,3 +208,12 @@ const char *print_uuid(char buf[3 * UUID_SIZE], const uint8_t uuid[UUID_SIZE]);
 #define DRM_MOD_SIZE 26
 #define PRINT_DRM_MOD(mod) (print_drm_mod((char[DRM_MOD_SIZE]){0}, (mod)))
 const char *print_drm_mod(char buf[DRM_MOD_SIZE], uint64_t mod);
+
+// Preparation service lifetime is nested inside the originating GPU.
+void pl_pass_prepare_init(pl_gpu gpu);
+void pl_pass_prepare_uninit(pl_gpu gpu);
+bool pl_pass_params_valid(pl_gpu gpu, const struct pl_pass_params *params);
+enum pl_prepared_pass_run_result pl_pass_run_checked(
+    pl_gpu gpu, const struct pl_pass_run_params *params, bool prepared);
+enum pl_prepared_pass_run_result pl_pass_run_vbo_checked(
+    pl_gpu gpu, const struct pl_pass_run_params *params, bool prepared);

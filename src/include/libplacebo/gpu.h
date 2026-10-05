@@ -1302,6 +1302,89 @@ typedef const struct pl_pass_t {
 PL_API pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params);
 PL_API void pl_pass_destroy(pl_gpu gpu, pl_pass *pass);
 
+// Asynchronous complete-pass preparation. Unlike pl_pass_create(), submission
+// never compiles on the caller thread. Only explicitly supported backends (at
+// present Vulkan) accept requests. There is one worker per GPU and admission
+// allows at most 64 outstanding requests (including unclaimed ready results).
+//
+// GPU, formats and the attached cache must outlive all requests and prepared
+// passes. Release requests and destroy prepared passes before GPU destruction;
+// GPU teardown joins outstanding worker work. Do not replace/free the attached
+// cache while preparation is outstanding. GPU destruction must not race any
+// public GPU/request operations. Log callbacks may run on the worker.
+//
+// Each request has one caller-side owner: serialize submit/poll/take/cancel/
+// release operations. Synchronizing a transfer to another owner is permitted.
+typedef struct pl_pass_preparation_t *pl_pass_preparation;
+typedef struct pl_prepared_pass_t *pl_prepared_pass;
+
+enum pl_pass_prepare_result {
+    PL_PASS_PREPARE_ACCEPTED = 0,
+    PL_PASS_PREPARE_INVALID,
+    PL_PASS_PREPARE_UNSUPPORTED,
+    PL_PASS_PREPARE_UNAVAILABLE,
+    PL_PASS_PREPARE_CAPACITY,
+};
+
+enum pl_pass_prepare_state {
+    PL_PASS_PREPARE_PENDING = 0,
+    PL_PASS_PREPARE_READY,
+    PL_PASS_PREPARE_FAILED,
+    PL_PASS_PREPARE_CANCELLED,
+};
+
+enum pl_pass_prepare_phase {
+    PL_PASS_PREPARE_PHASE_NONE = 0,
+    PL_PASS_PREPARE_PHASE_RESOURCES,
+    PL_PASS_PREPARE_PHASE_TRANSLATION,
+    PL_PASS_PREPARE_PHASE_PIPELINE,
+};
+
+// Copies every input array/string and specialization value before returning.
+// Only device-owned format identities are borrowed. On rejection *out is NULL.
+PL_API enum pl_pass_prepare_result pl_pass_prepare_submit(
+    pl_gpu gpu, const struct pl_pass_params *params, pl_pass_preparation *out);
+PL_API bool pl_pass_prepare_supported(pl_gpu gpu);
+
+// Poll never waits for compilation. Failed requests retain the failure phase
+// and diagnostic until release. error() returns NULL unless the state is FAILED.
+PL_API enum pl_pass_prepare_state pl_pass_prepare_poll(pl_pass_preparation request);
+PL_API enum pl_pass_prepare_phase pl_pass_prepare_failure_phase(pl_pass_preparation request);
+PL_API const char *pl_pass_prepare_error(pl_pass_preparation request);
+
+// Takes a READY result exactly once, sets *request to NULL and *out to the owned
+// prepared pass. Other states leave the request intact and set *out to NULL.
+PL_API enum pl_pass_prepare_state pl_pass_prepare_take(
+    pl_pass_preparation *request, pl_prepared_pass *out);
+
+// Cancellation wins over publication until take. Neither cancellation nor
+// release waits for driver work or destroys GPU resources on the caller thread.
+// An already running compilation can finish, but its result is never adopted.
+PL_API void pl_pass_prepare_cancel(pl_pass_preparation request);
+PL_API void pl_pass_prepare_release(pl_pass_preparation *request);
+
+// Prepared passes are execution-owner objects, not concurrently shareable.
+// Their immutable description is valid until destroy. No raw mutable pl_pass
+// is exposed, so legacy respecialization cannot invalidate readiness.
+PL_API const struct pl_pass_params *pl_prepared_pass_params(pl_prepared_pass pass);
+PL_API void pl_prepared_pass_destroy(pl_prepared_pass *pass);
+
+enum pl_prepared_pass_run_result {
+    PL_PREPARED_PASS_RUN_OK = 0,
+    PL_PREPARED_PASS_RUN_INVALID,
+    PL_PREPARED_PASS_RUN_VARIANT_MISMATCH,
+    PL_PREPARED_PASS_RUN_FAILED,
+};
+
+struct pl_pass_run_params;
+// params->pass MUST be NULL; this inserts the owned prepared pass. If
+// constant_data is non-NULL it must match the prepared specialization values.
+// NULL means use the values (or GLSL defaults) frozen during preparation.
+// A mismatch returns before any GPU submission; no synchronous repair occurs.
+// OK means accepted/submitted, not that asynchronous GPU execution completed.
+PL_API enum pl_prepared_pass_run_result pl_prepared_pass_run(
+    pl_prepared_pass pass, const struct pl_pass_run_params *params);
+
 struct pl_desc_binding {
     const void *object; // pl_* object with type corresponding to pl_desc_type
 
