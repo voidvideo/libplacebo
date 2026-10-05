@@ -33,6 +33,7 @@ struct cached_frame {
     struct pl_icc_profile profile;
     pl_rect2df crop;
     pl_tex tex;
+    const struct pl_hook_texture *prepared_tex;
     int comps;
     bool evict; // for garbage collection
 };
@@ -125,7 +126,13 @@ struct pl_renderer_preparation_t {
     int pass_index, texture_index;
     uint8_t shader_id, frame_index;
     struct pass_state *current;
-    struct prepared_frame_shape image_shape, target_shape;
+    struct prepared_frame_shape image_shape[PL_MAX_PLANES], target_shape;
+    int image_planes;
+    bool mix, mix_direct, mix_valid;
+    uint64_t mix_signature;
+    struct cached_frame mix_frame;
+    int mix_output_pass, mix_output_texture;
+    uint8_t shader_frame_index;
 };
 
 enum {
@@ -456,7 +463,7 @@ static pl_shader prepared_begin(void *priv, pl_dispatch destination, bool unique
     return pl_shader_alloc(p->rr->log, pl_shader_params(
         .gpu = p->rr->gpu,
         .id = unique ? p->shader_id++ : 0,
-        .index = p->frame_index,
+        .index = p->shader_frame_index,
         .dynamic_constants = p->snapshot.params->dynamic_constants,
         .description_only = !p->executing,
         .describe_lut = prepare_lut,
@@ -2166,7 +2173,8 @@ static bool pass_read_image(struct pass_state *pass)
         if (!did_merge)
             continue;
 
-        if (!img_tex(pass, &sti->img)) {
+        struct pl_sample_src merged = {0};
+        if (!img_source(pass, &sti->img, &merged)) {
             PL_ERR(rr, "Failed dispatching plane merging shader, disabling FBOs!");
             memset(pass->fbofmt, 0, sizeof(pass->fbofmt));
             rr->errors |= PL_RENDER_ERR_FBO;
@@ -2351,7 +2359,8 @@ static bool pass_read_image(struct pass_state *pass)
         pass_hook(pass, &st->img, plane_scaled_hook_stages[st->type]);
         ident_t sub = sh_subpass(sh, img_sh(pass, &st->img));
         if (!sub) {
-            if (!img_tex(pass, &st->img)) {
+            struct pl_sample_src materialized = {0};
+            if (!img_source(pass, &st->img, &materialized)) {
                 pl_dispatch_abort(rr->dp, &sh);
                 return false;
             }
@@ -4201,6 +4210,99 @@ static struct params_info render_params_info(const struct pl_render_params *para
     return info;
 }
 
+// Shared output builder for cached frame presentation and ordinary mixing.
+static bool pass_mix_output(struct pass_state *pass, const struct cached_frame *frames,
+                            const float *weights, int fidx, float wsum, int out_w, int out_h)
+{
+    pl_shader sh = pass_shader(pass, false);
+    sh_describef(sh, "frame mixing (%d frame%s)", fidx, fidx > 1 ? "s" : "");
+    sh->output = PL_SHADER_SIG_COLOR;
+    sh->output_w = out_w;
+    sh->output_h = out_h;
+
+    GLSL("vec4 color;                   \n"
+         "// pl_render_image_mix        \n"
+         "{                             \n");
+
+    // With a single frame there is nothing to mix, so we can skip the
+    // linearize/delinearize roundtrip.
+    bool mixing = fidx > 1;
+    struct pl_color_space mix_csp = pass->target.color;
+    if (mixing) {
+        mix_csp.transfer = PL_COLOR_TRC_LINEAR;
+        GLSL("vec4 mix_color = vec4(0.0); \n");
+    }
+
+    int comps = 0;
+    for (int i = 0; i < fidx; i++) {
+        const struct pl_tex_params *tpars = frames[i].prepared_tex
+            ? &frames[i].prepared_tex->params : &frames[i].tex->params;
+
+        // Use linear sampling if desired and possible
+        enum pl_tex_sample_mode sample_mode = PL_TEX_SAMPLE_NEAREST;
+        if ((tpars->w != out_w || tpars->h != out_h) &&
+            (tpars->format->caps & PL_FMT_CAP_LINEAR))
+        {
+            sample_mode = PL_TEX_SAMPLE_LINEAR;
+        }
+
+        ident_t pos, tex = sh_bind_metadata(sh, frames[i].tex, tpars,
+            frames[i].prepared_tex ? frames[i].prepared_tex->sampler_type
+                                   : frames[i].tex->sampler_type,
+            PL_TEX_ADDRESS_CLAMP, sample_mode, "frame", NULL, &pos, NULL);
+
+        GLSL("color = textureLod("$", "$", 0.0); \n", tex, pos);
+
+        // Usually a no-op. Handles mixed-colorspace frames when
+        // preserve_mixing_cache spans target changes. ICC diffs ignored.
+        struct pl_color_repr frame_repr = frames[i].repr;
+        struct pl_color_space frame_csp = frames[i].color;
+        // Ignore differences in HDR metadata, which may cause shader or LUT
+        // recompilation. Without a preserved cache, frames are re-rendered
+        // against the target's current HDR metadata.
+        frame_csp.hdr = mix_csp.hdr;
+        if (!pl_color_space_equal(&frame_csp, &mix_csp)) {
+            pl_shader_set_alpha(sh, &frame_repr, PL_ALPHA_INDEPENDENT);
+            pl_shader_color_map_ex(sh, NULL, pl_color_map_args(frame_csp, mix_csp));
+        }
+        pl_shader_set_alpha(sh, &frame_repr, PL_ALPHA_PREMULTIPLIED);
+
+        if (mixing) {
+            float weight = weights[i] / wsum;
+            GLSL("mix_color += vec4("$") * color; \n", SH_FLOAT_DYN(weight));
+        }
+        comps = PL_MAX(comps, frames[i].comps);
+    }
+
+    if (mixing)
+        GLSL("color = mix_color; \n");
+    GLSL("} \n");
+
+    // Dispatch this to the destination
+    pass->img = (struct img) {
+        .sh = sh,
+        .w = out_w,
+        .h = out_h,
+        .comps = comps,
+        .color = pass->target.color,
+        .rect = { 0, 0, out_w, out_h },
+        .repr = {
+            .sys = PL_COLOR_SYSTEM_RGB,
+            .levels = PL_COLOR_LEVELS_PC,
+            .alpha = comps >= 4 ? PL_ALPHA_PREMULTIPLIED : PL_ALPHA_NONE,
+        },
+    };
+
+    // Re-encode to target transfer, which in practice only delinearizes.
+    if (!pl_color_space_equal(&mix_csp, &pass->img.color)) {
+        pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_INDEPENDENT);
+        pl_shader_color_map_ex(sh, NULL,
+                               pl_color_map_args(mix_csp, pass->img.color));
+    }
+
+    return pass_output_target(pass);
+}
+
 #define MAX_MIX_FRAMES 16
 
 bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
@@ -4517,89 +4619,7 @@ inter_pass_error:
     pass.info.count = fidx;
     pl_assert(fidx > 0);
 
-    pl_shader sh = pl_dispatch_begin(rr->dp);
-    sh_describef(sh, "frame mixing (%d frame%s)", fidx, fidx > 1 ? "s" : "");
-    sh->output = PL_SHADER_SIG_COLOR;
-    sh->output_w = out_w;
-    sh->output_h = out_h;
-
-    GLSL("vec4 color;                   \n"
-         "// pl_render_image_mix        \n"
-         "{                             \n");
-
-    // With a single frame there is nothing to mix, so we can skip the
-    // linearize/delinearize roundtrip.
-    bool mixing = fidx > 1;
-    struct pl_color_space mix_csp = target->color;
-    if (mixing) {
-        mix_csp.transfer = PL_COLOR_TRC_LINEAR;
-        GLSL("vec4 mix_color = vec4(0.0); \n");
-    }
-
-    int comps = 0;
-    for (int i = 0; i < fidx; i++) {
-        const struct pl_tex_params *tpars = &frames[i].tex->params;
-
-        // Use linear sampling if desired and possible
-        enum pl_tex_sample_mode sample_mode = PL_TEX_SAMPLE_NEAREST;
-        if ((tpars->w != out_w || tpars->h != out_h) &&
-            (tpars->format->caps & PL_FMT_CAP_LINEAR))
-        {
-            sample_mode = PL_TEX_SAMPLE_LINEAR;
-        }
-
-        ident_t pos, tex = sh_bind(sh, frames[i].tex, PL_TEX_ADDRESS_CLAMP,
-                                   sample_mode, "frame", NULL, &pos, NULL);
-
-        GLSL("color = textureLod("$", "$", 0.0); \n", tex, pos);
-
-        // Usually a no-op. Handles mixed-colorspace frames when
-        // preserve_mixing_cache spans target changes. ICC diffs ignored
-        struct pl_color_repr frame_repr = frames[i].repr;
-        struct pl_color_space frame_csp = frames[i].color;
-        // Ignore differences in HDR metadata, which may cause shader or lut
-        // recompilation. Note that when preserve_mixing_cache is false, frames
-        // will be always re-rendered with the target's HDR metadata.
-        frame_csp.hdr = mix_csp.hdr;
-        if (!pl_color_space_equal(&frame_csp, &mix_csp)) {
-            pl_shader_set_alpha(sh, &frame_repr, PL_ALPHA_INDEPENDENT);
-            pl_shader_color_map_ex(sh, NULL, pl_color_map_args(frame_csp, mix_csp));
-        }
-        pl_shader_set_alpha(sh, &frame_repr, PL_ALPHA_PREMULTIPLIED);
-
-        if (mixing) {
-            float weight = weights[i] / wsum;
-            GLSL("mix_color += vec4("$") * color; \n", SH_FLOAT_DYN(weight));
-        }
-        comps = PL_MAX(comps, frames[i].comps);
-    }
-
-    if (mixing)
-        GLSL("color = mix_color; \n");
-    GLSL("} \n");
-
-    // Dispatch this to the destination
-    pass.img = (struct img) {
-        .sh = sh,
-        .w = out_w,
-        .h = out_h,
-        .comps = comps,
-        .color = target->color,
-        .rect = { 0, 0, out_w, out_h },
-        .repr = {
-            .sys = PL_COLOR_SYSTEM_RGB,
-            .levels = PL_COLOR_LEVELS_PC,
-            .alpha = comps >= 4 ? PL_ALPHA_PREMULTIPLIED : PL_ALPHA_NONE,
-        },
-    };
-
-    // Re-encode to target transfer, this will in practice delinearize only.
-    if (!pl_color_space_equal(&mix_csp, &pass.img.color)) {
-        pl_shader_set_alpha(sh, &pass.img.repr, PL_ALPHA_INDEPENDENT);
-        pl_shader_color_map_ex(sh, NULL, pl_color_map_args(mix_csp, pass.img.color));
-    }
-
-    if (!pass_output_target(&pass))
+    if (!pass_mix_output(&pass, frames, weights, fidx, wsum, out_w, out_h))
         goto fallback;
 
     pass_uninit(&pass);
@@ -4840,9 +4860,9 @@ void pl_renderer_reset_errors(pl_renderer rr,
 }
 
 static bool preparation_shape(struct prepared_frame_shape *stored,
-                               const struct pl_frame *frame, bool compare)
+                               const struct pl_frame *frame, int plane_index, bool compare)
 {
-    const struct pl_plane *plane = &frame->planes[0];
+    const struct pl_plane *plane = &frame->planes[plane_index];
     const struct pl_tex_params *tex = &plane->texture->params;
     if (!compare) {
         *stored = (struct prepared_frame_shape) {
@@ -4869,7 +4889,7 @@ static bool preparation_admit(pl_renderer_preparation p,
     const struct pl_frame *image, const struct pl_frame *target)
 {
     const struct pl_render_params *params = p->snapshot.params;
-    if (!image || !target || image->num_planes != 1 || target->num_planes != 1 ||
+    if (!image || !target || image->num_planes < 1 || image->num_planes > PL_MAX_PLANES || target->num_planes != 1 ||
         image->acquire || image->release || target->acquire || target->release ||
         image->prev || image->next || image->field != PL_FIELD_NONE ||
         image->film_grain.type || image->repr.dovi || target->repr.dovi ||
@@ -4910,12 +4930,16 @@ static bool preparation_admit(pl_renderer_preparation p,
 }
 
 static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparation p,
-    const struct pl_frame *image, const struct pl_frame *target)
+    const struct pl_frame *image, const struct pl_frame *target, uint64_t signature)
 {
     if (!preparation_admit(p, image, target))
         return p->result;
+    if (p->mix && !p->checking && !p->executing)
+        p->mix_direct = p->snapshot.params->skip_caching_single_frame ||
+                        render_params_info(p->snapshot.params).trivial;
     p->pass_index = p->texture_index = 0;
     p->shader_id = 0;
+    p->shader_frame_index = p->frame_index + 1;
     struct pass_state pass = {
         .rr = p->rr, .preparation = p, .params = p->snapshot.params,
         .image = *image, .target = *target, .info.stage = PL_RENDER_STAGE_FRAME,
@@ -4937,25 +4961,90 @@ static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparat
                      "native color-map variants are not yet described");
         goto done;
     }
-    if (!preparation_shape(&p->image_shape, &pass.image, p->checking || p->executing) ||
-        !preparation_shape(&p->target_shape, &pass.target, p->checking || p->executing)) {
+    bool compare = p->checking || p->executing;
+    if (!compare)
+        p->image_planes = pass.image.num_planes;
+    bool shape_matches = p->image_planes == pass.image.num_planes;
+    for (int i = 0; shape_matches && i < pass.image.num_planes; i++)
+        shape_matches = preparation_shape(&p->image_shape[i], &pass.image, i, compare);
+    shape_matches &= preparation_shape(&p->target_shape, &pass.target, 0, compare);
+    if (!shape_matches) {
         prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "frame shape differs from prepared generation");
         goto done;
     }
+    bool cached = p->mix && !p->mix_direct;
+    bool hit = cached && p->mix_valid && p->mix_signature == signature &&
+        pl_color_space_equal(&p->mix_frame.color, &pass.target.color);
+    struct cached_frame mixed = p->mix_frame;
     if (p->executing)
         pl_dispatch_callback(p->rr->dp, &pass, info_callback);
-    if (!pass_read_image(&pass) || p->result != PL_RENDERER_PREPARE_OK)
-        goto failed;
-    if (!pass_scale_main(&pass) || p->result != PL_RENDERER_PREPARE_OK)
-        goto failed;
-    pass_convert_colors(&pass);
-    if (p->result != PL_RENDERER_PREPARE_OK || !pass_output_target(&pass))
-        goto failed;
+    if (!hit) {
+        // Overwriting the cache invalidates the previous content immediately.
+        // Description/preflight never publish or invalidate cache contents.
+        if (cached && p->executing)
+            p->mix_valid = false;
+        if (!pass_read_image(&pass) || p->result != PL_RENDERER_PREPARE_OK)
+            goto failed;
+        if (!pass_scale_main(&pass) || p->result != PL_RENDERER_PREPARE_OK)
+            goto failed;
+        pass_convert_colors(&pass);
+        if (p->result != PL_RENDERER_PREPARE_OK)
+            goto failed;
+        if (cached) {
+            pl_shader_set_alpha(pass.img.sh, &pass.img.repr, PL_ALPHA_PREMULTIPLIED);
+            const struct pl_hook_texture *tex = prepared_texture(&pass,
+                pass.img.w, pass.img.h, pass.fbofmt[4], 4);
+            if (!tex || prepared_finish(p, p->rr->dp, pl_dispatch_params(
+                    .shader = &pass.img.sh,
+                    .target = p->executing ? tex->texture : NULL,
+                ), &tex->params) != PL_DISPATCH_OK)
+                goto failed;
+            mixed = (struct cached_frame) {
+                .prepared_tex = tex,
+                .color = pass.img.color,
+                .repr = pass.img.repr,
+                .comps = pass.img.comps,
+            };
+            if (!compare) {
+                p->mix_frame = mixed;
+                p->mix_output_pass = p->pass_index;
+                p->mix_output_texture = p->texture_index;
+            } else if (p->pass_index != p->mix_output_pass ||
+                       p->texture_index != p->mix_output_texture) {
+                prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "cache population graph changed");
+                goto done;
+            }
+        } else if (!pass_output_target(&pass)) {
+            goto failed;
+        }
+    }
+    if (cached) {
+        // An existing cached frame skips the entire source/analysis graph.
+        // The same output manifest serves both population and reuse variants.
+        p->pass_index = p->mix_output_pass;
+        p->texture_index = p->mix_output_texture;
+        p->shader_id = 0;
+        p->shader_frame_index = p->frame_index + (hit ? 1 : 2);
+        pass.info = (struct pl_render_info) { .stage = PL_RENDER_STAGE_BLEND, .count = 1 };
+        mixed.tex = p->executing ? mixed.prepared_tex->texture : NULL;
+        const float weight = 1.0;
+        if (!pass_mix_output(&pass, &mixed, &weight, 1, 1.0,
+                             mixed.prepared_tex->params.w, mixed.prepared_tex->params.h))
+            goto failed;
+    }
     if (p->rr->errors || p->rr->disabled_hooks.num)
         goto failed;
     if ((p->checking || p->executing) &&
         (p->pass_index != p->passes.num || p->texture_index != p->textures.num))
         prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "selected graph lost a required pass or resource");
+    if (p->executing && p->result == PL_RENDERER_PREPARE_OK) {
+        p->frame_index = p->shader_frame_index;
+        if (cached) {
+            p->mix_frame = mixed;
+            p->mix_signature = signature;
+            p->mix_valid = true;
+        }
+    }
     goto done;
 failed:
     prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "strict renderer shader generation failed");
@@ -4967,9 +5056,10 @@ done:
     return p->result;
 }
 
-enum pl_renderer_prepare_result pl_renderer_describe_image(pl_renderer renderer,
+static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
     const struct pl_frame *image, const struct pl_frame *target,
-    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out)
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out,
+    bool mix, uint64_t signature)
 {
     if (out)
         *out = NULL;
@@ -4982,13 +5072,60 @@ enum pl_renderer_prepare_result pl_renderer_describe_image(pl_renderer renderer,
     p->snapshot = *snapshot;
     snapshot->retain(snapshot->owner);
     p->rr = pl_renderer_create(renderer->log, renderer->gpu);
-    enum pl_renderer_prepare_result result = preparation_traverse(p, image, target);
+    p->mix = mix;
+    enum pl_renderer_prepare_result result = preparation_traverse(p, image, target, signature);
     if (result != PL_RENDERER_PREPARE_OK) {
         pl_renderer_prepare_destroy(&p);
         return result;
     }
     *out = p;
     return PL_RENDERER_PREPARE_OK;
+}
+
+enum pl_renderer_prepare_result pl_renderer_describe_image(pl_renderer renderer,
+    const struct pl_frame *image, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out)
+{
+    return describe_image(renderer, image, target, snapshot, out, false, 0);
+}
+
+static enum pl_renderer_prepare_result preparation_mix_image(const struct pl_frame_mix *mix,
+    const struct pl_frame **image, uint64_t *signature)
+{
+    if (!mix || mix->num_frames < 0)
+        return PL_RENDERER_PREPARE_INVALID;
+    if (!mix->num_frames)
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
+    if (!mix->frames || !mix->signatures || !mix->timestamps ||
+        !(mix->vsync_duration > 0))
+        return PL_RENDERER_PREPARE_INVALID;
+    for (int i = 0; i < mix->num_frames; i++) {
+        if (!mix->frames[i] || !isfinite(mix->timestamps[i]) ||
+            (i && mix->timestamps[i-1] > mix->timestamps[i]))
+            return PL_RENDERER_PREPARE_INVALID;
+    }
+    *image = pl_frame_mix_nearest(mix);
+    for (int i = 0; i < mix->num_frames; i++) {
+        if (mix->frames[i] == *image) {
+            *signature = mix->signatures[i];
+            return PL_RENDERER_PREPARE_OK;
+        }
+    }
+    return PL_RENDERER_PREPARE_INVALID;
+}
+
+enum pl_renderer_prepare_result pl_renderer_describe_image_mix(pl_renderer renderer,
+    const struct pl_frame_mix *images, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out)
+{
+    if (out)
+        *out = NULL;
+    const struct pl_frame *image;
+    uint64_t signature;
+    enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
+    if (result != PL_RENDERER_PREPARE_OK)
+        return result;
+    return describe_image(renderer, image, target, snapshot, out, true, signature);
 }
 
 enum pl_renderer_prepare_result pl_renderer_prepare_submit(pl_renderer_preparation p)
@@ -5072,8 +5209,8 @@ void pl_renderer_prepare_destroy(pl_renderer_preparation *ptr)
     *ptr = NULL;
 }
 
-enum pl_renderer_prepare_result pl_renderer_preflight_image(pl_renderer_preparation p,
-    const struct pl_frame *image, const struct pl_frame *target)
+static enum pl_renderer_prepare_result preflight_image(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target, uint64_t signature)
 {
     if (!p)
         return PL_RENDERER_PREPARE_INVALID;
@@ -5082,23 +5219,59 @@ enum pl_renderer_prepare_result pl_renderer_preflight_image(pl_renderer_preparat
     p->checking = true;
     p->error = NULL;
     enum pl_render_error prior_errors = p->rr->errors;
-    enum pl_renderer_prepare_result result = preparation_traverse(p, image, target);
+    enum pl_renderer_prepare_result result = preparation_traverse(p, image, target, signature);
     p->checking = false;
     p->rr->errors = prior_errors;
     p->result = PL_RENDERER_PREPARE_OK;
     return result;
 }
 
-enum pl_renderer_prepare_result pl_render_image_prepared(pl_renderer_preparation p,
+enum pl_renderer_prepare_result pl_renderer_preflight_image(pl_renderer_preparation p,
     const struct pl_frame *image, const struct pl_frame *target)
 {
-    enum pl_renderer_prepare_result result = pl_renderer_preflight_image(p, image, target);
+    if (!p || p->mix)
+        return PL_RENDERER_PREPARE_INVALID;
+    return preflight_image(p, image, target, 0);
+}
+
+static enum pl_renderer_prepare_result render_image_prepared(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target, uint64_t signature)
+{
+    enum pl_renderer_prepare_result result = preflight_image(p, image, target, signature);
     if (result != PL_RENDERER_PREPARE_OK)
         return result;
     p->executing = true;
-    result = preparation_traverse(p, image, target);
+    result = preparation_traverse(p, image, target, signature);
     p->executing = false;
-    if (result == PL_RENDERER_PREPARE_OK)
-        p->frame_index++;
     return result;
+}
+
+enum pl_renderer_prepare_result pl_render_image_prepared(pl_renderer_preparation p,
+    const struct pl_frame *image, const struct pl_frame *target)
+{
+    if (!p || p->mix)
+        return PL_RENDERER_PREPARE_INVALID;
+    return render_image_prepared(p, image, target, 0);
+}
+
+enum pl_renderer_prepare_result pl_renderer_preflight_image_mix(pl_renderer_preparation p,
+    const struct pl_frame_mix *images, const struct pl_frame *target)
+{
+    if (!p || !p->mix)
+        return PL_RENDERER_PREPARE_INVALID;
+    const struct pl_frame *image;
+    uint64_t signature;
+    enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
+    return result == PL_RENDERER_PREPARE_OK ? preflight_image(p, image, target, signature) : result;
+}
+
+enum pl_renderer_prepare_result pl_render_image_mix_prepared(pl_renderer_preparation p,
+    const struct pl_frame_mix *images, const struct pl_frame *target)
+{
+    if (!p || !p->mix)
+        return PL_RENDERER_PREPARE_INVALID;
+    const struct pl_frame *image;
+    uint64_t signature;
+    enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
+    return result == PL_RENDERER_PREPARE_OK ? render_image_prepared(p, image, target, signature) : result;
 }

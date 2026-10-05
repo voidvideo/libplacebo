@@ -57,6 +57,7 @@ struct snapshot_owner {
     pl_dispatch auxiliary;
     pl_buf output;
     int ordinary, resets, descriptions, executions;
+    int analysis_executions, output_executions;
 };
 
 static void retain(void *priv)
@@ -85,9 +86,13 @@ static struct pl_hook_res ordinary_hook(void *priv, const struct pl_hook_params 
 static struct pl_hook_prepare_result auxiliary_hook(struct snapshot_owner *owner,
     const struct pl_hook_prepare_params *params, bool execute)
 {
-    if (execute)
+    if (execute) {
         owner->executions++;
-    else
+        if (params->stage == PL_HOOK_RGB)
+            owner->analysis_executions++;
+        if (params->stage == PL_HOOK_OUTPUT)
+            owner->output_executions++;
+    } else
         owner->descriptions++;
     pl_shader shader = params->begin(params->context, owner->auxiliary, false);
     REQUIRE(shader);
@@ -166,19 +171,19 @@ static struct pl_frame frame(pl_tex texture)
     };
 }
 
-static void test_renderer(pl_gpu gpu, pl_tex source, int width, bool hook, bool ewa)
+static void test_renderer(pl_gpu gpu, struct pl_frame image, int width, bool hook, bool ewa)
 {
     pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
     pl_renderer reference_renderer = pl_renderer_create(gpu->log, gpu);
     REQUIRE(renderer && reference_renderer);
     struct pl_tex_params output_params = {
-        .w = width, .h = width, .format = source->params.format,
+        .w = width, .h = width, .format = pl_find_named_fmt(gpu, "rgba8"),
         .renderable = true, .host_readable = true, .blit_dst = true,
     };
     pl_tex output = pl_tex_create(gpu, &output_params);
     pl_tex reference = pl_tex_create(gpu, &output_params);
     REQUIRE(output && reference);
-    struct pl_frame image = frame(source), target = frame(output);
+    struct pl_frame target = frame(output);
     struct pl_frame reference_target = frame(reference);
     struct snapshot_owner *owner = new_snapshot(gpu, hook);
     if (ewa)
@@ -211,6 +216,14 @@ static void test_renderer(pl_gpu gpu, pl_tex source, int width, bool hook, bool 
     describing = true;
     REQUIRE(pl_renderer_preflight_image(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
     REQUIRE(pl_renderer_preflight_image(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
+    if (image.num_planes > 1) {
+        struct pl_frame changed_plane = image;
+        changed_plane.planes[image.num_planes - 1].shift_x += 0.25;
+        int descriptions = owner->descriptions;
+        REQUIRE(pl_renderer_preflight_image(preparation, &changed_plane, &target) ==
+                PL_RENDERER_PREPARE_NOT_READY);
+        REQUIRE(owner->descriptions == descriptions);
+    }
     describing = false;
     REQUIRE(!owner->executions && !owner->ordinary && !owner->resets);
     REQUIRE(pl_render_image_prepared(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
@@ -298,6 +311,114 @@ static void test_renderer(pl_gpu gpu, pl_tex source, int width, bool hook, bool 
     pl_renderer_destroy(&renderer);
 }
 
+static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
+{
+    pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
+    pl_renderer reference_renderer = pl_renderer_create(gpu->log, gpu);
+    struct pl_tex_params output_params = {
+        .w = 8, .h = 8, .format = pl_find_named_fmt(gpu, "rgba8"),
+        .renderable = true, .host_readable = true, .blit_dst = true,
+    };
+    pl_tex output = pl_tex_create(gpu, &output_params);
+    pl_tex reference = pl_tex_create(gpu, &output_params);
+    REQUIRE(output && reference);
+    struct pl_frame target = frame(output), reference_target = frame(reference);
+    struct snapshot_owner *owner = new_snapshot(gpu, hook);
+    owner->params.skip_caching_single_frame = direct;
+    if (hook)
+        owner->hook.stages |= PL_HOOK_OUTPUT;
+    struct pl_dither_params dither = pl_dither_default_params;
+    dither.temporal = true;
+    owner->params.dither_params = &dither;
+    struct pl_renderer_snapshot snapshot = {
+        .params = &owner->params, .owner = owner, .retain = retain, .release = release,
+    };
+    // A disabled mixer must select the nearest source, even with multiple inputs.
+    struct pl_frame other = image;
+    const struct pl_frame *frames[] = { &other, &image };
+    uint64_t signatures[] = { 123, 7 };
+    float timestamps[] = {-1.0, 0.0};
+    struct pl_frame_mix mix = {
+        .num_frames = 2, .frames = frames, .signatures = signatures,
+        .timestamps = timestamps, .vsync_duration = 1.0,
+    };
+    pl_renderer_preparation preparation = NULL;
+    srand(1234);
+    describing = true;
+    REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot,
+                                           &preparation) == PL_RENDERER_PREPARE_OK);
+    describing = false;
+    forbid_compile = true;
+    REQUIRE(pl_renderer_prepare_submit(preparation) == PL_RENDERER_PREPARE_OK);
+    pl_clock_t start = pl_clock_now();
+    enum pl_pass_prepare_state state;
+    while ((state = pl_renderer_prepare_poll(preparation)) == PL_PASS_PREPARE_PENDING) {
+        REQUIRE(pl_clock_diff(pl_clock_now(), start) < 10.0);
+        pl_thread_sleep(0.001);
+    }
+    REQUIRE(state == PL_PASS_PREPARE_READY);
+    forbid_compile = false;
+    uint8_t expected[8 * 8 * 4], actual[8 * 8 * 4];
+    for (int i = 0; i < 4; i++) {
+        signatures[1] = 7 + i / 2;
+        describing = forbid_compile = true;
+        int executions = owner->executions, descriptions = owner->descriptions;
+        REQUIRE(pl_renderer_preflight_image_mix(preparation, &mix, &target) ==
+                PL_RENDERER_PREPARE_OK);
+        REQUIRE(owner->executions == executions);
+        if (hook && !direct && i % 2)
+            REQUIRE(owner->descriptions == descriptions + 1);
+        describing = false;
+        enum pl_renderer_prepare_result result = pl_render_image_mix_prepared(preparation, &mix, &target);
+        if (result != PL_RENDERER_PREPARE_OK)
+            fprintf(stderr, "mix result %d: %s\n", result, pl_renderer_prepare_error(preparation));
+        REQUIRE(result == PL_RENDERER_PREPARE_OK);
+        forbid_compile = false;
+        int ordinary = owner->ordinary, resets = owner->resets;
+        // The strict callback must never invoke the ordinary callback/reset.
+        if (hook) {
+            REQUIRE(owner->analysis_executions == (direct ? i + 1 : i / 2 + 1));
+            REQUIRE(owner->output_executions == i + 1);
+        }
+        if (!i)
+            srand(1234);
+        REQUIRE(pl_render_image_mix(reference_renderer, &mix, &reference_target, &owner->params));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = reference, .ptr = expected)));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
+        REQUIRE_MEMEQ(expected, actual, sizeof(expected));
+        if (hook) {
+            REQUIRE(owner->ordinary == owner->executions);
+            REQUIRE(owner->ordinary - ordinary == 1 + (direct || !(i & 1)));
+            REQUIRE(owner->resets > resets);
+        }
+        // Even after a rejected cached-frame preflight, the valid cache and
+        // ready generation survive and can present the original frame again.
+        struct pl_frame changed = target;
+        changed.repr.sys = PL_COLOR_SYSTEM_BT_2020_C;
+        changed.repr.levels = PL_COLOR_LEVELS_LIMITED;
+        int runs = gpu_runs, buffer_writes = writes;
+        executions = owner->executions;
+        signatures[1] += 100;
+        describing = forbid_compile = true;
+        REQUIRE(pl_renderer_preflight_image_mix(preparation, &mix, &changed) ==
+                PL_RENDERER_PREPARE_NOT_READY);
+        describing = forbid_compile = false;
+        signatures[1] -= 100;
+        REQUIRE(gpu_runs == runs && writes == buffer_writes);
+        REQUIRE(owner->executions == executions);
+        REQUIRE(pl_renderer_prepare_poll(preparation) == PL_PASS_PREPARE_READY);
+    }
+    pl_renderer_prepare_destroy(&preparation);
+    REQUIRE(owner->refs == 1);
+    pl_dispatch_destroy(&owner->auxiliary);
+    pl_buf_destroy(gpu, &owner->output);
+    free(owner);
+    pl_tex_destroy(gpu, &reference);
+    pl_tex_destroy(gpu, &output);
+    pl_renderer_destroy(&reference_renderer);
+    pl_renderer_destroy(&renderer);
+}
+
 int main(void)
 {
     pl_log log = pl_test_logger();
@@ -315,16 +436,85 @@ int main(void)
     priv->impl.buf_write = observe_write;
     uint8_t pixels[4 * 4 * 4];
     for (int i = 0; i < sizeof(pixels); i++)
-        pixels[i] = i % 4 == 3 ? 255 : (i * 17) % 256;
+        pixels[i] = (i * 17) % 256;
     pl_tex source = pl_tex_create(gpu, pl_tex_params(
         .w = 4, .h = 4, .format = pl_find_named_fmt(gpu, "rgba8"),
         .sampleable = true, .initial_data = pixels,
     ));
     REQUIRE(source);
-    test_renderer(gpu, source, 4, false, false);
-    test_renderer(gpu, source, 8, false, false);
-    test_renderer(gpu, source, 8, true, false);
-    test_renderer(gpu, source, 8, true, true);
+    test_renderer(gpu, frame(source), 4, false, false);
+    test_renderer(gpu, frame(source), 8, false, false);
+    test_renderer(gpu, frame(source), 8, true, false);
+    test_renderer(gpu, frame(source), 8, true, true);
+    test_mix(gpu, frame(source), false, true);
+    test_mix(gpu, frame(source), true, true);
+    test_mix(gpu, frame(source), false, false);
+    // Subsampled NV12 and planar 4:2:0, including shifted chroma and EWA
+    // plane merging/materialization before chroma reconstruction.
+    uint8_t y[16], uv[8], u[4], v[4];
+    for (int i = 0; i < 16; i++) y[i] = 32 + i * 12;
+    for (int i = 0; i < 4; i++) {
+        uv[2*i] = u[i] = 90 + i * 9;
+        uv[2*i+1] = v[i] = 160 - i * 8;
+    }
+    pl_tex planes[4];
+    const void *data[] = {y, uv, u, v};
+    for (int i = 0; i < 4; i++) {
+        planes[i] = pl_tex_create(gpu, pl_tex_params(
+            .w = i ? 2 : 4, .h = i ? 2 : 4,
+            .format = pl_find_named_fmt(gpu, i == 1 ? "rg8" : "r8"),
+            .sampleable = true, .initial_data = data[i]));
+        REQUIRE(planes[i]);
+    }
+    for (int planar = 0; planar < 2; planar++) {
+        struct pl_frame yuv = frame(source);
+        yuv.num_planes = planar ? 3 : 2;
+        yuv.repr = (struct pl_color_repr) {
+            .sys = PL_COLOR_SYSTEM_BT_709, .levels = PL_COLOR_LEVELS_LIMITED,
+        };
+        yuv.planes[0] = (struct pl_plane) {
+            .texture = planes[0], .components = 1, .component_mapping = {0},
+        };
+        yuv.planes[1] = (struct pl_plane) {
+            .texture = planes[planar ? 2 : 1], .components = planar ? 1 : 2,
+            .component_mapping = {1, 2}, .shift_x = 0.5,
+        };
+        if (planar) yuv.planes[2] = (struct pl_plane) {
+            .texture = planes[3], .components = 1, .component_mapping = {2},
+            .shift_x = 0.5,
+        };
+        test_renderer(gpu, yuv, 4, true, false);
+        test_renderer(gpu, yuv, 8, true, true);
+        test_mix(gpu, yuv, false, true);
+    }
+    // CapturePlaneUploader exports three 16-bit UNORM planes. Cover both
+    // subsampled chroma and same-size planes without reconstruction scaling.
+    for (int full_chroma = 0; full_chroma < 2; full_chroma++) {
+        struct pl_frame capture = frame(source);
+        capture.num_planes = 3;
+        capture.repr = (struct pl_color_repr) {
+            .sys = PL_COLOR_SYSTEM_BT_709, .levels = PL_COLOR_LEVELS_LIMITED,
+            .bits = {.sample_depth = 16, .color_depth = 10, .bit_shift = 6},
+        };
+        for (int p = 0; p < 3; p++) {
+            int dim = !p || full_chroma ? 4 : 2;
+            uint16_t capture_data[16];
+            for (int j = 0; j < 16; j++)
+                capture_data[j] = (p ? 400 + 4 * j : 64 + 50 * j) << 6;
+            capture.planes[p] = (struct pl_plane) {
+                .texture = pl_tex_create(gpu, pl_tex_params(
+                    .w = dim, .h = dim, .format = pl_find_named_fmt(gpu, "r16"),
+                    .sampleable = true, .initial_data = capture_data)),
+                .components = 1, .component_mapping = {p, -1, -1, -1},
+            };
+            REQUIRE(capture.planes[p].texture);
+        }
+        test_renderer(gpu, capture, 4, true, false);
+        test_renderer(gpu, capture, 8, true, true);
+        test_mix(gpu, capture, false, true);
+        for (int p = 0; p < 3; p++) pl_tex_destroy(gpu, &capture.planes[p].texture);
+    }
+    for (int i = 0; i < 4; i++) pl_tex_destroy(gpu, &planes[i]);
     pl_tex_destroy(gpu, &source);
     pl_vulkan_destroy(&vulkan);
     pl_log_destroy(&log);

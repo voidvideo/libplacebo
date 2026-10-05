@@ -353,6 +353,11 @@ bool sh_lut_stage(pl_shader_obj object)
     return true;
 }
 
+bool pl_shader_lut_stage(pl_shader_obj object)
+{
+    return sh_lut_stage(object);
+}
+
 // Maximum number of floats to embed as a literal array (when using SH_LUT_AUTO)
 #define SH_LUT_MAX_LITERAL_SOFT 64
 #define SH_LUT_MAX_LITERAL_HARD 256
