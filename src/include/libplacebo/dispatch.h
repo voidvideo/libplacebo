@@ -234,6 +234,72 @@ struct pl_dispatch_vertex_params {
 // advanced things like sampling from a cube map or spherical video.
 PL_API bool pl_dispatch_vertex(pl_dispatch dp, const struct pl_dispatch_vertex_params *params);
 
+// Description and strict execution use the same normalization as the explicit
+// synchronous entry points above. No compilation, resource allocation or GPU
+// execution occurs during description. These operations consume *shader even
+// on failure. A description may use descriptor metadata with NULL bindings;
+// execution always requires actual GPU resources.
+//
+// All handles have a single caller-side owner. The originating dispatch, GPU
+// and formats must outlive every description, preparation and prepared entry.
+// Prepared entries are owned independently of the ordinary dispatch cache;
+// reset_frame/cache eviction cannot invalidate them.
+typedef struct pl_dispatch_description_t *pl_dispatch_description;
+typedef struct pl_dispatch_preparation_t *pl_dispatch_preparation;
+typedef struct pl_dispatch_prepared_t *pl_dispatch_prepared;
+
+enum pl_dispatch_result {
+    PL_DISPATCH_OK = 0,
+    PL_DISPATCH_INVALID,
+    PL_DISPATCH_NOT_READY, // exact normalized variant was not prepared
+    PL_DISPATCH_FAILED,
+};
+
+// target supplies metadata only when params->target is NULL. Both describe
+// variants with a target use its actual resource metadata when it is non-NULL.
+PL_API enum pl_dispatch_result pl_dispatch_describe_finish(pl_dispatch dp,
+    const struct pl_dispatch_params *params, const struct pl_tex_params *target,
+    pl_dispatch_description *out);
+PL_API enum pl_dispatch_result pl_dispatch_describe_compute(pl_dispatch dp,
+    const struct pl_dispatch_compute_params *params, pl_dispatch_description *out);
+PL_API enum pl_dispatch_result pl_dispatch_describe_vertex(pl_dispatch dp,
+    const struct pl_dispatch_vertex_params *params, const struct pl_tex_params *target,
+    pl_dispatch_description *out);
+
+// Immutable normalized compilation parameters, valid until description destroy
+// or accepted submission. Uniform values and GPU bindings are not retained.
+PL_API const struct pl_pass_params *pl_dispatch_description_params(
+    pl_dispatch_description description);
+PL_API void pl_dispatch_description_destroy(pl_dispatch_description *description);
+
+// Stages entry-owned uniform storage/timing resources, then submits full pass
+// compilation to the GPU worker. No compilation happens on this caller. On
+// ACCEPTED, consumes *description; on rejection it remains owned by the caller.
+// Resource staging failure is UNAVAILABLE. Poll/take never create resources.
+PL_API enum pl_pass_prepare_result pl_dispatch_prepare_submit(
+    pl_dispatch_description *description, pl_dispatch_preparation *out);
+PL_API enum pl_pass_prepare_state pl_dispatch_prepare_poll(pl_dispatch_preparation request);
+PL_API enum pl_pass_prepare_phase pl_dispatch_prepare_failure_phase(pl_dispatch_preparation request);
+PL_API const char *pl_dispatch_prepare_error(pl_dispatch_preparation request);
+PL_API void pl_dispatch_prepare_cancel(pl_dispatch_preparation request);
+PL_API void pl_dispatch_prepare_release(pl_dispatch_preparation *request);
+PL_API enum pl_pass_prepare_state pl_dispatch_prepare_take(
+    pl_dispatch_preparation *request, pl_dispatch_prepared *out);
+PL_API void pl_dispatch_prepared_destroy(pl_dispatch_prepared *prepared);
+
+// Rebuild and validate the exact normalized identity before any GPU submission.
+// Uniform values/bindings may change; shader, specialization and layout changes
+// return NOT_READY, with no compilation or synchronous repair. The prepared
+// entry must belong to dp. OK means submitted, not GPU completion. These are
+// single-pass operations; a renderer must preflight its entire pass manifest
+// separately before starting a frame to guarantee whole-frame readiness.
+PL_API enum pl_dispatch_result pl_dispatch_finish_prepared(pl_dispatch dp,
+    pl_dispatch_prepared prepared, const struct pl_dispatch_params *params);
+PL_API enum pl_dispatch_result pl_dispatch_compute_prepared(pl_dispatch dp,
+    pl_dispatch_prepared prepared, const struct pl_dispatch_compute_params *params);
+PL_API enum pl_dispatch_result pl_dispatch_vertex_prepared(pl_dispatch dp,
+    pl_dispatch_prepared prepared, const struct pl_dispatch_vertex_params *params);
+
 // Cancel an active shader without submitting anything. Useful, for example,
 // if the shader was instead merged into a different shader.
 PL_API void pl_dispatch_abort(pl_dispatch dp, pl_shader *sh);
