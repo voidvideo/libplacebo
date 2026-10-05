@@ -55,6 +55,7 @@ struct snapshot_owner {
     struct pl_hook hook;
     const struct pl_hook *hooks[1];
     pl_dispatch auxiliary;
+    pl_shader auxiliary_builder;
     pl_buf output;
     int ordinary, resets, descriptions, executions;
     int analysis_executions, output_executions;
@@ -96,6 +97,11 @@ static struct pl_hook_prepare_result auxiliary_hook(struct snapshot_owner *owner
         owner->descriptions++;
     pl_shader shader = params->begin(params->context, owner->auxiliary, false);
     REQUIRE(shader);
+    // This dispatch has only one builder in flight. Repeated preflight and
+    // execution must recycle it instead of filling an unconsumed shader pool.
+    if (owner->auxiliary_builder)
+        REQUIRE(shader == owner->auxiliary_builder);
+    owner->auxiliary_builder = shader;
     struct pl_buffer_var value = { .var = pl_var_uint("value") };
     value.layout = pl_std430_layout(0, &value.var);
     struct pl_shader_desc descriptor = {
@@ -214,8 +220,8 @@ static void test_renderer(pl_gpu gpu, struct pl_frame image, int width, bool hoo
         fprintf(stderr, "renderer prepare: %s\n", pl_renderer_prepare_error(preparation));
     REQUIRE(state == PL_PASS_PREPARE_READY);
     describing = true;
-    REQUIRE(pl_renderer_preflight_image(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
-    REQUIRE(pl_renderer_preflight_image(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
+    for (int i = 0; i < 64; i++)
+        REQUIRE(pl_renderer_preflight_image(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
     if (image.num_planes > 1) {
         struct pl_frame changed_plane = image;
         changed_plane.planes[image.num_planes - 1].shift_x += 0.25;

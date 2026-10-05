@@ -460,7 +460,12 @@ static pl_shader prepared_begin(void *priv, pl_dispatch destination, bool unique
         prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "missing dispatch owner");
         return NULL;
     }
-    return pl_shader_alloc(p->rr->log, pl_shader_params(
+    // Dispatch completion returns builders to the destination's pool. Acquire
+    // from that same pool while retaining the candidate's explicit identity.
+    pl_shader sh = pl_dispatch_begin_ex(destination, false);
+    if (!sh)
+        return NULL;
+    pl_shader_reset(sh, pl_shader_params(
         .gpu = p->rr->gpu,
         .id = unique ? p->shader_id++ : 0,
         .index = p->shader_frame_index,
@@ -469,6 +474,7 @@ static pl_shader prepared_begin(void *priv, pl_dispatch destination, bool unique
         .describe_lut = prepare_lut,
         .describe_priv = p,
     ));
+    return sh;
 }
 
 static pl_shader pass_shader(struct pass_state *pass, bool unique)
