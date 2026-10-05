@@ -303,6 +303,10 @@ struct sh_lut_obj {
     int width, height, depth, comps;
     uint64_t signature;
     bool error; // reset if params change
+    bool description_owned;
+    bool staged;
+    struct pl_tex_params texture;
+    char *texture_tag;
 
     // weights, depending on the lut type
     pl_tex tex;
@@ -316,8 +320,37 @@ static void sh_lut_uninit(pl_gpu gpu, void *ptr)
     pl_tex_destroy(gpu, &lut->tex);
     pl_free(lut->str.buf);
     pl_free(lut->data);
+    pl_free(lut->texture_tag);
 
     *lut = (struct sh_lut_obj) {0};
+}
+
+bool sh_lut_stage(pl_shader_obj object)
+{
+    if (!object || object->type != PL_SHADER_OBJ_LUT)
+        return false;
+    struct sh_lut_obj *lut = object->priv;
+    if (!lut->description_owned || lut->error)
+        return false;
+    if (lut->staged)
+        return true;
+    if (lut->type == SH_LUT_TEXTURE) {
+        struct pl_tex_params params = lut->texture;
+        params.initial_data = params.host_writable ? NULL : lut->data;
+        pl_tex tex = pl_tex_create(object->gpu, &params);
+        if (!tex)
+            return false;
+        if (params.host_writable && !pl_tex_upload(object->gpu,
+                pl_tex_transfer_params(.tex = tex, .ptr = lut->data)))
+        {
+            pl_tex_destroy(object->gpu, &tex);
+            return false;
+        }
+        lut->tex = tex;
+        pl_free_ptr(&lut->data);
+    }
+    lut->staged = true;
+    return true;
 }
 
 // Maximum number of floats to embed as a literal array (when using SH_LUT_AUTO)
@@ -352,11 +385,22 @@ ident_t sh_lut(pl_shader sh, const struct sh_lut_params *params)
         (gpu && gpu->glsl.version > 100) ? gpu->limits.max_tex_3d_dim : 0,
     };
 
+    const bool describe = SH_PARAMS(sh).description_only;
+    if (describe && params->object && *params->object &&
+        (*params->object)->type == PL_SHADER_OBJ_LUT &&
+        !((struct sh_lut_obj *) (*params->object)->priv)->description_owned)
+    {
+        SH_FAIL(sh, "LUT discovery requires a candidate-owned shader object");
+        return NULL_IDENT;
+    }
+
     struct sh_lut_obj *lut = SH_OBJ(sh, params->object, PL_SHADER_OBJ_LUT,
                                     struct sh_lut_obj, sh_lut_uninit);
 
     if (!lut)
         return NULL_IDENT;
+    if (describe)
+        lut->description_owned = true;
 
     bool update = params->update || lut->signature != params->signature ||
                   vartype != lut->vartype || params->fmt != lut->fmt ||
@@ -467,6 +511,17 @@ next_dim: ; // `continue` out of the inner loop
     update |= type != lut->type;
     update |= method != lut->method;
 
+    // Once staged, a candidate's resource identity is immutable. Preflight can
+    // emit its description repeatedly, but never regenerate its contents.
+    if (lut->description_owned && lut->staged && update) {
+        SH_FAIL(sh, "Prepared LUT changed; a new preparation candidate is required");
+        return NULL_IDENT;
+    }
+    if (lut->description_owned && !describe && !lut->staged) {
+        SH_FAIL(sh, "Candidate LUT has not been staged");
+        return NULL_IDENT;
+    }
+
     if (update) {
         if (params->dynamic)
             pl_log_level_cap(sh->log, PL_LOG_TRACE);
@@ -513,6 +568,17 @@ next_dim: ; // `continue` out of the inner loop
                 .initial_data   = params->dynamic ? NULL : obj.data,
                 .debug_tag      = params->debug_tag,
             };
+
+            if (describe) {
+                pl_free(lut->data);
+                lut->data = pl_memdup(NULL, obj.data, obj.size);
+                pl_free(lut->texture_tag);
+                lut->texture_tag = pl_str0dup0(NULL, tex_params.debug_tag);
+                lut->texture = tex_params;
+                lut->texture.initial_data = NULL;
+                lut->texture.debug_tag = lut->texture_tag;
+                break;
+            }
 
             bool ok;
             if (params->dynamic) {
@@ -621,10 +687,11 @@ next_dim: ; // `continue` out of the inner loop
                 .type = PL_DESC_SAMPLED_TEX,
             },
             .binding = {
-                .object = lut->tex,
+                .object = describe ? NULL : lut->tex,
                 .sample_mode = is_linear ? PL_TEX_SAMPLE_LINEAR
                                          : PL_TEX_SAMPLE_NEAREST,
-            }
+            },
+            .texture = describe ? &lut->texture : NULL,
         });
 
         if (is_linear) {
@@ -810,12 +877,15 @@ next_dim: ; // `continue` out of the inner loop
     }
 
     lut->error = false;
+    if (describe && SH_PARAMS(sh).describe_lut)
+        SH_PARAMS(sh).describe_lut(SH_PARAMS(sh).describe_priv, *params->object);
     pl_cache_obj_free(&obj);
     pl_assert(name);
     return name;
 
 error:
-    lut->error = true;
+    if (!lut->description_owned || !lut->staged)
+        lut->error = true;
     pl_cache_obj_free(&obj);
     return NULL_IDENT;
 }

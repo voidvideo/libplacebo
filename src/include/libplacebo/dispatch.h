@@ -253,6 +253,7 @@ enum pl_dispatch_result {
     PL_DISPATCH_INVALID,
     PL_DISPATCH_NOT_READY, // exact normalized variant was not prepared
     PL_DISPATCH_FAILED,
+    PL_DISPATCH_UNSUPPORTED, // explicit description/execution contract unavailable
 };
 
 // target supplies metadata only when params->target is NULL. Both describe
@@ -286,6 +287,12 @@ PL_API void pl_dispatch_prepare_release(pl_dispatch_preparation *request);
 PL_API enum pl_pass_prepare_state pl_dispatch_prepare_take(
     pl_dispatch_preparation *request, pl_dispatch_prepared *out);
 PL_API void pl_dispatch_prepared_destroy(pl_dispatch_prepared *prepared);
+
+// Read-only exact identity check for manifest preflight. Both handles must
+// belong to the same destination dispatch. Does not consume either handle,
+// compile, allocate GPU resources, update uniforms or submit GPU work.
+PL_API bool pl_dispatch_prepared_matches(pl_dispatch_description description,
+                                         pl_dispatch_prepared prepared);
 
 // Rebuild and validate the exact normalized identity before any GPU submission.
 // Uniform values/bindings may change; shader, specialization and layout changes

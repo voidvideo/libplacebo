@@ -891,6 +891,52 @@ PL_API extern const int pl_num_scale_filters; // excluding trailing {0}
 PL_DEPRECATED_IN(v6.323) PL_API size_t pl_renderer_save(pl_renderer rr, uint8_t *out_cache);
 PL_DEPRECATED_IN(v6.323) PL_API void pl_renderer_load(pl_renderer rr, const uint8_t *cache);
 
+// Progressive strict renderer interface. This does not enable preparation for
+// legacy render calls. Unsupported selected features are rejected explicitly.
+// All handles are single-owner and their GPU/dispatch dependencies must outlive
+// them. snapshot owns immutable parameters, pointed-to options, hook contexts
+// and resource-layout inputs; retain/release are required, and stack snapshots
+// without retained backing storage are invalid.
+struct pl_renderer_snapshot {
+    const struct pl_render_params *params;
+    void *owner;
+    void (*retain)(void *owner);
+    void (*release)(void *owner);
+};
+
+typedef struct pl_renderer_preparation_t *pl_renderer_preparation;
+
+enum pl_renderer_prepare_result {
+    PL_RENDERER_PREPARE_OK = 0,
+    PL_RENDERER_PREPARE_UNSUPPORTED,
+    PL_RENDERER_PREPARE_INVALID,
+    PL_RENDERER_PREPARE_NOT_READY,
+    PL_RENDERER_PREPARE_FAILED,
+};
+
+// Describe only: no GPU resource allocation, compilation, dispatch, ordinary hook
+// invocation or reset. Source/target textures are read for metadata on this
+// caller only and are not retained. The complete selected path is collected.
+PL_API enum pl_renderer_prepare_result pl_renderer_describe_image(
+    pl_renderer renderer, const struct pl_frame *image, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out);
+// Stage candidate-owned resources and submit asynchronous pass preparation.
+PL_API enum pl_renderer_prepare_result pl_renderer_prepare_submit(pl_renderer_preparation preparation);
+PL_API enum pl_pass_prepare_state pl_renderer_prepare_poll(pl_renderer_preparation preparation);
+PL_API const char *pl_renderer_prepare_error(pl_renderer_preparation preparation);
+PL_API void pl_renderer_prepare_destroy(pl_renderer_preparation *preparation);
+// Preflight reconstructs the whole selected graph and compares every exact
+// pass before execution can begin. render_prepared performs that preflight
+// itself, then executes only through retained prepared entries. The snapshot
+// and runtime hook inputs must remain unchanged throughout the call. No frame
+// acquire/release callbacks are invoked: inputs must already be accessible.
+PL_API enum pl_renderer_prepare_result pl_renderer_preflight_image(
+    pl_renderer_preparation preparation, const struct pl_frame *image,
+    const struct pl_frame *target);
+PL_API enum pl_renderer_prepare_result pl_render_image_prepared(
+    pl_renderer_preparation preparation, const struct pl_frame *image,
+    const struct pl_frame *target);
+
 PL_API_END
 
 #endif // LIBPLACEBO_RENDERER_H_

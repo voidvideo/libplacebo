@@ -2000,6 +2000,13 @@ enum pl_pass_prepare_state pl_dispatch_prepare_take(
     return state;
 }
 
+bool pl_dispatch_prepared_matches(pl_dispatch_description description,
+                                  pl_dispatch_prepared prepared)
+{
+    return description && prepared && description->owner == prepared->owner &&
+           pass_matches(description->entry, prepared->entry);
+}
+
 void pl_dispatch_prepared_destroy(pl_dispatch_prepared *ptr)
 {
     pl_dispatch_prepared prepared = *ptr;
