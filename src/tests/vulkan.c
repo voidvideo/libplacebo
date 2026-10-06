@@ -7,6 +7,56 @@
 #include <libplacebo/renderer.h>
 #include <libplacebo/vulkan.h>
 
+#ifdef VK_KHR_cooperative_matrix
+static bool vulkan_has_extension(pl_vulkan vk, const char *name)
+{
+    for (int i = 0; i < vk->num_extensions; i++) {
+        if (strcmp(vk->extensions[i], name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static const VkPhysicalDeviceCooperativeMatrixFeaturesKHR *
+cooperative_matrix_features(pl_vulkan vk)
+{
+    for (const VkBaseInStructure *feature = (const void *) vk->features;
+         feature; feature = feature->pNext)
+    {
+        if (feature->sType ==
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)
+            return (const void *) feature;
+    }
+    return NULL;
+}
+
+static void cooperative_matrix_tests(pl_vulkan vk)
+{
+    const VkPhysicalDeviceCooperativeMatrixFeaturesKHR *features =
+        cooperative_matrix_features(vk);
+    const bool enabled = vulkan_has_extension(
+        vk, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) &&
+        features && features->cooperativeMatrix;
+
+    if (!enabled) {
+        REQUIRE(!vk->cooperative_matrices);
+        REQUIRE(!vk->num_cooperative_matrices);
+        return;
+    }
+
+    REQUIRE(vk->cooperative_matrices);
+    REQUIRE(vk->num_cooperative_matrices > 0);
+    for (int i = 0; i < vk->num_cooperative_matrices; i++) {
+        const struct pl_vulkan_cooperative_matrix *matrix =
+            &vk->cooperative_matrices[i];
+        REQUIRE(matrix->m > 0);
+        REQUIRE(matrix->n > 0);
+        REQUIRE(matrix->k > 0);
+        REQUIRE(matrix->stages != 0);
+    }
+}
+#endif
+
 // Exercise producer-complete imports without requiring a capture device. The
 // producer uses the same GPU allocation but explicitly hands ownership away;
 // this proves buffer data and ownership transitions, not V4L2 driver interop.
@@ -238,7 +288,7 @@ int main(int argc, char **argv)
     pl_log log = pl_test_logger();
     pl_vk_inst inst = pl_vk_inst_create(log, pl_vk_inst_params(
         .debug = true,
-        .debug_extra = true,
+        .debug_extra = false,
         .get_proc_addr = vkGetInstanceProcAddr,
         .opt_extensions = (const char *[]){
             VK_KHR_SURFACE_EXTENSION_NAME,
@@ -266,7 +316,13 @@ int main(int argc, char **argv)
     VkSurfaceKHR surf = VK_NULL_HANDLE;
 
     PL_VK_LOAD_FUN(inst->instance, CreateHeadlessSurfaceEXT, inst->get_proc_addr);
-    if (CreateHeadlessSurfaceEXT && !buffer_only) {
+    // A headless surface belongs to the instance, but several Vulkan ICDs do
+    // not safely handle surface queries when physical devices from multiple
+    // ICDs share that instance. Keep the all-device coverage below free of
+    // WSI, and exercise WSI whenever the loader exposes a single device. A
+    // multi-GPU host can cover each WSI implementation by running this test
+    // once per ICD via VK_DRIVER_FILES.
+    if (CreateHeadlessSurfaceEXT && !buffer_only && num == 1) {
         VkHeadlessSurfaceCreateInfoEXT info = {
             .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
         };
@@ -318,10 +374,14 @@ int main(int argc, char **argv)
         if (!vk)
             continue;
 
+#ifdef VK_KHR_cooperative_matrix
+        cooperative_matrix_tests(vk);
+#endif
         vulkan_buffer_import_rejections(vk);
         if (!buffer_only) {
             gpu_shader_tests(vk->gpu);
-            vulkan_swapchain_tests(vk, surf);
+            if (surf)
+                vulkan_swapchain_tests(vk, surf);
         }
 
         // Print heap statistics
@@ -342,6 +402,14 @@ int main(int argc, char **argv)
             .queue_transfer = vk->queue_transfer,
         ));
         REQUIRE(vk2);
+#ifdef VK_KHR_cooperative_matrix
+        cooperative_matrix_tests(vk2);
+        REQUIRE_CMP(vk2->num_cooperative_matrices, ==,
+                    vk->num_cooperative_matrices, "d");
+        REQUIRE_MEMEQ(vk2->cooperative_matrices, vk->cooperative_matrices,
+                      vk->num_cooperative_matrices *
+                      sizeof(*vk->cooperative_matrices));
+#endif
         pl_vulkan_destroy(&vk2);
 
         // Run these tests last because they disable some validation layers

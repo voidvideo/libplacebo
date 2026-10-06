@@ -42,7 +42,7 @@ static void observed_write(pl_gpu gpu, pl_buf buf, size_t offset, const void *da
 
 enum sampling_kind {
     DIRECT, NEAREST, BILINEAR, BICUBIC, HERMITE, GAUSSIAN, OVERSAMPLE,
-    POLAR_GATHER, POLAR_COMPUTE, ORTHO, KIND_COUNT,
+    POLAR_GATHER, POLAR_COMPUTE, POLAR_CACHED, ORTHO, KIND_COUNT,
 };
 
 static pl_shader sample(pl_dispatch dp, enum sampling_kind kind,
@@ -60,7 +60,10 @@ static pl_shader sample(pl_dispatch dp, enum sampling_kind kind,
     case OVERSAMPLE: ok = pl_shader_sample_oversample(sh, src, 0.0); break;
     case POLAR_GATHER:
     case POLAR_COMPUTE:
-        ok = pl_shader_sample_polar(sh, src, pl_sample_filter_params(
+    case POLAR_CACHED:
+        ok = (kind == POLAR_CACHED ? pl_shader_sample_polar_cached
+                                   : pl_shader_sample_polar)
+            (sh, src, pl_sample_filter_params(
             .filter = pl_filter_ewa_lanczos, .lut = lut,
             .no_compute = kind == POLAR_GATHER,
         ));
@@ -108,8 +111,8 @@ static void test_sampling(pl_gpu gpu, pl_tex source, enum sampling_kind kind)
     struct pl_tex_params target = source->params;
     target.initial_data = NULL;
     target.w = 8;
-    target.h = kind == ORTHO ? 4 : 8;
-    target.storable = kind == POLAR_COMPUTE;
+    target.h = kind == ORTHO || kind == POLAR_CACHED ? 4 : 8;
+    target.storable = kind == POLAR_COMPUTE || kind == POLAR_CACHED;
     target.host_readable = true;
     pl_tex output = pl_tex_create(gpu, &target);
     pl_tex reference = pl_tex_create(gpu, &target);
@@ -139,6 +142,10 @@ static void test_sampling(pl_gpu gpu, pl_tex source, enum sampling_kind kind)
         REQUIRE(strstr(b->glsl_shader, "textureGather"));
     if (kind == POLAR_COMPUTE)
         REQUIRE(b->type == PL_PASS_COMPUTE);
+    if (kind == POLAR_CACHED) {
+        REQUIRE(b->type == PL_PASS_COMPUTE);
+        REQUIRE(strstr(b->glsl_shader, "gl_LocalInvocationID.y == 0u"));
+    }
     forbid_gpu = false;
     pl_dispatch_prepared prepared = prepare(&desc);
     forbid_gpu = true;
@@ -148,7 +155,8 @@ static void test_sampling(pl_gpu gpu, pl_tex source, enum sampling_kind kind)
     REQUIRE(!pl_dispatch_prepared_matches(NULL, prepared));
     forbid_gpu = false;
 
-    pl_shader sh = sample(dp, kind, &real, &lut);
+    enum sampling_kind reference_kind = kind == POLAR_CACHED ? POLAR_COMPUTE : kind;
+    pl_shader sh = sample(dp, reference_kind, &real, &lut);
     REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = reference)));
     sh = sample(dp, kind, &real, &lut);
     REQUIRE(pl_dispatch_finish_prepared(dp, prepared,

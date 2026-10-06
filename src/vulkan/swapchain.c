@@ -48,6 +48,12 @@ struct priv {
     VkSwapchainCreateInfoKHR protoInfo; // partially filled-in prototype
     struct vk_swapchain *current;
     PL_ARRAY(struct vk_swapchain*) retired;
+#ifdef PL_HAVE_WIN32
+    HMONITOR exclusive_monitor;
+    bool exclusive_acquired;
+    VkResult exclusive_result;
+    atomic_uint_fast64_t exclusive_snapshot;
+#endif
     uint32_t queue_families[3];
     int cur_width, cur_height;
     int swapchain_depth;
@@ -62,6 +68,16 @@ struct priv {
 
 static const struct pl_sw_fns vulkan_swapchain;
 
+#ifdef PL_HAVE_WIN32
+// Publish result and confirmed acquisition together. Status readers must never
+// wait on the lock held across start_frame/render/submit or on driver calls.
+static void publish_exclusive(struct priv *p)
+{
+    uint64_t snapshot = ((uint64_t) (uint32_t) p->exclusive_result << 1) |
+                        (uint64_t) p->exclusive_acquired;
+    atomic_store_explicit(&p->exclusive_snapshot, snapshot, memory_order_release);
+}
+#endif
 
 static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
 {
@@ -398,6 +414,10 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
     p->has_swapchain_maintenance1 = sw_maint_features && sw_maint_features->swapchainMaintenance1;
     pl_assert(p->swapchain_depth > 0);
     atomic_init(&p->frames_in_flight, 0);
+#ifdef PL_HAVE_WIN32
+    p->exclusive_result = VK_NOT_READY;
+    atomic_init(&p->exclusive_snapshot, (uint64_t) VK_NOT_READY << 1);
+#endif
     p->protoInfo = (VkSwapchainCreateInfoKHR) {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = p->surf,
@@ -518,6 +538,54 @@ static void cleanup_retired_swapchains(pl_swapchain sw, uint64_t timeout)
     }
 }
 
+// Called with the swapchain lock held (or during final destruction).
+static void release_exclusive(struct priv *p)
+{
+#ifdef PL_HAVE_WIN32
+    if (p->exclusive_acquired && p->current && p->current->swapchain) {
+        VkResult res = p->vk->ReleaseFullScreenExclusiveModeEXT(
+            p->vk->dev, p->current->swapchain);
+        if (res != VK_SUCCESS)
+            PL_WARN(p->vk, "[Exclusive] Release failed: %s", vk_res_str(res));
+        p->exclusive_acquired = false;
+        p->exclusive_result = res;
+        publish_exclusive(p);
+    }
+#else
+    (void) p;
+#endif
+}
+
+#ifdef PL_HAVE_WIN32
+static bool acquire_exclusive(struct priv *p)
+{
+    if (!p->exclusive_monitor || p->exclusive_acquired)
+        return true;
+    if (!p->current || !p->current->swapchain)
+        return false;
+
+    VkResult previous = p->exclusive_result;
+    p->exclusive_result = p->vk->AcquireFullScreenExclusiveModeEXT(
+        p->vk->dev, p->current->swapchain);
+    p->exclusive_acquired = p->exclusive_result == VK_SUCCESS;
+    publish_exclusive(p);
+    if (p->exclusive_acquired)
+        PL_INFO(p->vk, "[Exclusive] Vulkan fullscreen acquisition confirmed");
+    else if (previous != p->exclusive_result)
+        PL_ERR(p->vk, "[Exclusive] Acquisition failed: %s",
+               vk_res_str(p->exclusive_result));
+    return p->exclusive_acquired;
+}
+
+static void exclusive_lost(struct priv *p)
+{
+    p->exclusive_acquired = false;
+    p->exclusive_result = VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
+    publish_exclusive(p);
+    PL_WARN(p->vk, "[Exclusive] Vulkan fullscreen mode lost; presentation suspended until reacquired");
+}
+#endif
+
 static void vk_sw_destroy(pl_swapchain sw)
 {
     pl_gpu gpu = sw->gpu;
@@ -527,6 +595,7 @@ static void vk_sw_destroy(pl_swapchain sw)
     pl_gpu_flush(gpu);
     vk_wait_idle(vk);
 
+    release_exclusive(p);
     cleanup_retired_swapchains(sw, UINT64_MAX);
     swapchain_destroy(sw, &p->current, UINT64_MAX);
 
@@ -562,19 +631,57 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
         .surface = p->surf,
     };
 #ifdef VK_EXT_full_screen_exclusive
-    // Explicitly disallow full screen exclusive mode if possible
-    static const VkSurfaceFullScreenExclusiveInfoEXT fsinfo = {
+    VkSurfaceFullScreenExclusiveInfoEXT fsinfo = {
         .sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
+#ifdef PL_HAVE_WIN32
+        .fullScreenExclusive = p->exclusive_monitor
+            ? VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
+            : VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,
+#else
         .fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,
+#endif
     };
     if (vk->AcquireFullScreenExclusiveModeEXT)
         vk_link_struct(&surface_info, &fsinfo);
+#ifdef PL_HAVE_WIN32
+    VkSurfaceFullScreenExclusiveWin32InfoEXT monitor = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT,
+        .hmonitor = p->exclusive_monitor,
+    };
+    if (p->exclusive_monitor)
+        vk_link_struct(&surface_info, &monitor);
+#endif
 #endif
 
+#ifdef PL_HAVE_WIN32
+    VkSurfaceCapabilitiesFullScreenExclusiveEXT exclusive_support = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT,
+    };
+#endif
     VkSurfaceCapabilities2KHR surface_caps = {
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+#ifdef PL_HAVE_WIN32
+        .pNext = p->exclusive_monitor ? &exclusive_support : NULL,
+#endif
     };
-    VK(vk->GetPhysicalDeviceSurfaceCapabilities2KHR(vk->physd, &surface_info, &surface_caps));
+    VkResult caps_res = vk->GetPhysicalDeviceSurfaceCapabilities2KHR(
+        vk->physd, &surface_info, &surface_caps);
+#ifdef PL_HAVE_WIN32
+    if (p->exclusive_monitor &&
+        (caps_res != VK_SUCCESS || !exclusive_support.fullScreenExclusiveSupported))
+    {
+        p->exclusive_result = caps_res != VK_SUCCESS
+            ? caps_res : VK_ERROR_FEATURE_NOT_PRESENT;
+        publish_exclusive(p);
+        PL_ERR(vk, "[Exclusive] Target surface/monitor does not support exclusive fullscreen: %s",
+               vk_res_str(p->exclusive_result));
+        return false;
+    }
+#endif
+    if (caps_res != VK_SUCCESS) {
+        PL_ERR(vk, "Failed querying surface capabilities: %s", vk_res_str(caps_res));
+        return false;
+    }
     caps = surface_caps.surfaceCapabilities;
 
 caps_ready:
@@ -768,13 +875,30 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
         vk_link_struct(&sinfo, &pminfo);
 
 #ifdef VK_EXT_full_screen_exclusive
-    // Explicitly disallow full screen exclusive mode if possible
-    static const VkSurfaceFullScreenExclusiveInfoEXT fsinfo = {
+    VkSurfaceFullScreenExclusiveInfoEXT fsinfo = {
         .sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
+#ifdef PL_HAVE_WIN32
+        .fullScreenExclusive = p->exclusive_monitor
+            ? VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
+            : VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,
+#else
         .fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,
+#endif
     };
     if (vk->AcquireFullScreenExclusiveModeEXT)
         vk_link_struct(&sinfo, &fsinfo);
+#ifdef PL_HAVE_WIN32
+    VkSurfaceFullScreenExclusiveWin32InfoEXT monitor = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT,
+        .hmonitor = p->exclusive_monitor,
+    };
+    if (p->exclusive_monitor)
+        vk_link_struct(&sinfo, &monitor);
+    else if (vk->AcquireFullScreenExclusiveModeEXT)
+        PL_INFO(sw, "[Fullscreen] Vulkan exclusive policy: allowed (driver-managed; acquisition not confirmed)");
+    else
+        PL_WARN(sw, "[Fullscreen] VK_EXT_full_screen_exclusive unavailable; using driver default behavior");
+#endif
 #endif
 
     p->suboptimal = false;
@@ -798,6 +922,19 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     p->current = current = pl_zalloc_ptr(NULL, p->current);
     current->last_imgidx = -1;
     VkResult res = vk->CreateSwapchainKHR(vk->dev, &sinfo, PL_VK_ALLOC, &current->swapchain);
+#ifdef PL_HAVE_WIN32
+    // A successful replacement inherits exclusive access from oldSwapchain.
+    // Do not acquire it a second time. A failed replacement retires the old
+    // chain, so clear the confirmed state.
+    if (p->exclusive_monitor && res != VK_SUCCESS) {
+        p->exclusive_acquired = false;
+        p->exclusive_result = res;
+        publish_exclusive(p);
+    } else if (p->exclusive_acquired) {
+        p->exclusive_result = VK_SUCCESS;
+        publish_exclusive(p);
+    }
+#endif
     PL_VK_ASSERT(res, "vk->CreateSwapchainKHR(...)");
 
     // Get the new swapchain images
@@ -859,10 +996,22 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     p->hdr_metadata = pl_hdr_metadata_empty;
     set_hdr_metadata(p, &metadata);
 
+#ifdef PL_HAVE_WIN32
+    if (!acquire_exclusive(p))
+        goto error;
+#endif
     return true;
 
 error:
     PL_ERR(vk, "Failed (re)creating swapchain!");
+    release_exclusive(p);
+#ifdef PL_HAVE_WIN32
+    if (p->exclusive_monitor && (p->exclusive_result == VK_SUCCESS ||
+                                 p->exclusive_result == VK_NOT_READY)) {
+        p->exclusive_result = VK_ERROR_INITIALIZATION_FAILED;
+        publish_exclusive(p);
+    }
+#endif
     swapchain_destroy(sw, &p->current, UINT64_MAX);
     p->cur_width = p->cur_height = 0;
     return false;
@@ -883,6 +1032,15 @@ static bool vk_sw_start_frame(pl_swapchain sw,
         pl_mutex_unlock(&p->lock);
         return false;
     }
+
+#ifdef PL_HAVE_WIN32
+    // Never continue ordinary presentation after exclusive access was lost.
+    // Retrying on the same live swapchain is explicitly allowed by Vulkan.
+    if (!acquire_exclusive(p)) {
+        pl_mutex_unlock(&p->lock);
+        return false;
+    }
+#endif
 
     for (int attempts = 0; attempts < 2; attempts++) {
         VkSemaphore sem_in = p->current->sems_in.elem[p->current->idx_sems_in];
@@ -920,6 +1078,13 @@ static bool vk_sw_start_frame(pl_swapchain sw,
             };
             // keep lock held
             return true;
+
+#ifdef PL_HAVE_WIN32
+        case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+            exclusive_lost(p);
+            pl_mutex_unlock(&p->lock);
+            return false;
+#endif
 
         case VK_ERROR_OUT_OF_DATE_KHR: {
             // In these cases try recreating the swapchain
@@ -1018,6 +1183,13 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
+#ifdef PL_HAVE_WIN32
+    if (res == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+        exclusive_lost(p);
+        pl_mutex_unlock(&p->lock);
+        return false;
+    }
+#endif
     pl_mutex_unlock(&p->lock);
 
     switch (res) {
@@ -1095,6 +1267,50 @@ static void vk_sw_colorspace_hint(pl_swapchain sw, const struct pl_color_space *
     pl_assert(ok);
 
     pl_mutex_unlock(&p->lock);
+}
+
+VkResult pl_vulkan_swapchain_request_exclusive(pl_swapchain sw, void *native_monitor)
+{
+#ifdef PL_HAVE_WIN32
+    struct priv *p = PL_PRIV(sw);
+    struct vk_ctx *vk = p->vk;
+    pl_mutex_lock(&p->lock);
+    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+    if (p->current || !native_monitor)
+        goto done;
+    result = VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!vk->AcquireFullScreenExclusiveModeEXT ||
+        !vk->ReleaseFullScreenExclusiveModeEXT ||
+        !vk->GetPhysicalDeviceSurfaceCapabilities2KHR)
+        goto done;
+    p->exclusive_monitor = (HMONITOR) native_monitor;
+    p->exclusive_result = VK_NOT_READY;
+    publish_exclusive(p);
+    p->needs_recreate = true;
+    result = VK_SUCCESS;
+done:
+    pl_mutex_unlock(&p->lock);
+    return result;
+#else
+    (void) sw;
+    (void) native_monitor;
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+#endif
+}
+
+VkResult pl_vulkan_swapchain_exclusive_status(pl_swapchain sw, bool *acquired)
+{
+    *acquired = false;
+#ifdef PL_HAVE_WIN32
+    struct priv *p = PL_PRIV(sw);
+    uint64_t snapshot = atomic_load_explicit(&p->exclusive_snapshot,
+                                             memory_order_acquire);
+    *acquired = snapshot & 1;
+    return (VkResult) (int32_t) (snapshot >> 1);
+#else
+    (void) sw;
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+#endif
 }
 
 bool pl_vulkan_swapchain_suboptimal(pl_swapchain sw)

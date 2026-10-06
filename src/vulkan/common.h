@@ -109,6 +109,9 @@ struct vk_ctx {
     PL_VK_FUN(GetPhysicalDeviceExternalBufferProperties);
     PL_VK_FUN(GetPhysicalDeviceExternalSemaphoreProperties);
     PL_VK_FUN(GetPhysicalDeviceFeatures2);
+#ifdef VK_KHR_cooperative_matrix
+    PL_VK_FUN(GetPhysicalDeviceCooperativeMatrixPropertiesKHR);
+#endif
     PL_VK_FUN(GetPhysicalDeviceFormatProperties);
     PL_VK_FUN(GetPhysicalDeviceFormatProperties2);
     PL_VK_FUN(GetPhysicalDeviceImageFormatProperties2);
@@ -242,5 +245,6 @@ struct vk_ctx {
 #endif
 #ifdef VK_EXT_full_screen_exclusive
     PL_VK_FUN(AcquireFullScreenExclusiveModeEXT);
+    PL_VK_FUN(ReleaseFullScreenExclusiveModeEXT);
 #endif
 };

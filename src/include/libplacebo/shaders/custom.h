@@ -357,7 +357,12 @@ struct pl_hook_prepare_params {
     pl_gpu gpu;
     pl_dispatch dispatch;
     void *context;
+    // Per-preparation storage owned by the renderer. This is zero-initialized
+    // once and retained across description, preflight and prepared execution.
+    // It is private to this hook and preparation object.
+    void *state;
     pl_shader (*begin)(void *context, pl_dispatch destination, bool unique);
+    void (*abort)(void *context, pl_dispatch destination, pl_shader *shader);
     enum pl_dispatch_result (*finish)(void *context, pl_dispatch destination,
         const struct pl_dispatch_params *params, const struct pl_tex_params *target);
     enum pl_dispatch_result (*compute)(void *context, pl_dispatch destination,
@@ -417,6 +422,15 @@ struct pl_hook {
     // All hooks with the same signature will be disabled, should they fail to
     // execute during run-time.
     uint64_t signature;
+
+    // Optional per-preparation state required by explicit strict callbacks.
+    // The renderer allocates a separate zeroed block for every preparation,
+    // so callbacks never need to mutate shared hook state. reset_prepared is
+    // invoked once at the start of every strict traversal; it may clear
+    // traversal-local bookkeeping but must preserve any frozen configuration
+    // needed to compare description, preflight and execution.
+    size_t prepared_state_size;
+    void (*reset_prepared)(void *priv, void *state, bool executing);
 
     // Explicit strict-path callbacks. Both are required for preparation.
     // describe may only emit shaders and inspect frozen metadata. It must not

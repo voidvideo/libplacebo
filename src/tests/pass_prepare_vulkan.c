@@ -96,6 +96,81 @@ static void test_raster(pl_gpu gpu)
     pl_tex_destroy(gpu, &target);
 }
 
+#ifdef VK_KHR_cooperative_matrix
+static void test_cooperative_matrix_pass(pl_vulkan vk)
+{
+    const struct pl_vulkan_cooperative_matrix *matrix = NULL;
+    for (int i = 0; i < vk->num_cooperative_matrices; i++) {
+        const struct pl_vulkan_cooperative_matrix *candidate =
+            &vk->cooperative_matrices[i];
+        if (candidate->a_type == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            candidate->b_type == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            candidate->c_type == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+            candidate->result_type == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+            candidate->scope == VK_SCOPE_SUBGROUP_KHR &&
+            !candidate->saturating_accumulation &&
+            (candidate->stages & VK_SHADER_STAGE_COMPUTE_BIT))
+        {
+            matrix = candidate;
+            break;
+        }
+    }
+
+    if (!matrix)
+        return;
+
+    char source[4096];
+    int len = snprintf(source, sizeof(source),
+        "#version 450\n"
+        "#extension GL_EXT_shader_16bit_storage : require\n"
+        "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
+        "#extension GL_KHR_cooperative_matrix : require\n"
+        "#extension GL_KHR_memory_scope_semantics : require\n"
+        "#pragma use_vulkan_memory_model\n"
+        "layout(local_size_x = %u) in;\n"
+        "layout(std430, binding = 0) buffer Output { float result[]; };\n"
+        "shared float16_t a_data[%u];\n"
+        "shared float16_t b_data[%u];\n"
+        "shared float c_data[%u];\n"
+        "void main() {\n"
+        "  coopmat<float16_t, gl_ScopeSubgroup, %u, %u, gl_MatrixUseA> a;\n"
+        "  coopmat<float16_t, gl_ScopeSubgroup, %u, %u, gl_MatrixUseB> b;\n"
+        "  coopmat<float, gl_ScopeSubgroup, %u, %u, gl_MatrixUseAccumulator> c =\n"
+        "      coopmat<float, gl_ScopeSubgroup, %u, %u, gl_MatrixUseAccumulator>(0.0);\n"
+        "  coopMatLoad(a, a_data, 0, %u, gl_CooperativeMatrixLayoutRowMajor);\n"
+        "  coopMatLoad(b, b_data, 0, %u, gl_CooperativeMatrixLayoutRowMajor);\n"
+        "  c = coopMatMulAdd(a, b, c);\n"
+        "  coopMatStore(c, c_data, 0, %u, gl_CooperativeMatrixLayoutRowMajor);\n"
+        "  barrier();\n"
+        "  for (uint i = gl_LocalInvocationIndex; i < %u; i += %u)\n"
+        "    result[i] = c_data[i];\n"
+        "}\n",
+        vk->gpu->glsl.subgroup_size,
+        matrix->m * matrix->k, matrix->k * matrix->n, matrix->m * matrix->n,
+        matrix->m, matrix->k, matrix->k, matrix->n,
+        matrix->m, matrix->n, matrix->m, matrix->n,
+        matrix->k, matrix->n, matrix->n,
+        matrix->m * matrix->n, vk->gpu->glsl.subgroup_size);
+    REQUIRE(len > 0 && len < sizeof(source));
+
+    struct pl_desc output = {
+        .name = "Output",
+        .type = PL_DESC_BUF_STORAGE,
+        .access = PL_DESC_ACCESS_WRITEONLY,
+    };
+    pl_pass_preparation request = NULL;
+    REQUIRE(pl_pass_prepare_submit(vk->gpu, pl_pass_params(
+        .type = PL_PASS_COMPUTE,
+        .glsl_shader = source,
+        .num_descriptors = 1,
+        .descriptors = &output,
+    ), &request) == PL_PASS_PREPARE_ACCEPTED);
+    pl_prepared_pass pass = take_prepared(&request);
+    REQUIRE(pass);
+    pl_prepared_pass_destroy(&pass);
+}
+#endif
+
 static const char source[] =
     "#version 450\n"
     "layout(local_size_x = 1) in;\n"
@@ -163,7 +238,10 @@ int main(void)
     latch_init(&translation);
     latch_init(&pipeline);
     pl_log log = pl_test_logger();
-    pl_vulkan vk = pl_vulkan_create(log, pl_vulkan_params(.allow_software = true));
+    pl_vulkan vk = pl_vulkan_create(log, pl_vulkan_params(
+        .allow_software = true,
+        .instance_params = pl_vk_inst_params(.debug = true),
+    ));
     if (!vk) {
         pl_log_destroy(&log);
         return SKIP;
@@ -179,6 +257,10 @@ int main(void)
     priv->vk->CreateComputePipelines = observed_pipeline;
     original_graphics = priv->vk->CreateGraphicsPipelines;
     priv->vk->CreateGraphicsPipelines = observed_graphics;
+
+#ifdef VK_KHR_cooperative_matrix
+    test_cooperative_matrix_pass(vk);
+#endif
 
     pl_buf buffer = pl_buf_create(gpu, pl_buf_params(
         .size = sizeof(uint32_t), .storable = true, .host_readable = true,

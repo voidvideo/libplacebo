@@ -511,6 +511,13 @@ static void describe_filter(pl_shader sh, const struct pl_filter_config *cfg,
     }
 }
 
+static bool polar_tap_active(pl_filter filter, int x, int y)
+{
+    int yy = y > 0 ? y - 1 : y;
+    int xx = x > 0 ? x - 1 : x;
+    return sqrt(xx * xx + yy * yy) < filter->radius;
+}
+
 // Subroutine for computing and adding an individual texel contribution
 // If `in` is NULL, samples directly
 // If `in` is set, takes the pixel from inX[idx] where X is the component,
@@ -518,7 +525,9 @@ static void describe_filter(pl_shader sh, const struct pl_filter_config *cfg,
 static void polar_sample(pl_shader sh, pl_filter filter,
                          ident_t tex, ident_t lut, ident_t radius,
                          int x, int y, uint8_t comp_mask, ident_t in,
-                         bool use_ar, ident_t scale)
+                         bool use_ar, ident_t scale, ident_t cached_weights,
+                         ident_t cached_phases, int cached_index,
+                         int cached_stride)
 {
     // Since we can't know the subpixel position in advance, assume a
     // worst case scenario
@@ -541,7 +550,14 @@ static void polar_sample(pl_shader sh, pl_filter filter,
     d = length(vec2(offset) - fcoord);                          \
     @if (maybe_skippable)                                       \
         if (d < $radius) {                                      \
-    w = $lut(d * 1.0 / $radius);                                \
+    @if (cached_weights != NULL_IDENT) {                         \
+        if (all(equal(fcoord, ${cached_phases}[gl_LocalInvocationID.x]))) \
+            w = ${cached_weights}[${const int: cached_index * cached_stride} + int(gl_LocalInvocationID.x)]; \
+        else                                                     \
+            w = $lut(d * 1.0 / $radius);                        \
+    @} else {                                                   \
+        w = $lut(d * 1.0 / $radius);                            \
+    @}                                                          \
     wsum += w;                                                  \
     @if (in != NULL_IDENT) {                                    \
         @for (c : comp_mask)                                    \
@@ -599,8 +615,9 @@ static void fill_polar_lut(void *data, const struct sh_lut_params *params)
     memcpy(data, filt->weights, params->width * sizeof(float));
 }
 
-bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
-                            const struct pl_sample_filter_params *params)
+static bool shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+                                const struct pl_sample_filter_params *params,
+                                bool request_weight_cache)
 {
     pl_assert(params);
     if (!params->filter.polar) {
@@ -676,6 +693,11 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
     int bound   = ceil(obj->filter->radius);
     int offset  = bound - 1; // padding top/left
     int padding = offset + bound; // total padding
+    int num_taps = 0;
+    for (int y = 1 - bound; y <= bound; y++) {
+        for (int x = 1 - bound; x <= bound; x++)
+            num_taps += polar_tap_active(obj->filter, x, y);
+    }
 
     // Determined experimentally on modern AMD and Nvidia hardware. 32 is a
     // good tradeoff for the horizontal work group size. Apart from that,
@@ -687,6 +709,7 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
     // gather kernel generally pulls ahead here.
     bool is_compute = !params->no_compute && sh_glsl(sh).compute;
     is_compute &= obj->filter->radius < 6.0;
+    bool cache_weights = request_weight_cache && rx == 2.0f && ry == 1.0f;
 
     while (is_compute) {
         // We need to sample everything from base_min to base_max, so make sure
@@ -702,10 +725,19 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
             sizeh = PL_ALIGN2(sizeh, 8);
         }
 
-        const int shmem_req = (sizew * sizeh * num_comps + 2) * sizeof(float);
+        int shmem_req = (sizew * sizeh * num_comps + 2) * sizeof(float);
+        if (cache_weights)
+            shmem_req += bw * (2 + num_taps) * sizeof(float);
         if (shmem_req > sh_glsl(sh).max_shmem_size && bh > 1) {
             // Try again with smaller work group size
             bh >>= 1;
+            continue;
+        }
+        if (shmem_req > sh_glsl(sh).max_shmem_size && cache_weights) {
+            // Keep the normal compute sampler when the cache itself would
+            // prevent dispatch on a smaller shared-memory implementation.
+            cache_weights = false;
+            bh = sh_glsl(sh).max_group_threads / bw;
             continue;
         }
 
@@ -734,6 +766,8 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
 
     ident_t radius_c = sh_const_float(sh, "radius", obj->filter->radius);
     ident_t in = sh_fresh(sh, "in");
+    ident_t cached_weights = NULL_IDENT;
+    ident_t cached_phases = NULL_IDENT;
 
     if (is_compute) {
 
@@ -787,13 +821,53 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
         GLSL("}}                     \n"
              "barrier();             \n");
 
+        if (cache_weights) {
+            ident_t offsets = sh_fresh(sh, "polar_offsets");
+            cached_phases = sh_fresh(sh, "polar_phases");
+            cached_weights = sh_fresh(sh, "polar_weights");
+            GLSLH("shared vec2 "$"[%d]; \n"
+                  "shared float "$"[%d]; \n"
+                  "const ivec2 "$"[%d] = ivec2[]( \n",
+                  cached_phases, bw, cached_weights, bw * num_taps,
+                  offsets, num_taps);
+            int tap = 0;
+            for (int y = 1 - bound; y <= bound; y++) {
+                for (int x = 1 - bound; x <= bound; x++) {
+                    if (!polar_tap_active(obj->filter, x, y))
+                        continue;
+                    GLSLH("ivec2(%d, %d)%s \n", x, y,
+                          ++tap == num_taps ? "" : ",");
+                }
+            }
+            GLSLH("); \n");
+            GLSL("if (gl_LocalInvocationID.y == 0u)                         \n"
+                 "    "$"[gl_LocalInvocationID.x] = fcoord;                \n"
+                 "barrier();                                                \n"
+                 "for (uint i = gl_LocalInvocationIndex; i < %du;           \n"
+                 "     i += gl_WorkGroupSize.x * gl_WorkGroupSize.y) {      \n"
+                 "    int tap = int(i) / %d;                                \n"
+                 "    int column = int(i) %% %d;                            \n"
+                 "    float cache_d = length(vec2("$"[tap]) - "$"[column]);\n"
+                 "    "$"[i] = cache_d < "$"                              \n"
+                 "        ? "$"(cache_d * 1.0 / "$")                    \n"
+                 "        : 0.0;                                            \n"
+                 "}                                                         \n"
+                 "barrier();                                                \n",
+                 cached_phases, bw * num_taps, bw, bw, offsets, cached_phases,
+                 cached_weights, radius_c, lut, radius_c);
+        }
+
         // Dispatch the actual samples
+        int tap = 0;
         for (int y = 1 - bound; y <= bound; y++) {
             for (int x = 1 - bound; x <= bound; x++) {
+                if (!polar_tap_active(obj->filter, x, y))
+                    continue;
                 GLSL("idx = "$" * rel.y + rel.x + "$" * %d + %d; \n",
                      sizew_c, sizew_c, y + offset, x + offset);
                 polar_sample(sh, obj->filter, src_tex, lut, radius_c,
-                             x, y, cmask, in, use_ar, scale);
+                             x, y, cmask, in, use_ar, scale, cached_weights,
+                             cached_phases, tap++, bw);
             }
         }
     } else {
@@ -851,7 +925,8 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
                 if (!use_gather) {
                     // Switch to direct sampling instead
                     polar_sample(sh, obj->filter, src_tex, lut, radius_c,
-                                 x, y, cmask, NULL_IDENT, use_ar, scale);
+                                 x, y, cmask, NULL_IDENT, use_ar, scale,
+                                 NULL_IDENT, NULL_IDENT, 0, 0);
                     continue;
                 }
 
@@ -894,7 +969,8 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
 
                     GLSL("idx = %d;\n", p);
                     polar_sample(sh, obj->filter, src_tex, lut, radius_c,
-                                 x+xo[p], y+yo[p], cmask, in, use_ar, scale);
+                                 x+xo[p], y+yo[p], cmask, in, use_ar, scale,
+                                 NULL_IDENT, NULL_IDENT, 0, 0);
                 }
 
                 // Mark the other next row's pixels as already gathered
@@ -924,6 +1000,18 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
     }
 
     return true;
+}
+
+bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+                            const struct pl_sample_filter_params *params)
+{
+    return shader_sample_polar(sh, src, params, false);
+}
+
+bool pl_shader_sample_polar_cached(pl_shader sh, const struct pl_sample_src *src,
+                                   const struct pl_sample_filter_params *params)
+{
+    return shader_sample_polar(sh, src, params, true);
 }
 
 static void fill_ortho_lut(void *data, const struct sh_lut_params *params)

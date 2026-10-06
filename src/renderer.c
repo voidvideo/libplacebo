@@ -112,12 +112,18 @@ struct prepared_frame_shape {
     pl_rect2df crop;
 };
 
+struct prepared_hook_state {
+    const struct pl_hook *hook;
+    void *data;
+};
+
 struct pl_renderer_preparation_t {
     pl_renderer rr;
     struct pl_renderer_snapshot snapshot;
     PL_ARRAY(struct prepared_render_pass) passes;
     PL_ARRAY(struct pl_hook_texture *) textures;
     PL_ARRAY(pl_shader_obj) luts;
+    PL_ARRAY(struct prepared_hook_state) hook_states;
     enum pl_renderer_prepare_result result;
     const char *error;
     bool submitted;
@@ -134,6 +140,47 @@ struct pl_renderer_preparation_t {
     int mix_output_pass, mix_output_texture;
     uint8_t shader_frame_index;
 };
+
+static void prepare_fail(pl_renderer_preparation p,
+                         enum pl_renderer_prepare_result result,
+                         const char *error);
+
+static void *prepared_hook_state(pl_renderer_preparation p,
+                                 const struct pl_hook *hook)
+{
+    if (!hook->prepared_state_size)
+        return NULL;
+    for (int i = 0; i < p->hook_states.num; i++) {
+        if (p->hook_states.elem[i].hook == hook)
+            return p->hook_states.elem[i].data;
+    }
+    if (p->checking || p->executing) {
+        prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY,
+                     "prepared hook state graph changed");
+        return NULL;
+    }
+    void *data = pl_zalloc(p, hook->prepared_state_size);
+    if (!data) {
+        prepare_fail(p, PL_RENDERER_PREPARE_FAILED,
+                     "failed allocating prepared hook state");
+        return NULL;
+    }
+    PL_ARRAY_APPEND(p, p->hook_states, ((struct prepared_hook_state) {
+        .hook = hook,
+        .data = data,
+    }));
+    return data;
+}
+
+static void reset_prepared_hook_states(pl_renderer_preparation p)
+{
+    for (int i = 0; i < p->hook_states.num; i++) {
+        struct prepared_hook_state *state = &p->hook_states.elem[i];
+        if (state->hook->reset_prepared)
+            state->hook->reset_prepared(state->hook->priv, state->data,
+                                        p->executing);
+    }
+}
 
 enum {
     // Index into `lut_state`
@@ -477,6 +524,16 @@ static pl_shader prepared_begin(void *priv, pl_dispatch destination, bool unique
     return sh;
 }
 
+static void prepared_abort(void *priv, pl_dispatch destination, pl_shader *shader)
+{
+    pl_renderer_preparation p = priv;
+    if (!destination) {
+        prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "missing dispatch owner");
+        return;
+    }
+    pl_dispatch_abort(destination, shader);
+}
+
 static pl_shader pass_shader(struct pass_state *pass, bool unique)
 {
     return pass->preparation ? prepared_begin(pass->preparation, pass->rr->dp, unique)
@@ -760,8 +817,10 @@ static bool img_source(struct pass_state *pass, struct img *img, struct pl_sampl
     if (img->sh) {
         const struct pl_hook_texture *tex = prepared_texture(pass, img->w, img->h,
                                                             img->fmt, img->comps);
-        if (!tex)
+        if (!tex) {
+            pl_dispatch_abort(pass->rr->dp, &img->sh);
             return false;
+        }
         if (prepared_finish(p, pass->rr->dp, pl_dispatch_params(
                 .shader = &img->sh, .target = p->executing ? tex->texture : NULL,
             ), &tex->params) != PL_DISPATCH_OK)
@@ -919,7 +978,8 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
 
 static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
                              struct sampler *sampler, enum sampler_usage usage,
-                             pl_tex target_tex, const struct pl_sample_src *src)
+                             pl_tex target_tex, const struct pl_sample_src *src,
+                             enum pl_sampler_target target)
 {
     const struct pl_render_params *params = pass->params;
     if (!sampler)
@@ -973,6 +1033,24 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
         fparams.no_compute = !target_tex->params.storable;
     } else {
         fparams.no_compute = !(pass->fbofmt[4]->caps & PL_FMT_CAP_STORABLE);
+    }
+
+    const struct pl_sampler_override *override = params->sampler_override;
+    if (override && override->sample && target != PL_SAMPLER_NONE &&
+        info.dir == SAMPLER_UP)
+    {
+        enum pl_dispatch_result result = override->sample(override->priv, sh,
+                                                          target, src, &fparams);
+        if (result == PL_DISPATCH_OK)
+            return;
+        if (result != PL_DISPATCH_UNSUPPORTED) {
+            PL_ERR(rr, "Custom sampler failed");
+            sh->failed = true;
+            if (pass->preparation)
+                prepare_fail(pass->preparation, PL_RENDERER_PREPARE_FAILED,
+                             "custom sampler failed");
+            return;
+        }
     }
 
     bool ok;
@@ -1318,7 +1396,9 @@ static bool pass_hook_prepared(struct pass_state *pass, struct img *img,
             mapping.state = NULL;
         struct pl_hook_prepare_params hp = {
             .gpu = pass->rr->gpu, .dispatch = pass->rr->dp, .context = p,
-            .begin = prepared_begin, .finish = prepared_finish, .compute = prepared_compute,
+            .state = prepared_hook_state(p, hook),
+            .begin = prepared_begin, .abort = prepared_abort,
+            .finish = prepared_finish, .compute = prepared_compute,
             .get_tex = prepared_hook_texture, .stage = stage,
             .rect = img->rect, .repr = img->repr, .color = img->color,
             .orig_repr = &pass->image.repr, .orig_color = &pass->image.color,
@@ -1327,6 +1407,8 @@ static bool pass_hook_prepared(struct pass_state *pass, struct img *img,
             .color_map = color_map ? &mapping : NULL,
             .color_map_params = color_map ? pass->params->color_map_params : NULL,
         };
+        if (hook->prepared_state_size && !hp.state)
+            break;
         if (hook->input == PL_HOOK_SIG_TEX) {
             struct pl_sample_src src = {0};
             if (!img_source(pass, img, &src))
@@ -2015,7 +2097,7 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
 
         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
         dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_PLANE,
-                         NULL, &src);
+                         NULL, &src, PL_SAMPLER_NONE);
 
         ident_t sub = sh_subpass(sh, plane_sh);
         pl_dispatch_abort(rr->dp, &plane_sh);
@@ -2354,7 +2436,8 @@ static bool pass_read_image(struct pass_state *pass)
             st->img.prepared_tex = NULL;
             st->img.sh = pass_shader(pass, true);
             dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
-                             SAMPLER_PLANE, NULL, &src);
+                             SAMPLER_PLANE, NULL, &src,
+                             st->type == PLANE_CHROMA ? PL_SAMPLER_CHROMA : PL_SAMPLER_NONE);
             st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
             st->img.w = st->img.rect.x1 = src.new_w;
@@ -2580,7 +2663,7 @@ static bool pass_scale_main(struct pass_state *pass)
     pass->need_peak_fbo = false;
 
     pl_shader sh = pass_shader(pass, true);
-    dispatch_sampler(pass, sh, &rr->sampler_main, SAMPLER_MAIN, NULL, &src);
+    dispatch_sampler(pass, sh, &rr->sampler_main, SAMPLER_MAIN, NULL, &src, PL_SAMPLER_IMAGE);
     img->tex  = NULL;
     img->prepared_tex = NULL;
     img->sh   = sh;
@@ -2651,7 +2734,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
     };
 
     sh = pass_shader(pass, false);
-    dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_LOWPASS, out_tex, &src);
+    dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_LOWPASS, out_tex, &src, PL_SAMPLER_NONE);
     ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
         .shader = &sh,
         .target = out_tex,
@@ -3408,7 +3491,7 @@ static bool pass_output_target(struct pass_state *pass)
 
             sh = pass_shader(pass, false);
             dispatch_sampler(pass, sh, &rr->samplers_dst[p], SAMPLER_PLANE,
-                             plane->texture, &src);
+                             plane->texture, &src, PL_SAMPLER_NONE);
 
         } else {
 
@@ -4148,6 +4231,8 @@ static struct params_info render_params_info(const struct pl_render_params *para
             scaler = NULL;                                                      \
         }                                                                       \
     } while (0)
+
+    HASH_PTR(params.sampler_override, NULL, false);
 
     HASH_FILTER(params.upscaler);
     HASH_FILTER(params.downscaler);
@@ -4917,15 +5002,11 @@ static bool preparation_admit(pl_renderer_preparation p,
         prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "invalid hook arrays");
         return false;
     }
-    const enum pl_hook_stage plane_stages = PL_HOOK_RGB_INPUT | PL_HOOK_LUMA_INPUT |
-        PL_HOOK_CHROMA_INPUT | PL_HOOK_ALPHA_INPUT | PL_HOOK_XYZ_INPUT |
-        PL_HOOK_CHROMA_SCALED | PL_HOOK_ALPHA_SCALED;
     for (int list = 0; list < 2; list++) {
         int count = list ? params->num_color_map_hooks : params->num_hooks;
         const struct pl_hook *const *hooks = list ? params->color_map_hooks : params->hooks;
         for (int i = 0; i < count; i++) {
-            if (!hooks[i] || !hooks[i]->describe || !hooks[i]->execute_prepared ||
-                (hooks[i]->stages & plane_stages)) {
+            if (!hooks[i] || !hooks[i]->describe || !hooks[i]->execute_prepared) {
                 prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED,
                              "selected hook lacks supported explicit preparation");
                 return false;
@@ -4940,6 +5021,7 @@ static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparat
 {
     if (!preparation_admit(p, image, target))
         return p->result;
+    reset_prepared_hook_states(p);
     if (p->mix && !p->checking && !p->executing)
         p->mix_direct = p->snapshot.params->skip_caching_single_frame ||
                         render_params_info(p->snapshot.params).trivial;

@@ -107,6 +107,18 @@ struct pl_vulkan_queue {
     VkDeviceQueueCreateFlags flags; // Queue family flags
 };
 
+#ifdef VK_KHR_cooperative_matrix
+// One cooperative-matrix configuration enabled on this Vulkan device.
+// `stages` is the device-wide stage mask associated with this configuration.
+struct pl_vulkan_cooperative_matrix {
+    uint32_t m, n, k;
+    VkComponentTypeKHR a_type, b_type, c_type, result_type;
+    VkBool32 saturating_accumulation;
+    VkScopeKHR scope;
+    VkShaderStageFlags stages;
+};
+#endif
+
 // Structure representing the actual vulkan device and associated GPU instance
 typedef const struct pl_vulkan_t *pl_vulkan;
 struct pl_vulkan_t {
@@ -137,6 +149,14 @@ struct pl_vulkan_t {
     // Note: Whenever a feature flag is ambiguious between several alternative
     // locations, for completeness' sake, we include both.
     const VkPhysicalDeviceFeatures2 *features;
+
+#ifdef VK_KHR_cooperative_matrix
+    // Cooperative-matrix configurations available to shaders on this device.
+    // Empty unless VK_KHR_cooperative_matrix and its cooperativeMatrix feature
+    // were both enabled. The array is owned by this pl_vulkan instance.
+    const struct pl_vulkan_cooperative_matrix *cooperative_matrices;
+    int num_cooperative_matrices;
+#endif
 
     // The explicit queue families we are using to provide a given capability.
     struct pl_vulkan_queue queue_graphics; // provides VK_QUEUE_GRAPHICS_BIT
@@ -404,6 +424,23 @@ PL_API pl_swapchain pl_vulkan_create_swapchain(pl_vulkan vk,
 // as being suboptimal (VK_SUBOPTIMAL_KHR). This might be of use to clients
 // who have `params->allow_suboptimal` enabled.
 PL_API bool pl_vulkan_swapchain_suboptimal(pl_swapchain sw);
+
+// VoidVideo extension, with no change to existing public struct layouts.
+// Configure application-controlled exclusive fullscreen BEFORE the first resize
+// or start_frame. native_monitor is the target Win32 HMONITOR. The caller must
+// first make its window fullscreen on that monitor and enable the instance
+// extension VK_KHR_get_surface_capabilities2. Only Windows is supported.
+// Returns VK_SUCCESS when configured, not when acquired. Resize creates and
+// acquires the native swapchain; failure never falls back to ordinary mode.
+PL_API VkResult pl_vulkan_swapchain_request_exclusive(pl_swapchain sw,
+                                                     void *native_monitor);
+
+// Reports actual acquisition and the last acquisition/query/create/loss result.
+// Does not acquire or infer exclusivity from window flags. A successful config
+// initially reports VK_NOT_READY and acquired=false. Uses a nonblocking atomic
+// snapshot; the caller must keep sw alive for the duration of this call.
+PL_API VkResult pl_vulkan_swapchain_exclusive_status(pl_swapchain sw, bool *acquired);
+
 
 // Vulkan interop API, for sharing a single VkDevice (and associated vulkan
 // resources) directly with the API user. The use of this API is a bit sketchy

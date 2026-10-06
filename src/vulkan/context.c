@@ -181,6 +181,7 @@ static const struct vk_ext vk_device_extensions[] = {
         .name = VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(AcquireFullScreenExclusiveModeEXT),
+            PL_VK_DEV_FUN(ReleaseFullScreenExclusiveModeEXT),
             {0}
         },
 #endif
@@ -218,6 +219,14 @@ static const struct vk_ext vk_device_extensions[] = {
             PL_VK_DEV_FUN(GetDeviceImageMemoryRequirements),
             {0}
         },
+#ifdef VK_KHR_cooperative_matrix
+    }, {
+        .name = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_INST_FUN(GetPhysicalDeviceCooperativeMatrixPropertiesKHR),
+            {0}
+        },
+#endif
     },
 };
 
@@ -254,6 +263,9 @@ const char * const pl_vulkan_recommended_extensions[] = {
     VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,
 #endif
     VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
+#ifdef VK_KHR_cooperative_matrix
+    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+#endif
 };
 
 const int pl_vulkan_num_recommended_extensions =
@@ -273,9 +285,21 @@ static const VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR synchronize
 };
 #endif
 
+#ifdef VK_KHR_cooperative_matrix
+static const VkPhysicalDeviceCooperativeMatrixFeaturesKHR recommended_cooperative_matrix = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+#ifdef VK_KHR_internally_synchronized_queues
+    .pNext = (void *) &synchronized_queues,
+#endif
+    .cooperativeMatrix = true,
+};
+#endif
+
 static const VkPhysicalDeviceVideoMaintenance2FeaturesKHR video_maintenance2 = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR,
-#ifdef VK_KHR_internally_synchronized_queues
+#ifdef VK_KHR_cooperative_matrix
+    .pNext = (void *) &recommended_cooperative_matrix,
+#elif defined(VK_KHR_internally_synchronized_queues)
     .pNext = (void *) &synchronized_queues,
 #endif
     .videoMaintenance2 = true,
@@ -1477,6 +1501,72 @@ static void unlock_queue(pl_vulkan pl_vk, uint32_t qf, uint32_t qidx)
     vk->unlock_queue(vk->queue_ctx, qf, qidx);
 }
 
+#ifdef VK_KHR_cooperative_matrix
+static void discover_cooperative_matrices(struct pl_vulkan_t *pl_vk)
+{
+    struct vk_ctx *vk = PL_PRIV(pl_vk);
+    const VkPhysicalDeviceCooperativeMatrixFeaturesKHR *features =
+        vk_find_struct(&vk->features,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR);
+    if (!features || !features->cooperativeMatrix ||
+        !vk->GetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+        return;
+
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR device_props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+    };
+    VkPhysicalDeviceProperties2 props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &device_props,
+    };
+    vk->GetPhysicalDeviceProperties2(vk->physd, &props);
+
+    uint32_t count = 0;
+    VkResult res = vk->GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+        vk->physd, &count, NULL);
+    if (res != VK_SUCCESS || !count) {
+        PL_WARN(vk, "Cooperative matrix feature enabled but no configurations were reported");
+        return;
+    }
+
+    VkCooperativeMatrixPropertiesKHR *raw = pl_calloc_ptr(NULL, count, raw);
+    for (uint32_t i = 0; i < count; i++)
+        raw[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    res = vk->GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+        vk->physd, &count, raw);
+    if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+        PL_WARN(vk, "Failed querying cooperative matrix configurations: %s",
+                vk_res_str(res));
+        pl_free(raw);
+        return;
+    }
+
+    struct pl_vulkan_cooperative_matrix *matrices =
+        pl_calloc_ptr(vk->alloc, count, matrices);
+    for (uint32_t i = 0; i < count; i++) {
+        matrices[i] = (struct pl_vulkan_cooperative_matrix) {
+            .m = raw[i].MSize,
+            .n = raw[i].NSize,
+            .k = raw[i].KSize,
+            .a_type = raw[i].AType,
+            .b_type = raw[i].BType,
+            .c_type = raw[i].CType,
+            .result_type = raw[i].ResultType,
+            .saturating_accumulation = raw[i].saturatingAccumulation,
+            .scope = raw[i].scope,
+            .stages = device_props.cooperativeMatrixSupportedStages,
+        };
+    }
+    pl_free(raw);
+
+    pl_vk->cooperative_matrices = matrices;
+    pl_vk->num_cooperative_matrices = count;
+    PL_INFO(vk, "Enabled %u cooperative matrix configuration%s for shader stages 0x%x",
+            count, count == 1 ? "" : "s",
+            device_props.cooperativeMatrixSupportedStages);
+}
+#endif
+
 static bool finalize_context(struct pl_vulkan_t *pl_vk, int max_glsl_version,
                              bool no_compute)
 {
@@ -1514,6 +1604,9 @@ static bool finalize_context(struct pl_vulkan_t *pl_vk, int max_glsl_version,
     pl_vk->extensions = vk->exts.elem;
     pl_vk->num_extensions = vk->exts.num;
     pl_vk->features = &vk->features;
+#ifdef VK_KHR_cooperative_matrix
+    discover_cooperative_matrices(pl_vk);
+#endif
     pl_vk->num_queues = vk->pools.num;
     pl_vk->queues = pl_calloc_ptr(vk->alloc, vk->pools.num, pl_vk->queues);
     pl_vk->lock_queue = lock_queue;
@@ -1732,6 +1825,9 @@ pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *par
                  "features!");
         goto error;
     }
+
+    for (int i = 0; i < params->num_extensions; i++)
+        PL_ARRAY_APPEND(vk->alloc, vk->exts, params->extensions[i]);
 
     // Load all mandatory device-level functions
     for (int i = 0; i < PL_ARRAY_SIZE(vk_dev_funs); i++)

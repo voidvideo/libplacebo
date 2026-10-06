@@ -580,7 +580,10 @@ pl_tex vk_tex_create(pl_gpu gpu, const struct pl_tex_params *params)
 
     vk->GetImageMemoryRequirements2(vk->dev, &req_info, &reqs);
     mparams.reqs = reqs.memoryRequirements;
-    if (ded_reqs.prefersDedicatedAllocation) {
+    const bool external_requires_dedicated = vk_handle_type &&
+        (ext_props.externalMemoryProperties.externalMemoryFeatures &
+         VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT);
+    if (ded_reqs.prefersDedicatedAllocation || external_requires_dedicated) {
         mparams.ded_image = tex_vk->img;
         if (vk_mem_handle_type(params->import_handle))
             mparams.shared_mem.size = reqs.memoryRequirements.size;

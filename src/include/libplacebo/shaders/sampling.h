@@ -195,6 +195,16 @@ struct pl_sample_filter_params {
 PL_API bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
                                    const struct pl_sample_filter_params *params);
 
+// Performs polar sampling while allowing the compute path to reuse filter
+// weights across workgroup rows when their subpixel phases are identical.
+// This is currently specialized for exact 2x horizontal / 1x vertical
+// scaling. For all other geometries and when compute is unavailable, this is
+// equivalent to pl_shader_sample_polar(). The filter and output semantics are
+// unchanged.
+PL_API bool pl_shader_sample_polar_cached(pl_shader sh,
+                                          const struct pl_sample_src *src,
+                                          const struct pl_sample_filter_params *params);
+
 // Performs orthogonal (1D) sampling. Using this twice in a row (once vertical
 // and once horizontal) effectively performs a 2D upscale. This is lower
 // quality than polar sampling, but significantly faster, and therefore the

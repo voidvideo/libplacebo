@@ -80,6 +80,32 @@ PL_API struct pl_render_errors pl_renderer_get_errors(pl_renderer rr);
 PL_API void pl_renderer_reset_errors(pl_renderer rr,
                                      const struct pl_render_errors *errors);
 
+// Sampling replacement points. Chroma is the input-plane reconstruction step;
+// image is the main kernel after the renderer's linear/sigmoid transforms.
+// Output-plane sampling, contrast lowpass, 1:1 and downscaling are excluded.
+enum pl_sampler_target {
+    PL_SAMPLER_NONE = 0,
+    PL_SAMPLER_CHROMA,
+    PL_SAMPLER_IMAGE,
+};
+
+struct pl_sampler_override {
+    void *priv;
+    uint64_t signature; // Change when immutable shader/configuration changes.
+
+    // Shader construction only: no GPU allocation, submission or live lookups.
+    // Called during ordinary rendering, strict description, preflight and
+    // prepared execution. Metadata-only src->texture must produce the same
+    // graph as the equivalent real src->tex. Borrowed pointers last this call.
+    // Return UNSUPPORTED without changing sh to use the configured libplacebo
+    // sampler. OK means a NONE -> COLOR sampler was emitted. Other results
+    // fail the render/preparation; never append fallback to a partial shader.
+    // The snapshot owner retains this descriptor and immutable priv resources.
+    enum pl_dispatch_result (*sample)(void *priv, pl_shader sh,
+        enum pl_sampler_target target, const struct pl_sample_src *src,
+        const struct pl_sample_filter_params *params);
+};
+
 enum pl_lut_type {
     PL_LUT_UNKNOWN = 0,
     PL_LUT_NATIVE,      // applied to raw image contents (after fixing bit depth)
@@ -368,6 +394,10 @@ struct pl_render_params {
     // Note: `info` is only valid until this function returns.
     void (*info_callback)(void *priv, const struct pl_render_info *info);
     void *info_priv;
+
+    // Optional upscaler replacement at the actual sampling boundary. NULL keeps
+    // the existing renderer. This descriptor is part of the frozen snapshot.
+    const struct pl_sampler_override *sampler_override;
 
     // --- Deprecated/removed fields
     PL_DEPRECATED_IN(v6.254) bool allow_delayed_peak_detect; // moved to pl_peak_detect_params

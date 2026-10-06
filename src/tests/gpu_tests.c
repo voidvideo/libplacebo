@@ -1,4 +1,5 @@
 #include "gpu_tests.h"
+#include "mpv_shader_fixtures.h"
 #include "shaders.h"
 
 #include <libplacebo/renderer.h>
@@ -1216,117 +1217,6 @@ error:
     pl_tex_destroy(gpu, &dot5x5);
     pl_tex_destroy(gpu, &fbo);
 }
-
-static const char *user_shader_tests[] = {
-    // Test hooking, saving and loading
-    "// Example of a comment at the beginning                               \n"
-    "                                                                       \n"
-    "//!HOOK NATIVE                                                         \n"
-    "//!DESC upscale image                                                  \n"
-    "//!BIND HOOKED                                                         \n"
-    "//!WIDTH HOOKED.w 10 *                                                 \n"
-    "//!HEIGHT HOOKED.h 10 *                                                \n"
-    "//!SAVE NATIVEBIG                                                      \n"
-    "//!WHEN NATIVE.w 500 <                                                 \n"
-    "                                                                       \n"
-    "vec4 hook()                                                            \n"
-    "{                                                                      \n"
-    "    return HOOKED_texOff(0);                                           \n"
-    "}                                                                      \n"
-    "                                                                       \n"
-    "//!HOOK MAIN                                                           \n"
-    "//!DESC downscale bigger image                                         \n"
-    "//!WHEN NATIVE.w 500 <                                                 \n"
-    "//!BIND NATIVEBIG                                                      \n"
-    "                                                                       \n"
-    "vec4 hook()                                                            \n"
-    "{                                                                      \n"
-    "    return NATIVEBIG_texOff(0);                                        \n"
-    "}                                                                      \n",
-
-    // Test use of textures
-    "//!HOOK MAIN                                                           \n"
-    "//!DESC turn everything into colorful pixels                           \n"
-    "//!BIND HOOKED                                                         \n"
-    "//!BIND DISCO                                                          \n"
-    "//!COMPONENTS 3                                                        \n"
-    "                                                                       \n"
-    "vec4 hook()                                                            \n"
-    "{                                                                      \n"
-    "    return vec4(DISCO_tex(HOOKED_pos * 10.0).rgb, 1);                  \n"
-    "}                                                                      \n"
-    "                                                                       \n"
-    "//!TEXTURE DISCO                                                       \n"
-    "//!SIZE 3 3                                                            \n"
-    "//!FORMAT rgba8                                                        \n"
-    "//!FILTER NEAREST                                                      \n"
-    "//!BORDER REPEAT                                                       \n"
-    "ff0000ff00ff00ff0000ffff00ffffffff00ffffffff00ff4c4c4cff999999ffffffffff\n"
-
-    // Test custom parameters
-    "//!PARAM test                                                          \n"
-    "//!DESC test parameter                                                 \n"
-    "//!TYPE DYNAMIC float                                                  \n"
-    "//!MINIMUM 0.0                                                         \n"
-    "//!MAXIMUM 100.0                                                       \n"
-    "1.0                                                                    \n"
-    "                                                                       \n"
-    "//!PARAM testconst                                                     \n"
-    "//!TYPE CONSTANT uint                                                  \n"
-    "//!MAXIMUM 16                                                          \n"
-    "3                                                                      \n"
-    "                                                                       \n"
-    "//!PARAM testdefine                                                    \n"
-    "//!TYPE DEFINE                                                         \n"
-    "100                                                                    \n"
-    "                                                                       \n"
-    "//!PARAM testenum                                                      \n"
-    "//!TYPE ENUM DEFINE                                                    \n"
-    "FOO                                                                    \n"
-    "BAR                                                                    \n"
-    "                                                                       \n"
-    "//!HOOK MAIN                                                           \n"
-    "//!WHEN testconst 30 >                                                 \n"
-    "#error should not be run                                               \n"
-    "                                                                       \n"
-    "//!HOOK MAIN                                                           \n"
-    "//!WHEN testenum FOO =                                                 \n"
-    "#if testenum == BAR                                                    \n"
-    " #error bad                                                            \n"
-    "#endif                                                                 \n"
-    "vec4 hook() { return vec4(0.0); }                                      \n"
-};
-
-static const char *compute_shader_tests[] = {
-    // Test use of storage/buffer resources
-    "//!HOOK MAIN                                                           \n"
-    "//!DESC attach some storage objects                                    \n"
-    "//!BIND tex_storage                                                    \n"
-    "//!BIND buf_uniform                                                    \n"
-    "//!BIND buf_storage                                                    \n"
-    "//!COMPONENTS 4                                                        \n"
-    "                                                                       \n"
-    "vec4 hook()                                                            \n"
-    "{                                                                      \n"
-    "    return vec4(foo, bar, bat);                                        \n"
-    "}                                                                      \n"
-    "                                                                       \n"
-    "//!TEXTURE tex_storage                                                 \n"
-    "//!SIZE 100 100                                                        \n"
-    "//!FORMAT r32f                                                         \n"
-    "//!STORAGE                                                             \n"
-    "                                                                       \n"
-    "//!BUFFER buf_uniform                                                  \n"
-    "//!VAR float foo                                                       \n"
-    "//!VAR float bar                                                       \n"
-    "0000000000000000                                                       \n"
-    "                                                                       \n"
-    "//!BUFFER buf_storage                                                  \n"
-    "//!VAR vec2 bat                                                        \n"
-    "//!VAR int big[32];                                                    \n"
-    "//!STORAGE                                                             \n",
-
-};
 
 static const char *test_luts[] = {
 
