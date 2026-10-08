@@ -2198,7 +2198,11 @@ static void pass_convert_colors(struct pass_state *pass)
                        params->num_color_map_hooks, &args);
         // Both cache population and direct rendering consume a shader.
         // Texture-returning hooks use the same materialization as all hooks.
-        img_sh(pass, img);
+        sh = img_sh(pass, img);
+        enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
+        if (lut_type == PL_LUT_NORMALIZED || lut_type == PL_LUT_CONVERSION)
+            pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
+        img->color = target->color;
         return;
     }
 
