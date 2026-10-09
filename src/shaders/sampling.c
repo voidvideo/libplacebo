@@ -20,6 +20,7 @@
 
 #include <libplacebo/colorspace.h>
 #include <libplacebo/shaders/sampling.h>
+#include <libplacebo/shaders/custom.h>
 
 const struct pl_deband_params pl_deband_default_params = { PL_DEBAND_DEFAULTS };
 
@@ -287,6 +288,34 @@ void pl_shader_deband(pl_shader sh, const struct pl_sample_src *src,
          "#undef GET        \n"
          "}                 \n",
          swiz, SH_FLOAT(scale));
+}
+
+bool pl_shader_sample_custom(pl_shader sh, const struct pl_sample_src *src,
+    enum pl_tex_sample_mode mode, const struct pl_custom_shader *custom)
+{
+    if (!custom || (mode != PL_TEX_SAMPLE_NEAREST && mode != PL_TEX_SAMPLE_LINEAR))
+        return false;
+    ident_t tex, pos, pt;
+    float scale;
+    if (!setup_src(sh, src, &tex, &pos, &pt, NULL, NULL, NULL, &scale, false,
+                   mode == PL_TEX_SAMPLE_LINEAR ? LINEAR : NEAREST))
+        return false;
+    // Repeat aliases in both buffers: all headers precede all bodies after
+    // fusion, so a later sampler must not change an earlier body's bindings.
+#define SAMPLE_ALIASES "#undef SRC\n#define SRC "$"\n" \
+                       "#undef src_pos\n#define src_pos "$"\n" \
+                       "#undef src_pt\n#define src_pt "$"\n"
+    GLSLH(SAMPLE_ALIASES, tex, pos, pt);
+    GLSL(SAMPLE_ALIASES, tex, pos, pt);
+#undef SAMPLE_ALIASES
+    struct pl_custom_shader params = *custom;
+    GLSL("vec4 color = vec4(0.0);\n");
+    params.input = PL_SHADER_SIG_COLOR;
+    params.output = PL_SHADER_SIG_COLOR;
+    if (!pl_shader_custom(sh, &params))
+        return false;
+    GLSL("color *= "$";\n", SH_FLOAT(scale));
+    return true;
 }
 
 bool pl_shader_sample_direct(pl_shader sh, const struct pl_sample_src *src)
@@ -1221,7 +1250,12 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
     if (!sh_require(sh, PL_SHADER_SIG_NONE, out_w, out_h))
         return;
 
-    const int src_w = src_tex->params.w, src_h = src_tex->params.h;
+    const struct pl_tex_params *texture = src_tex ? &src_tex->params : params->texture;
+    if (!texture) {
+        SH_FAIL(sh, "Distortion requires a texture description");
+        return;
+    }
+    const int src_w = texture->w, src_h = texture->h;
     float rx = 1.0f, ry = 1.0f;
     if (src_w > src_h) {
         ry = (float) src_h / src_w;
@@ -1268,7 +1302,8 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
     };
 
     ident_t pos = sh_attr_vec2(sh, "pos", &canvas);
-    ident_t pt, tex = sh_bind(sh, src_tex, params->address_mode,
+    ident_t pt, tex = sh_bind_metadata(sh, src_tex, texture, PL_SAMPLER_NORMAL,
+                              params->address_mode,
                               PL_TEX_SAMPLE_LINEAR, "tex", NULL, NULL, &pt);
 
     // Bind the inverse of the tex2canvas transform (i.e. canvas2tex)

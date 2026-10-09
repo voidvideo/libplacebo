@@ -5,7 +5,8 @@
 static _Thread_local bool caller_thread;
 static _Thread_local bool forbid_gpu_destroy;
 static struct prepare_latch blocked;
-static atomic_int created, destroyed, executed;
+static atomic_int created, destroyed, executed, started;
+static int workers;
 static bool fail_create, fail_run;
 static enum pl_pass_prepare_phase failure_phase;
 static bool inspect_snapshot;
@@ -27,6 +28,7 @@ static pl_pass mock_create(pl_gpu gpu, const struct pl_pass_params *params,
                            enum pl_pass_prepare_phase *phase)
 {
     REQUIRE(!caller_thread);
+    atomic_fetch_add(&started, 1);
     latch_block(&blocked);
     atomic_fetch_add(&created, 1);
     if (inspect_snapshot)
@@ -53,6 +55,11 @@ static bool mock_run(pl_gpu gpu, const struct pl_pass_run_params *params)
     REQUIRE(params->pass);
     atomic_fetch_add(&executed, 1);
     return !fail_run;
+}
+
+static void mock_run_sync(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    REQUIRE(mock_run(gpu, params));
 }
 
 static pl_pass_preparation submit(pl_gpu gpu, const struct pl_pass_params *params)
@@ -121,10 +128,40 @@ static void wait_destroyed(int n)
     }
 }
 
+// All jobs must enter the backend before any is released: this fails with a
+// serial worker and catches duplicate claims of a still-pending request.
+static void wait_started(int n)
+{
+    pl_clock_t start = pl_clock_now();
+    while (atomic_load(&started) < n) {
+        REQUIRE(pl_clock_diff(pl_clock_now(), start) < 10.0);
+        pl_thread_sleep(0.001);
+    }
+}
+
+static void test_parallel(pl_gpu gpu, const struct pl_pass_params *p)
+{
+    int before = atomic_load(&started);
+    latch_arm(&blocked);
+    pl_pass_preparation requests[4];
+    for (int i = 0; i < workers; i++)
+        requests[i] = submit(gpu, p);
+    wait_started(before + workers);
+    REQUIRE(atomic_load(&started) == before + workers);
+    for (int i = 0; i < workers; i++)
+        REQUIRE(pl_pass_prepare_poll(requests[i]) == PL_PASS_PREPARE_PENDING);
+    latch_release(&blocked);
+    for (int i = 0; i < workers; i++) {
+        pl_prepared_pass pass = take_prepared(&requests[i]);
+        pl_prepared_pass_destroy(&pass);
+    }
+}
+
 static void test_progress_and_capacity(pl_gpu gpu, const struct pl_pass_params *p)
 {
     pl_pass_preparation request = submit(gpu, p);
     pl_prepared_pass active = take_prepared(&request);
+    const int started_before = atomic_load(&started);
     latch_arm(&blocked);
     request = submit(gpu, p);
     latch_entered(&blocked);
@@ -147,13 +184,14 @@ static void test_progress_and_capacity(pl_gpu gpu, const struct pl_pass_params *
         REQUIRE(r == PL_PASS_PREPARE_ACCEPTED);
     }
     REQUIRE(count > 0 && count < PL_ARRAY_SIZE(queued));
+    wait_started(started_before + workers);
     for (int i = 0; i < count; i++) {
         pl_pass_prepare_cancel(queued[i]);
         REQUIRE(pl_pass_prepare_poll(queued[i]) == PL_PASS_PREPARE_CANCELLED);
         pl_pass_prepare_release(&queued[i]);
         REQUIRE(!queued[i]);
     }
-    const int expect_destroyed = atomic_load(&destroyed) + 1;
+    const int expect_destroyed = atomic_load(&destroyed) + workers;
     pl_pass_prepare_cancel(request);
     REQUIRE(pl_pass_prepare_poll(request) == PL_PASS_PREPARE_CANCELLED);
     pl_pass_prepare_release(&request);
@@ -245,6 +283,43 @@ static void test_failure_and_variant(pl_gpu gpu, const struct pl_pass_params *p)
     }
 }
 
+static void test_indirect_validation(pl_gpu gpu, const struct pl_pass_params *p)
+{
+    pl_pass_preparation request = submit(gpu, p);
+    pl_prepared_pass prepared = take_prepared(&request);
+    struct pl_pass_t raw = { .params = *p };
+    pl_buf buf = pl_buf_create(gpu, pl_buf_params(.size = 32, .indirect = true));
+    REQUIRE(buf);
+    const size_t invalid_offsets[] = { 1, 24, 32, 36, SIZE_MAX - 3 };
+    for (int mode = 0; mode < 2; mode++) {
+        for (int i = 0; i < PL_ARRAY_SIZE(invalid_offsets); i++) {
+            struct pl_pass_run_params run = {
+                .pass = mode ? NULL : &raw,
+                .indirect_buf = buf,
+                .indirect_offset = invalid_offsets[i],
+            };
+            int before = atomic_load(&executed);
+            enum pl_prepared_pass_run_result result = mode
+                ? pl_prepared_pass_run(prepared, &run)
+                : pl_pass_run_checked(gpu, &run, false);
+            REQUIRE(result == PL_PREPARED_PASS_RUN_INVALID);
+            REQUIRE(atomic_load(&executed) == before);
+        }
+        // Exactly 12 bytes remain: the upper valid boundary must still run.
+        struct pl_pass_run_params run = {
+            .pass = mode ? NULL : &raw,
+            .indirect_buf = buf,
+            .indirect_offset = 20,
+        };
+        int before = atomic_load(&executed);
+        REQUIRE((mode ? pl_prepared_pass_run(prepared, &run)
+                      : pl_pass_run_checked(gpu, &run, false)) == PL_PREPARED_PASS_RUN_OK);
+        REQUIRE(atomic_load(&executed) == before + 1);
+    }
+    pl_buf_destroy(gpu, &buf);
+    pl_prepared_pass_destroy(&prepared);
+}
+
 static atomic_bool shutdown_started, shutdown_finished;
 static PL_THREAD_VOID shutdown_worker(void *arg)
 {
@@ -256,10 +331,14 @@ static PL_THREAD_VOID shutdown_worker(void *arg)
 
 static void test_shutdown(pl_gpu gpu, const struct pl_pass_params *p)
 {
+    int before = atomic_load(&started);
     latch_arm(&blocked);
-    pl_pass_preparation request = submit(gpu, p);
-    latch_entered(&blocked);
-    pl_pass_prepare_release(&request);
+    pl_pass_preparation requests[8];
+    for (int i = 0; i < 8; i++)
+        requests[i] = submit(gpu, p);
+    wait_started(before + workers);
+    for (int i = 0; i < 8; i++)
+        pl_pass_prepare_release(&requests[i]);
     pl_thread shutdown;
     REQUIRE(!pl_thread_create(&shutdown, shutdown_worker, (void *) gpu));
     while (!atomic_load(&shutdown_started))
@@ -273,9 +352,13 @@ static void test_shutdown(pl_gpu gpu, const struct pl_pass_params *p)
 int main(void)
 {
     caller_thread = true;
+    unsigned cpus = pl_thread_num_processors();
+    workers = PL_MIN(4, cpus > 1 ? cpus - 1 : 1);
     latch_init(&blocked);
     pl_log log = pl_test_logger();
-    pl_gpu gpu = pl_gpu_dummy_create(log, NULL);
+    struct pl_gpu_dummy_params dummy = pl_gpu_dummy_default_params;
+    dummy.limits.indirect_dispatch = true;
+    pl_gpu gpu = pl_gpu_dummy_create(log, &dummy);
     struct pl_pass_params p = { .type = PL_PASS_COMPUTE, .glsl_shader = "compute" };
     pl_pass_preparation request = NULL;
     REQUIRE(!pl_pass_prepare_supported(gpu));
@@ -284,6 +367,7 @@ int main(void)
     struct pl_gpu_fns *fns = PL_PRIV(gpu);
     fns->pass_create_prepared = mock_create;
     fns->pass_run_prepared = mock_run;
+    fns->pass_run = mock_run_sync;
     fns->pass_destroy = mock_destroy;
     pl_pass_prepare_init(gpu);
     REQUIRE(pl_pass_prepare_supported(gpu));
@@ -292,8 +376,10 @@ int main(void)
     REQUIRE(pl_pass_prepare_submit(gpu, &invalid, &request) == PL_PASS_PREPARE_INVALID);
     REQUIRE(!request);
     test_snapshot(gpu);
+    test_parallel(gpu, &p);
     test_progress_and_capacity(gpu, &p);
     test_failure_and_variant(gpu, &p);
+    test_indirect_validation(gpu, &p);
     test_shutdown(gpu, &p);
     int before = atomic_load(&created);
     REQUIRE(pl_pass_prepare_submit(gpu, &p, &request) == PL_PASS_PREPARE_UNAVAILABLE);

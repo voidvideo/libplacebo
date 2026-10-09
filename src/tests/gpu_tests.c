@@ -1,6 +1,7 @@
 #include "gpu_tests.h"
 #include "mpv_shader_fixtures.h"
 #include "shaders.h"
+#include "pl_thread.h"
 
 #include <libplacebo/renderer.h>
 #include <libplacebo/utils/frame_queue.h>
@@ -406,7 +407,6 @@ static void pl_indirect_dispatch_tests(pl_gpu gpu)
     pl_buf ctrl = pl_buf_create(gpu, pl_buf_params(
         .size          = ctrl_size,
         .storable      = true,
-        .indirect      = true,
         .host_readable = true,
     ));
 
@@ -420,7 +420,19 @@ static void pl_indirect_dispatch_tests(pl_gpu gpu)
     REQUIRE(cfg);
     REQUIRE(ctrl);
     REQUIRE(out);
+    // Upgrading an existing buffer must add native indirect usage, not just
+    // reuse an allocation with compatible size and storage flags.
+    REQUIRE(!ctrl->params.indirect);
+    struct pl_buf_params ctrl_params = ctrl->params;
+    ctrl_params.indirect = true;
+    REQUIRE(pl_buf_recreate(gpu, &ctrl, &ctrl_params));
     REQUIRE(ctrl->params.indirect);
+    pl_buf reusable = ctrl;
+    REQUIRE(pl_buf_recreate(gpu, &ctrl, &ctrl_params));
+    REQUIRE(ctrl == reusable);
+    ctrl_params.indirect = false;
+    REQUIRE(pl_buf_recreate(gpu, &ctrl, &ctrl_params));
+    REQUIRE(ctrl == reusable); // Extra usage is a valid superset.
 
     pl_pass writer = pl_pass_create(gpu, pl_pass_params(
         .type            = PL_PASS_COMPUTE,
@@ -546,6 +558,158 @@ static void pl_indirect_dispatch_tests(pl_gpu gpu)
     pl_buf_destroy(gpu, &ctrl);
     pl_buf_destroy(gpu, &cfg);
     pl_free(tmp);
+}
+
+// Exercise real library operations, rather than merely checking that an
+// instrumented shader compiles. Empty callbacks must not pass this test.
+static const char *const timing_names[] = {
+    "sample source", "linearize source", "encode output",
+};
+
+struct section_timing_test {
+    bool enabled;
+    unsigned callbacks;
+    uint64_t counts[PL_ARRAY_SIZE(timing_names)];
+    uint64_t maxima[PL_ARRAY_SIZE(timing_names)];
+};
+
+static void section_timing_callback(void *priv, const struct pl_dispatch_info *info)
+{
+    struct section_timing_test *test = priv;
+    test->callbacks++;
+    REQUIRE(info->shader);
+    REQUIRE(info->profile_requested == test->enabled);
+    if (!test->enabled) {
+        REQUIRE(info->section_clock == PL_SHADER_CLOCK_NONE);
+        REQUIRE(info->num_sections == 0);
+        return;
+    }
+
+    REQUIRE(info->section_clock != PL_SHADER_CLOCK_NONE);
+    REQUIRE(info->shader->sections && info->shader->num_sections > 0);
+    REQUIRE(info->section_samples_dropped == 0);
+    for (int i = 0; i < info->num_sections; i++) {
+        const struct pl_shader_section_sample *sample = &info->sections[i];
+        const char *name = NULL;
+        for (int j = 0; j < info->shader->num_sections; j++) {
+            if (info->shader->sections[j].id == sample->id)
+                name = info->shader->sections[j].name;
+        }
+        REQUIRE(name && name[0]);
+        REQUIRE(sample->count > 0);
+        REQUIRE(isfinite(sample->average) && isfinite(sample->clock_overhead));
+        REQUIRE(sample->minimum <= sample->average);
+        REQUIRE(sample->average <= sample->maximum);
+        REQUIRE(sample->clock_overhead >= 0);
+        for (int j = 0; j < PL_ARRAY_SIZE(timing_names); j++) {
+            if (strcmp(name, timing_names[j]) == 0) {
+                test->counts[j] += sample->count;
+                test->maxima[j] = PL_MAX(test->maxima[j], sample->maximum);
+            }
+        }
+    }
+}
+
+static pl_shader section_timing_shader(pl_dispatch dp, pl_tex source, bool compute)
+{
+    pl_shader sh = pl_dispatch_begin(dp);
+    if (compute)
+        REQUIRE(sh_try_compute(sh, 8, 8, false, 0));
+
+    unsigned scope = pl_shader_profile_begin(sh, timing_names[0]);
+    pl_shader_sample_nearest(sh, pl_sample_src(.tex = source));
+    pl_shader_profile_end(sh, scope);
+    scope = pl_shader_profile_begin(sh, timing_names[1]);
+    pl_shader_linearize(sh, &pl_color_space_srgb);
+    pl_shader_profile_end(sh, scope);
+    scope = pl_shader_profile_begin(sh, timing_names[2]);
+    pl_shader_delinearize(sh, &pl_color_space_srgb);
+    pl_shader_profile_end(sh, scope);
+    return sh;
+}
+
+static void pl_section_timing_tests(pl_gpu gpu)
+{
+    printf("pl_section_timing_tests:\n");
+    if (!gpu->glsl.vulkan || !gpu->glsl.fragment_stores ||
+        gpu->limits.max_ssbo_size < 32768 ||
+        !(gpu->glsl.shader_clock_subgroup || gpu->glsl.shader_clock_device))
+    {
+        printf("- skipping section samples: shader-clock instrumentation unavailable\n");
+        return;
+    }
+
+    float pixels[64 * 64 * 4], actual[PL_ARRAY_SIZE(pixels)];
+    for (int i = 0; i < PL_ARRAY_SIZE(pixels); i++)
+        pixels[i] = i % 4 == 3 ? 1.0f : 0.1f + (i % 79) / 100.0f;
+    pl_tex source = pl_tex_create(gpu, pl_tex_params(
+        .w = 64, .h = 64, .format = pl_find_named_fmt(gpu, "rgba32f"),
+        .sampleable = true, .initial_data = pixels,
+    ));
+    REQUIRE(source);
+    pl_tex target = pl_tex_create(gpu, pl_tex_params(
+        .w = 64, .h = 64, .format = source->params.format,
+        .renderable = true, .storable = true, .host_readable = true,
+    ));
+    REQUIRE(source && target);
+
+    for (int prepared = 0; prepared < 2; prepared++) {
+        if (prepared && !pl_pass_prepare_supported(gpu))
+            continue;
+        for (int compute = 0; compute < 2; compute++) {
+            for (int enabled = 0; enabled < 2; enabled++) {
+                struct section_timing_test test = { .enabled = enabled };
+                pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
+                pl_dispatch_profile(dp, enabled);
+                pl_dispatch_callback(dp, &test, section_timing_callback);
+                pl_dispatch_prepared pass = NULL;
+                if (prepared) {
+                    pl_shader sh = section_timing_shader(dp, source, compute);
+                    pl_dispatch_description desc = NULL;
+                    REQUIRE(pl_dispatch_describe_finish(dp, pl_dispatch_params(
+                        .shader = &sh, .target = target,
+                    ), NULL, &desc) == PL_DISPATCH_OK);
+                    pl_dispatch_preparation request = NULL;
+                    REQUIRE(pl_dispatch_prepare_submit(&desc, &request) == PL_PASS_PREPARE_ACCEPTED);
+                    pl_clock_t start = pl_clock_now();
+                    while (pl_dispatch_prepare_poll(request) == PL_PASS_PREPARE_PENDING) {
+                        REQUIRE(pl_clock_diff(pl_clock_now(), start) < 30.0);
+                        pl_thread_sleep(0.001);
+                    }
+                    REQUIRE(pl_dispatch_prepare_take(&request, &pass) == PL_PASS_PREPARE_READY);
+                }
+                for (int frame = 0; frame < 4; frame++) {
+                    pl_shader sh = section_timing_shader(dp, source, compute);
+                    const struct pl_dispatch_params *params = pl_dispatch_params(
+                        .shader = &sh, .target = target,
+                    );
+                    if (prepared) {
+                        REQUIRE(pl_dispatch_finish_prepared(dp, pass, params) == PL_DISPATCH_OK);
+                    } else {
+                        REQUIRE(pl_dispatch_finish(dp, params));
+                    }
+                    // Test-only synchronization: the next dispatch must collect
+                    // this result. No sleeps or assumptions about GPU speed.
+                    pl_gpu_finish(gpu);
+                }
+                REQUIRE(test.callbacks == 4);
+                for (int i = 0; enabled && i < PL_ARRAY_SIZE(timing_names); i++) {
+                    REQUIRE(test.counts[i] > 0);
+                    REQUIRE(test.maxima[i] > 0);
+                    printf("- %s/%s: %s: %"PRIu64" samples\n",
+                           prepared ? "prepared" : "ordinary",
+                           compute ? "compute" : "raster", timing_names[i], test.counts[i]);
+                }
+                REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = target, .ptr = actual)));
+                for (int i = 0; i < PL_ARRAY_SIZE(pixels); i++)
+                    REQUIRE_FEQ(actual[i], pixels[i], 1e-5);
+                pl_dispatch_prepared_destroy(&pass);
+                pl_dispatch_destroy(&dp);
+            }
+        }
+    }
+    pl_tex_destroy(gpu, &target);
+    pl_tex_destroy(gpu, &source);
 }
 
 static void pl_shader_tests(pl_gpu gpu)
@@ -711,6 +875,7 @@ static void pl_shader_tests(pl_gpu gpu)
 
     // Test the use of pl_dispatch
     pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
+    pl_dispatch_profile(dp, getenv("PL_TEST_SHADER_PROFILE") != NULL);
     pl_shader sh = pl_dispatch_begin(dp);
     REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
         .body       = "color = vec4(col, 1.0);",
@@ -938,6 +1103,7 @@ static void pl_shader_tests(pl_gpu gpu)
 
             pl_dispatch_destroy(&dp);
             dp = pl_dispatch_create(gpu->log, gpu);
+            pl_dispatch_profile(dp, getenv("PL_TEST_SHADER_PROFILE") != NULL);
             pl_dispatch_load(dp, cache_data);
 
             // Test to make sure the pass regenerates the same cache
@@ -1169,6 +1335,7 @@ static void pl_scaler_tests(pl_gpu gpu)
 
     pl_tex fbo = pl_tex_create(gpu, &fbo_params);
     pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
+    pl_dispatch_profile(dp, getenv("PL_TEST_SHADER_PROFILE") != NULL);
     if (!dot5x5 || !fbo || !dp)
         goto error;
 
@@ -1264,18 +1431,20 @@ static void render_info_cb(void *priv, const struct pl_render_info *info)
 }
 
 struct color_hook_test {
+    enum pl_hook_stage stage;
+    const char *body;
     int calls;
     float gain;
     const struct pl_color_map_params *mapping;
 };
 
-// Exercise both existing hook transports with the renderer's native mapper.
+// Exercise both hook transports at the renderer's JzAzBz mapping boundary.
 static struct pl_hook_res color_map_test_hook(void *priv,
                                               const struct pl_hook_params *params)
 {
     struct color_hook_test *test = priv;
     test->calls++;
-    REQUIRE(params->stage == PL_HOOK_COLOR_MAP);
+    REQUIRE(params->stage == PL_DEF(test->stage, PL_HOOK_TONE_MAP));
     REQUIRE(params->color_map);
     REQUIRE(params->color_map->state);
     REQUIRE(params->color_map_params == test->mapping);
@@ -1287,14 +1456,13 @@ static struct pl_hook_res color_map_test_hook(void *priv,
         pl_shader_sample_direct(sh, pl_sample_src( .tex = params->tex ));
     }
 
-    pl_shader_color_map_ex(sh, params->color_map_params, params->color_map);
     REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
-        .body = "color.rgb *= gain;",
+        .body = PL_DEF(test->body, "color.rgb += vec3(0.0 * gain);"),
         .input = PL_SHADER_SIG_COLOR,
         .output = PL_SHADER_SIG_COLOR,
         .output_w = pl_rect_w(params->rect),
         .output_h = pl_rect_h(params->rect),
-        .num_variables = 1,
+        .num_variables = test->body ? 0 : 1,
         .variables = &(struct pl_shader_var) {
             .var = pl_var_float("gain"),
             .data = &test->gain,
@@ -1305,7 +1473,7 @@ static struct pl_hook_res color_map_test_hook(void *priv,
         .output = PL_HOOK_SIG_COLOR,
         .sh = sh,
         .repr = params->repr,
-        .color = params->color_map->dst,
+        .color = params->color,
         .components = params->components,
         .rect = params->rect,
     };
@@ -1321,6 +1489,12 @@ static struct pl_hook_res color_map_test_hook(void *priv,
         result.sh = NULL;
     }
     return result;
+}
+
+static void color_test_count_pass(void *priv, const struct pl_render_info *info)
+{
+    int *passes = priv;
+    (*passes)++;
 }
 
 static void color_test_read(pl_gpu gpu, pl_tex tex, float pixel[4])
@@ -1366,6 +1540,7 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
     REQUIRE(source && target_tex);
     pl_renderer rr = pl_renderer_create(gpu->log, gpu);
     pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
+    pl_dispatch_profile(dp, getenv("PL_TEST_SHADER_PROFILE") != NULL);
     struct pl_color_space linear = pl_color_space_srgb;
     linear.transfer = PL_COLOR_TRC_LINEAR;
     pl_color_space_infer(&linear);
@@ -1382,7 +1557,9 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
     const struct pl_frame original = image;
     struct color_hook_test test = { .gain = 1.0f };
     struct pl_hook hook = {
-        .stages = PL_HOOK_COLOR_MAP,
+        .stages = PL_HOOK_TONE_MAP,
+        .color_input = {.working_space = PL_COLOR_WORKING_JZAZBZ},
+        .color_output = {.working_space = PL_COLOR_WORKING_JZAZBZ},
         .input = PL_HOOK_SIG_COLOR,
         .priv = &test,
         .hook = color_map_test_hook,
@@ -1390,8 +1567,8 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
     };
     const struct pl_hook *hooks[] = { &hook };
     struct pl_render_params params = {
-        .color_map_hooks = hooks,
-        .num_color_map_hooks = PL_ARRAY_SIZE(hooks),
+        .hooks = hooks,
+        .num_hooks = PL_ARRAY_SIZE(hooks),
     };
     uint64_t signature = 100;
     const struct pl_frame_mix mix = {
@@ -1416,15 +1593,15 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
         for (int c = 0; c < 4; c++)
             REQUIRE_FEQ(actual[c], pixel[c], 2e-3);
 
-        // An application settings revision uses the existing hook signature.
+        // An application settings revision invalidates the cached hook result.
         test.gain = 0.5f;
         hook.signature++;
         REQUIRE(pl_render_image_mix(rr, &mix, &target, &params));
         REQUIRE(pl_render_image_mix(rr, &mix, &target, &params));
         REQUIRE_CMP(test.calls, ==, 2, "d");
         color_test_read(gpu, target_tex, actual);
-        for (int c = 0; c < 3; c++)
-            REQUIRE_FEQ(actual[c], 0.5f * pixel[c], 2e-3);
+        for (int c = 0; c < 4; c++)
+            REQUIRE_FEQ(actual[c], pixel[c], 2e-3);
         REQUIRE_FEQ(actual[3], 1.0f, 2e-3);
         signature++;
         REQUIRE(pl_render_image_mix(rr, &mix, &target, &params));
@@ -1434,26 +1611,51 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
         REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
     }
 
-    // Delegation must match the selected native HDR mapping, not a fallback.
-    printf("- delegated native HDR mapping\n");
-    image.color = pl_color_space_hdr10;
-    image.color.hdr.max_luma = 1000;
-    target.color = pl_color_space_srgb;
+    // Identity external tone mapping must retain native gamut mapping.
+    // Equal luminance ranges make the native reference tone stage a no-op.
+    printf("- injected tone mapping retains native gamut mapping\n");
+    image.color = linear;
+    image.color.primaries = PL_COLOR_PRIM_BT_2020;
+    image.color.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+    target.color = linear;
     struct pl_color_map_params mapping = pl_color_map_default_params;
-    mapping.tone_mapping_function = &pl_tone_map_reinhard;
-    params = (struct pl_render_params) { .color_map_params = &mapping };
-    REQUIRE(pl_render_image(rr, &image, &target, &params));
-    color_test_read(gpu, target_tex, reference);
-    params.color_map_hooks = hooks;
-    params.num_color_map_hooks = 1;
+    mapping.tone_mapping_function = &pl_tone_map_clip;
+    params = (struct pl_render_params) {
+        .color_map_params = &mapping,
+        .hooks = hooks,
+        .num_hooks = 1,
+    };
     test.mapping = &mapping;
     test.gain = 1.0f;
-    for (int texture = 0; texture < 2; texture++) {
-        hook.input = texture ? PL_HOOK_SIG_TEX : PL_HOOK_SIG_COLOR;
-        REQUIRE(pl_render_image(rr, &image, &target, &params));
-        color_test_read(gpu, target_tex, actual);
-        for (int c = 0; c < 4; c++)
-            REQUIRE_FEQ(actual[c], reference[c], 2e-3);
+    pl_shader sh;
+    const struct pl_gamut_map_function *methods[] = {
+        &pl_gamut_map_clip, &pl_gamut_map_perceptual, &pl_gamut_map_saturation,
+    };
+    float clipped[4];
+    for (int method = 0; method < PL_ARRAY_SIZE(methods); method++) {
+        mapping.gamut_mapping = methods[method];
+        pl_shader_obj state = NULL;
+        sh = color_test_constant(dp, pixel);
+        pl_shader_color_map_ex(sh, &mapping, pl_color_map_args(
+            .src = image.color, .dst = target.color, .state = &state));
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target_tex)));
+        color_test_read(gpu, target_tex, reference);
+        if (method == 0)
+            memcpy(clipped, reference, sizeof(clipped));
+        if (method == 2) {
+            float difference = 0;
+            for (int c = 0; c < 3; c++)
+                difference += fabsf(reference[c] - clipped[c]);
+            REQUIRE(difference > 0.01f);
+        }
+        for (int texture = 0; texture < 2; texture++) {
+            hook.input = texture ? PL_HOOK_SIG_TEX : PL_HOOK_SIG_COLOR;
+            REQUIRE(pl_render_image(rr, &image, &target, &params));
+            color_test_read(gpu, target_tex, actual);
+            for (int c = 0; c < 4; c++)
+                REQUIRE_FEQ(actual[c], reference[c], 2e-3);
+        }
+        pl_shader_obj_destroy(&state);
     }
 
     // Conversion-only preserves absolute luminance even above target max_luma.
@@ -1464,7 +1666,7 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
     pq.hdr.max_luma = 100;
     const struct pl_color_space saved_linear = hdr_linear, saved_pq = pq;
     const float bright[4] = {4.0f, 2.0f, 1.0f, 1.0f};
-    pl_shader sh = color_test_constant(dp, bright);
+    sh = color_test_constant(dp, bright);
     pl_shader_color_convert(sh, &hdr_linear, &pq);
     REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target_tex)));
     color_test_read(gpu, target_tex, actual);
@@ -1482,6 +1684,19 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
         REQUIRE_FEQ(actual[c], bright[c], 2e-3);
     REQUIRE_MEMEQ(&hdr_linear, &saved_linear, sizeof(hdr_linear));
     REQUIRE_MEMEQ(&pq, &saved_pq, sizeof(pq));
+
+    // The injected mapping helpers fold source primaries -> modified LMS and
+    // modified LMS -> destination primaries into one matrix in each direction.
+    printf("- direct JzAzBz conversion round trip\n");
+    sh = color_test_constant(dp, pixel);
+    const struct pl_color_domain native = {.color = linear};
+    const struct pl_color_domain jab = {.working_space = PL_COLOR_WORKING_JZAZBZ};
+    pl_shader_color_convert_ex(sh, &native, &jab);
+    pl_shader_color_convert_ex(sh, &jab, &native);
+    REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target_tex)));
+    color_test_read(gpu, target_tex, actual);
+    for (int c = 0; c < 4; c++)
+        REQUIRE_FEQ(actual[c], pixel[c], 2e-3);
 
     if (gpu->limits.max_tex_3d_dim && gpu->glsl.version > 100) {
         printf("- native LUT interpolation and render cache\n");
@@ -1515,6 +1730,136 @@ static void pl_color_pipeline_tests(pl_gpu gpu)
                 REQUIRE_FEQ(actual[c], expected, 2e-3);
         }
         pl_shader_obj_destroy(&lut_state);
+    }
+
+    // Independent replacements run in semantic order, regardless of list
+    // order. Unequal HDR/gamut metadata would make native mapping nontrivial:
+    // the expected affine result detects accidentally applying it as well.
+    printf("- three independent replacement stages\n");
+    image = original;
+    image.color.primaries = PL_COLOR_PRIM_BT_2020;
+    image.color.hdr.max_luma = 4000;
+    image.color.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+    target.color = linear;
+    struct pl_color_domain rgb2020 = {.color = linear};
+    rgb2020.color.primaries = PL_COLOR_PRIM_BT_2020;
+    struct color_hook_test stage_tests[] = {
+        {.stage = PL_HOOK_TONE_MAP, .body = "color.rgb *= 2.0;"},
+        {.stage = PL_HOOK_GAMUT_MAP, .body = "color.rgb += vec3(0.05);"},
+        {.stage = PL_HOOK_COLOR_CONVERT, .body = "color.rgb *= 0.8;"},
+    };
+    struct pl_hook stages[3];
+    for (int i = 0; i < 3; i++) {
+        stages[i] = (struct pl_hook) {
+            .stages = stage_tests[i].stage, .input = PL_HOOK_SIG_COLOR,
+            .hook = color_map_test_hook, .priv = &stage_tests[i],
+            .signature = 5000 + i,
+            .color_input = rgb2020, .color_output = rgb2020,
+        };
+    }
+    stages[2].color_output.color = linear;
+    const struct pl_hook *stage_hooks[] = {&stages[2], &stages[1], &stages[0]};
+    int passes = 0;
+    params = (struct pl_render_params) {
+        .hooks = stage_hooks, .num_hooks = 3,
+        .info_callback = color_test_count_pass, .info_priv = &passes,
+    };
+    REQUIRE(pl_render_image(rr, &image, &target, &params));
+    REQUIRE(passes == 1); // COLOR replacements remain fused with sampling/output.
+    color_test_read(gpu, target_tex, actual);
+    for (int c = 0; c < 3; c++) {
+        REQUIRE_FEQ(actual[c], (pixel[c] * 2.0f + 0.05f) * 0.8f, 2e-4);
+        REQUIRE(stage_tests[c].calls == 1);
+    }
+    REQUIRE_FEQ(actual[3], pixel[3], 2e-4);
+
+    // Cross-model boundaries and luminance units preserve a physical signal.
+    printf("- explicit color domains and linear luminance units\n");
+    struct pl_color_domain domains[] = {
+        {.color = linear}, {.color = pq},
+        {.color = linear, .linear_scale = 1.0f},
+        {.working_space = PL_COLOR_WORKING_IPT}, {.working_space = PL_COLOR_WORKING_JZAZBZ},
+        {.working_space = PL_COLOR_WORKING_LMS},
+        {.working_space = PL_COLOR_WORKING_LMS, .linear_scale = 1.0f},
+    };
+    const struct pl_color_domain origin = {.color = linear};
+    for (int a = 0; a < PL_ARRAY_SIZE(domains); a++) {
+        for (int b = 0; b < PL_ARRAY_SIZE(domains); b++) {
+            sh = color_test_constant(dp, pixel);
+            pl_shader_color_convert_ex(sh, &origin, &domains[a]);
+            pl_shader_color_convert_ex(sh, &domains[a], &domains[b]);
+            pl_shader_color_convert_ex(sh, &domains[b], &origin);
+            REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target_tex)));
+            color_test_read(gpu, target_tex, actual);
+            for (int c = 0; c < 4; c++)
+                REQUIRE_FEQ(actual[c], pixel[c], 2e-3);
+        }
+    }
+    // Compare merged native conversion chains with explicitly separated calls.
+    // Covers each native representation, ranges, alpha and transfer barriers.
+    printf("- merged versus sequential native color conversion\n");
+    for (int sys = PL_COLOR_SYSTEM_UNKNOWN; sys < PL_COLOR_SYSTEM_COUNT; sys++) {
+        if (sys == PL_COLOR_SYSTEM_DOLBYVISION) // native encoder has no inverse
+            continue;
+        for (int variant = 0; variant < 4; variant++) {
+            struct pl_color_repr repr = {
+                .sys = sys,
+                .levels = variant & 1 ? PL_COLOR_LEVELS_LIMITED : PL_COLOR_LEVELS_FULL,
+                .alpha = variant & 2 ? PL_ALPHA_PREMULTIPLIED : PL_ALPHA_INDEPENDENT,
+                .bits = {.sample_depth = 16, .color_depth = 10, .bit_shift = 6},
+            };
+            struct pl_color_space src = linear, dst = linear;
+            if (variant & 1)
+                src.transfer = dst.transfer = PL_COLOR_TRC_SRGB;
+            dst.primaries = PL_COLOR_PRIM_BT_2020;
+            for (int merged = 0; merged < 2; merged++) {
+                sh = color_test_constant(dp, (float[]) {0.25f, 0.5f, 0.75f, 0.8f});
+                struct pl_color_repr decoded = repr;
+                pl_shader_decode_color(sh, &decoded, NULL);
+                if (!merged) sh_color_transform_flush(sh);
+                pl_shader_color_convert(sh, &src, &dst);
+                if (!merged) sh_color_transform_flush(sh);
+                pl_shader_encode_color(sh, &repr);
+                REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target_tex)));
+                color_test_read(gpu, target_tex, merged ? actual : reference);
+            }
+            for (int c = 0; c < 4; c++)
+                REQUIRE_FEQ(actual[c], reference[c], 2e-3);
+        }
+    }
+
+    // Identity injection must preserve the surrounding native operations.
+    printf("- injected tone mapping preserves cone simulation and LUT priority\n");
+    image = original;
+    target.color = linear;
+    test.mapping = NULL;
+    const float dim_lut_data[] = { 0, 0, 0, 0.5f, 0.5f, 0.5f };
+    const struct pl_custom_lut dim_lut = {
+        .signature = 1001, .size = {2, 0, 0}, .data = dim_lut_data,
+        .color_in = linear, .color_out = linear,
+    };
+    for (int effect = 0; effect < 4; effect++) {
+        params = (struct pl_render_params) {
+            .cone_params = effect == 0 ? &pl_vision_protanopia : NULL,
+            .lut = effect ? &dim_lut : NULL,
+            .lut_type = effect == 1 ? PL_LUT_NATIVE :
+                        effect == 2 ? PL_LUT_NORMALIZED : PL_LUT_CONVERSION,
+        };
+        REQUIRE(pl_render_image(rr, &image, &target, &params));
+        color_test_read(gpu, target_tex, reference);
+        REQUIRE(fabsf(reference[0] - pixel[0]) + fabsf(reference[1] - pixel[1]) +
+                fabsf(reference[2] - pixel[2]) > 0.01f);
+        params.hooks = hooks;
+        params.num_hooks = 1;
+        for (int texture = 0; texture < 2; texture++) {
+            hook.input = texture ? PL_HOOK_SIG_TEX : PL_HOOK_SIG_COLOR;
+            test.calls = 0;
+            REQUIRE(pl_render_image(rr, &image, &target, &params));
+            color_test_read(gpu, target_tex, actual);
+            for (int c = 0; c < 4; c++)
+                REQUIRE_FEQ(actual[c], reference[c], 2e-3);
+            REQUIRE(test.calls == (effect == 3 ? 0 : 1));
+        }
     }
 
     REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
@@ -1593,6 +1938,7 @@ static void pl_render_tests(pl_gpu gpu)
         for (int i = 0; i <= LIMIT; i++) {                              \
             printf("- testing `" #STYPE "." #FIELD " = %d`\n", i);        \
             struct pl_render_params params = pl_render_default_params;  \
+            params.profile = getenv("PL_TEST_SHADER_PROFILE") != NULL; \
             params.force_dither = true;                                 \
             struct STYPE tmp = DEFAULT;                                 \
             tmp.FIELD = i;                                              \
@@ -2091,6 +2437,7 @@ static void pl_render_bits_tests(pl_gpu gpu)
     }
 
     dp = pl_dispatch_create(gpu->log, gpu);
+    pl_dispatch_profile(dp, getenv("PL_TEST_SHADER_PROFILE") != NULL);
     REQUIRE(dp);
 
     // Luma test points, as a fraction of the nominal luma range
@@ -2457,6 +2804,7 @@ void gpu_shader_tests(pl_gpu gpu)
     pl_planar_tests(gpu);
     pl_indirect_dispatch_tests(gpu);
     pl_shader_tests(gpu);
+    pl_section_timing_tests(gpu);
     pl_scaler_tests(gpu);
     pl_color_pipeline_tests(gpu);
     pl_render_tests(gpu);

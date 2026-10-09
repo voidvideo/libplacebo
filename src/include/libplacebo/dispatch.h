@@ -46,6 +46,25 @@ PL_API void pl_dispatch_reset_frame(pl_dispatch dp);
 // For more information, see the header documentation in `shaders/*.h`.
 PL_API pl_shader pl_dispatch_begin(pl_dispatch dp);
 
+enum pl_shader_clock {
+    PL_SHADER_CLOCK_NONE = 0,
+    PL_SHADER_CLOCK_SUBGROUP,
+    PL_SHADER_CLOCK_DEVICE,
+};
+
+struct pl_shader_section_sample {
+    unsigned id;
+    uint64_t count, minimum, maximum;
+    double average;
+    // Back-to-back clock read baseline, in the same units. Not subtracted:
+    // instrumentation also changes scheduling/register pressure and adds stores.
+    double clock_overhead;
+};
+
+// Enable sampled shader diagnostics for subsequent pl_dispatch_begin calls.
+// Disabled by default. Affects shader/cache identity, not GPU execution policy.
+PL_API void pl_dispatch_profile(pl_dispatch dp, bool enable);
+
 // Struct passed to `info_callback`. Only valid until that function returns.
 struct pl_dispatch_info {
     // Information about the shader for this shader execution, as well as a
@@ -62,6 +81,18 @@ struct pl_dispatch_info {
     uint64_t last;
     uint64_t peak;
     uint64_t average;
+
+    // Newly completed section measurements (no rolling history), in opaque
+    // 64-bit clock ticks, never nanoseconds. May arrive several dispatches late.
+    // NONE means this pass has no instrumented sections (including unsupported
+    // GPUs). Not additive pass times. Excess samples/section IDs are dropped.
+    bool profile_requested;
+    enum pl_shader_clock section_clock;
+    struct pl_shader_section_sample sections[64];
+    int num_sections;
+    uint64_t section_samples_dropped;
+    // A busy readback ring skips diagnostics, never waits for the GPU.
+    bool section_sampling_skipped;
 };
 
 // Helper function to make a copy of `pl_dispatch_info`, while overriding

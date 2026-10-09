@@ -7,7 +7,7 @@
 static pl_tex (*real_create)(pl_gpu, const struct pl_tex_params *);
 static bool (*real_upload)(pl_gpu, const struct pl_tex_transfer_params *);
 static int creates, uploads, fills;
-static bool fail_create;
+static bool fail_create, fail_upload;
 
 static pl_tex count_create(pl_gpu gpu, const struct pl_tex_params *params)
 {
@@ -18,7 +18,7 @@ static pl_tex count_create(pl_gpu gpu, const struct pl_tex_params *params)
 static bool count_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
 {
     uploads++;
-    return real_upload(gpu, params);
+    return !fail_upload && real_upload(gpu, params);
 }
 
 struct collected {
@@ -110,6 +110,14 @@ static void test_lut(pl_gpu gpu, enum sh_lut_type type, bool dynamic)
         fail_create = true;
         REQUIRE(!sh_lut_stage(candidate));
         fail_create = false;
+        if (dynamic) {
+            fail_upload = true;
+            REQUIRE(!sh_lut_stage(candidate));
+            fail_upload = false;
+            // A failed candidate upload cannot alter the active resource.
+            pl_tex old = rr->descriptors[0].binding.object;
+            REQUIRE(((float *) pl_tex_dummy_data(old))[0] == 0.25f);
+        }
     }
     REQUIRE(sh_lut_stage(candidate));
     const int staged_create = creates, staged_upload = uploads, staged_fill = fills;
@@ -164,6 +172,48 @@ static void test_lut(pl_gpu gpu, enum sh_lut_type type, bool dynamic)
     REQUIRE(!sh_lut(live, &params));
     REQUIRE(pl_shader_is_failed(live));
     REQUIRE(creates == staged_create && uploads == staged_upload && fills == staged_fill);
+
+    if (dynamic && type == SH_LUT_TEXTURE) {
+        // A signature identifies content, not layout. Explicitly mutable
+        // prepared LUTs update in place, and never upload during preflight.
+        params.object = &candidate;
+        params.update_prepared = true;
+        pl_shader update = shader(gpu, true, &c);
+        REQUIRE(sh_lut(update, &params));
+        REQUIRE(creates == staged_create && uploads == staged_upload);
+        REQUIRE(fills == staged_fill + 1);
+        // Several CPU-side updates may supersede one another before any GPU
+        // execution. Only the most recently described contents may publish.
+        pl_shader superseded[3];
+        for (int i = 0; i < 3; i++) {
+            params.signature++;
+            base = 10.0f + i;
+            superseded[i] = shader(gpu, true, &c);
+            REQUIRE(sh_lut(superseded[i], &params));
+            REQUIRE(creates == staged_create && uploads == staged_upload);
+            pl_tex current = pl_shader_finalize(execute)->descriptors[0].binding.object;
+            REQUIRE(((float *) pl_tex_dummy_data(current))[0] == 0.25f);
+        }
+        base = -100.0f; // Execution must use the owned description, not this pointer.
+        pl_shader upload = shader(gpu, false, NULL);
+        REQUIRE(sh_lut(upload, &params));
+        REQUIRE(creates == staged_create && uploads == staged_upload + 1);
+        const struct pl_shader_res *updated = pl_shader_finalize(upload);
+        const struct pl_shader_res *previous = pl_shader_finalize(execute);
+        REQUIRE(updated->descriptors[0].binding.object == previous->descriptors[0].binding.object);
+        pl_tex published = updated->descriptors[0].binding.object;
+        for (int i = 0; i < params.width; i++)
+            REQUIRE(((float *) pl_tex_dummy_data(published))[i] == 12.0f + i);
+        for (int i = 0; i < 3; i++) pl_shader_free(&superseded[i]);
+        compare(execute, upload);
+        pl_shader layout = shader(gpu, true, &c);
+        params.width++;
+        REQUIRE(!sh_lut(layout, &params));
+        REQUIRE(creates == staged_create && uploads == staged_upload + 1);
+        pl_shader_free(&layout);
+        pl_shader_free(&upload);
+        pl_shader_free(&update);
+    }
 
     pl_shader_free(&live);
     pl_shader_free(&changed);

@@ -606,12 +606,12 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
                       const struct pl_film_grain_params *params)
 {
     int sub_x = 0, sub_y = 0;
-    int tex_w = params->tex->params.w,
-        tex_h = params->tex->params.h;
+    int tex_w = params->texture->w,
+        tex_h = params->texture->h;
 
-    if (params->luma_tex) {
-        sub_x = params->luma_tex->params.w > tex_w;
-        sub_y = params->luma_tex->params.h > tex_h;
+    if (params->luma_texture) {
+        sub_x = params->luma_texture->w > tex_w;
+        sub_y = params->luma_texture->h > tex_h;
     }
 
     const struct pl_av1_grain_data *data = &params->data.params.av1;
@@ -687,6 +687,7 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
             .comps      = 1,
             .update     = needs_update,
             .dynamic    = true,
+            .update_prepared = true,
             .fill       = fill_grain_lut,
             .priv       = obj,
         ));
@@ -722,6 +723,7 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
             .comps      = chroma_comps,
             .update     = needs_update,
             .dynamic    = true,
+            .update_prepared = true,
             .fill       = fill_grain_lut,
             .priv       = obj,
         ));
@@ -744,6 +746,7 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
         .comps      = 1,
         .update     = needs_update,
         .dynamic    = true,
+        .update_prepared = true,
         .fill       = generate_offsets,
         .priv       = (void *) &params->data,
     ));
@@ -806,6 +809,7 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
                 .comps      = 1,
                 .update     = scaling_changed,
                 .dynamic    = true,
+                .update_prepared = true,
                 .fill       = generate_scaling,
                 .priv       = &priv,
             ));
@@ -882,6 +886,7 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
     // Load the color value of the tex itself
     ident_t tex = sh_desc(sh, (struct pl_shader_desc) {
         .binding.object = params->tex,
+        .texture = params->texture,
         .desc = (struct pl_desc) {
             .name = "tex",
             .type = PL_DESC_SAMPLED_TEX,
@@ -905,9 +910,10 @@ bool pl_shader_fg_av1(pl_shader sh, pl_shader_obj *grain_state,
             }
         } else {
             // Luma channel not present in image, attach it separately
-            pl_assert(params->luma_tex);
+            pl_assert(params->luma_texture);
             ident_t luma = sh_desc(sh, (struct pl_shader_desc) {
                 .binding.object = params->luma_tex,
+                .texture = params->luma_texture,
                 .desc = (struct pl_desc) {
                     .name = "luma",
                     .type = PL_DESC_SAMPLED_TEX,

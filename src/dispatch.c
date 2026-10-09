@@ -42,6 +42,7 @@ struct pl_dispatch_t {
     uint8_t current_ident;
     uint8_t current_index;
     bool dynamic_constants;
+    bool profile;
     int max_passes;
 
     void (*info_callback)(void *, const struct pl_dispatch_info *);
@@ -71,6 +72,10 @@ struct pass_var {
     void *cached_data;
 };
 
+#define PROFILE_RECORDS 1024
+#define PROFILE_WORDS (4 + 6 * PROFILE_RECORDS)
+#define PROFILE_RING 4
+
 struct pass {
     // Independent prepared entries are owned by their generation, not cached.
     pl_prepared_pass prepared;
@@ -96,6 +101,14 @@ struct pass {
     // the UBO pre-filled), vertex array and variable updates
     struct pl_pass_run_params run_params;
 
+    int profile_index;
+    int profile_sections;
+    int profile_group_size[2];
+    ident_t profile_words;
+    enum pl_shader_clock profile_clock;
+    pl_buf profile_buf[PROFILE_RING + 1]; // last is permanently disabled
+    bool profile_pending[PROFILE_RING];
+
     // for pl_dispatch_info
     pl_timer timer;
     uint64_t ts_last;
@@ -111,6 +124,8 @@ static void pass_destroy(pl_dispatch dp, struct pass *pass)
         return;
 
     pl_buf_destroy(dp->gpu, &pass->ubo);
+    for (int i = 0; i < PL_ARRAY_SIZE(pass->profile_buf); i++)
+        pl_buf_destroy(dp->gpu, &pass->profile_buf[i]);
     pl_pass_destroy(dp->gpu, &pass->pass);
     pl_prepared_pass_destroy(&pass->prepared);
     pl_timer_destroy(dp->gpu, &pass->timer);
@@ -208,6 +223,7 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique)
         .gpu = dp->gpu,
         .index = dp->current_index,
         .dynamic_constants = dp->dynamic_constants,
+        .profile = dp->profile,
     };
 
     pl_shader sh = NULL;
@@ -220,6 +236,13 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique)
     }
 
     return pl_shader_alloc(dp->log, &params);
+}
+
+void pl_dispatch_profile(pl_dispatch dp, bool enable)
+{
+    pl_mutex_lock(&dp->lock);
+    dp->profile = enable;
+    pl_mutex_unlock(&dp->lock);
 }
 
 void pl_dispatch_mark_dynamic(pl_dispatch dp, bool dynamic)
@@ -368,6 +391,12 @@ static void generate_shaders(pl_dispatch dp,
         (gpu->glsl.gles && gpu->glsl.version > 100) ? " es" : "");
     if (pass_params->type == PL_PASS_COMPUTE)
         ADD(pre, "#extension GL_ARB_compute_shader : enable\n");
+
+    if (pass->profile_clock) {
+        ADD(pre, "#extension %s : require\n",
+            pass->profile_clock == PL_SHADER_CLOCK_SUBGROUP
+                ? "GL_ARB_shader_clock" : "GL_EXT_shader_realtime_clock");
+    }
 
     // Enable this unconditionally if the GPU supports it, since we have no way
     // of knowing whether subgroups are being used or not
@@ -663,6 +692,38 @@ static void generate_shaders(pl_dispatch dp,
     pl_str_builder glsl = dp->tmp[TMP_MAIN];
     ADD_CAT(glsl, pre);
 
+    if (pass->profile_clock) {
+        ADD(glsl, "#define _pl_profile_words "$"\n", pass->profile_words);
+        ADD(glsl, "uvec2 _pl_profile_clock() { return %s(); }\n",
+            pass->profile_clock == PL_SHADER_CLOCK_SUBGROUP
+                ? "clock2x32ARB" : "clockRealtime2x32EXT");
+        ADD(glsl, "bool _pl_profile_selected() {\n");
+        if (pass_params->type == PL_PASS_COMPUTE) {
+            ADD(glsl, "uvec3 p = gl_GlobalInvocationID;\n"
+                     "return _pl_profile_words[0] != 0u && p.z == 0u && "
+                     "((p.x | p.y) & _pl_profile_words[2]) == 0u; }\n");
+        } else {
+            ADD(glsl, "uvec2 p = uvec2(gl_FragCoord.xy);\n"
+                     "return _pl_profile_words[0] != 0u && !gl_HelperInvocation && "
+                     "((p.x | p.y) & _pl_profile_words[2]) == 0u; }\n");
+        }
+        ADD(glsl, "void _pl_profile_record(uint id, uvec2 start, uvec2 end) {\n"
+                 "uvec2 a = _pl_profile_clock(), b = _pl_profile_clock();\n"
+                 "uvec2 dt = uvec2(end.x-start.x, end.y-start.y-uint(end.x<start.x));\n"
+                 "uvec2 overhead = uvec2(b.x-a.x, b.y-a.y-uint(b.x<a.x));\n"
+                 "uint n = atomicAdd(_pl_profile_words[1], 1u);\n"
+                 "if (n >= %uu) return;\n"
+                 "uint off = 4u + n * 6u;\n"
+                 "_pl_profile_words[off] = id;\n"
+                 "_pl_profile_words[off+1u] = dt.x;\n"
+                 "_pl_profile_words[off+2u] = dt.y;\n"
+                 "_pl_profile_words[off+3u] = overhead.x;\n"
+                 "_pl_profile_words[off+4u] = overhead.y;\n"
+                 "}\n", PROFILE_RECORDS);
+    }
+
+
+
     switch(pass_params->type) {
     case PL_PASS_RASTER: {
         pl_assert(params->vert_idx >= 0);
@@ -875,6 +936,18 @@ static bool pass_resources(pl_dispatch dp, struct pass *pass)
         run->vertex_count = 4;
         run->vertex_data = pl_zalloc(pass, 4 * params->vertex_stride);
     }
+    if (pass->profile_clock) {
+        uint32_t zero[PROFILE_WORDS] = {0};
+        for (int i = 0; i < PL_ARRAY_SIZE(pass->profile_buf); i++) {
+            pass->profile_buf[i] = pl_buf_create(dp->gpu, pl_buf_params(
+                .size = sizeof(zero), .storable = true,
+                .host_writable = true, .host_readable = true,
+                .initial_data = zero,
+            ));
+            if (!pass->profile_buf[i])
+                return false;
+        }
+    }
     pass->timer = pl_timer_create(dp->gpu);
     return true;
 }
@@ -943,6 +1016,8 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
                                   const pl_transform2x2 *proj,
                                   struct dispatch_build *build)
 {
+    // Resolve pending color uniforms before resource layout and cache hashing.
+    sh_color_transform_flush(sh);
     build->result = PL_DISPATCH_FAILED;
     struct pass *pass = pl_alloc_ptr(NULL, pass);
     *pass = (struct pass) {
@@ -1084,6 +1159,28 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
         PL_ARRAY_APPEND(sh, sh->descs, pass->ubo_desc); // don't mangle names
     };
 
+    if (sh_profile_enabled(sh) && sh->info->sections.num) {
+        pass->profile_clock = dp->gpu->glsl.shader_clock_subgroup
+                            ? PL_SHADER_CLOCK_SUBGROUP : PL_SHADER_CLOCK_DEVICE;
+        pass->profile_index = sh->descs.num;
+        pass->profile_sections = sh->info->sections.num;
+        memcpy(pass->profile_group_size, sh->group_size, sizeof(pass->profile_group_size));
+        pass->profile_words = sh_fresh(sh, "profile_words");
+        struct pl_shader_desc sd = {
+            .desc = {
+                .name = sh_ident_pack(sh_fresh(sh, "profile_buffer")),
+                .type = PL_DESC_BUF_STORAGE,
+                .access = PL_DESC_ACCESS_READWRITE,
+            },
+        };
+        sh_buf_desc_append(sh, dp->gpu, &sd, NULL, (struct pl_var) {
+            .name = sh_ident_pack(pass->profile_words),
+            .type = PL_VAR_UINT, .dim_v = 1, .dim_m = 1,
+            .dim_a = PROFILE_WORDS,
+        });
+        PL_ARRAY_APPEND(sh, sh->descs, sd);
+    }
+
     // Place and fill in the descriptors
     const int num_descs = sh->descs.num;
     int binding[PL_DESC_TYPE_COUNT] = {0};
@@ -1093,6 +1190,13 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
         struct pl_desc *desc = &params.descriptors[i];
         *desc = sh->descs.elem[i].desc;
         desc->binding = binding[pl_desc_namespace(dp->gpu, desc->type)]++;
+    }
+
+    if (pass->profile_clock) {
+        for (int i = 0; i < sh->info->sections.num; i++) {
+            const struct pl_shader_section *section = &sh->info->sections.elem[i];
+            pl_hash_merge(&pass->signature, pl_mem_hash(section->name, strlen(section->name)));
+        }
     }
 
     // Finalize the shader and look it up in the pass cache
@@ -1352,9 +1456,88 @@ static void translate_compute_shader(pl_dispatch dp, pl_shader sh,
     sh->output = PL_SHADER_SIG_NONE;
 }
 
+// Each pass owns its readbacks. No result borrows a retired generation's data.
+// Only inspect buffers which are no longer in use, then recycle them. A full
+// ring binds the immutable disabled buffer, keeping the rendering path moving.
+static int profile_collect(pl_dispatch dp, struct pass *pass,
+                           struct pl_dispatch_info *info)
+{
+    info->section_clock = pass->profile_clock;
+    if (!pass->profile_clock)
+        return -1;
+
+    int available = -1;
+    for (int i = 0; i < PROFILE_RING; i++) {
+        if (pl_buf_poll(dp->gpu, pass->profile_buf[i], 0))
+            continue;
+        if (pass->profile_pending[i]) {
+            uint32_t words[PROFILE_WORDS];
+            if (pl_buf_read(dp->gpu, pass->profile_buf[i], 0, words, sizeof(words))) {
+                uint32_t count = PL_MIN(words[1], PROFILE_RECORDS);
+                info->section_samples_dropped += words[1] - count;
+                for (uint32_t j = 0; j < count; j++) {
+                    const uint32_t *r = &words[4 + j * 6];
+                    int k = 0;
+                    while (k < info->num_sections && info->sections[k].id != r[0])
+                        k++;
+                    if (k == PL_ARRAY_SIZE(info->sections)) {
+                        info->section_samples_dropped++;
+                        continue;
+                    }
+                    if (k == info->num_sections) {
+                        info->num_sections++;
+                        info->sections[k].id = r[0];
+                        info->sections[k].minimum = UINT64_MAX;
+                    }
+                    struct pl_shader_section_sample *sample = &info->sections[k];
+                    uint64_t ticks = (uint64_t) r[2] << 32 | r[1];
+                    uint64_t overhead = (uint64_t) r[4] << 32 | r[3];
+                    sample->count++;
+                    sample->minimum = PL_MIN(sample->minimum, ticks);
+                    sample->maximum = PL_MAX(sample->maximum, ticks);
+                    sample->average += ((double) ticks - sample->average) / sample->count;
+                    sample->clock_overhead += ((double) overhead - sample->clock_overhead)
+                                              / sample->count;
+                }
+            }
+            pass->profile_pending[i] = false;
+        }
+        available = i;
+    }
+    info->section_sampling_skipped = available < 0;
+    int index = available < 0 ? PROFILE_RING : available;
+    if (available >= 0) {
+        const struct pl_pass_run_params *run = &pass->run_params;
+        uint64_t width, height;
+        if (pass_params(pass)->type == PL_PASS_RASTER) {
+            width = run->target->params.w;
+            height = run->target->params.h;
+        } else {
+            // Indirect dimensions remain GPU-owned; overflow is still reported
+            // for those dispatches and for scopes repeated inside shader loops.
+            width = (uint64_t) PL_MAX(run->compute_groups[0], 1) * pass->profile_group_size[0];
+            height = (uint64_t) PL_MAX(run->compute_groups[1], 1) * pass->profile_group_size[1];
+        }
+        uint32_t stride = 64;
+        while (stride < (1u << 30) &&
+               PL_DIV_UP(width, stride) * PL_DIV_UP(height, stride) >
+                   PROFILE_RECORDS / PL_MAX(pass->profile_sections, 1))
+            stride *= 2;
+        const uint32_t header[4] = {1, 0, stride - 1, 0};
+        pl_buf_write(dp->gpu, pass->profile_buf[index], 0, header, sizeof(header));
+    }
+    pass->run_params.desc_bindings[pass->profile_index].object = pass->profile_buf[index];
+    return available;
+}
+
 static enum pl_dispatch_result run_pass(pl_dispatch dp, pl_shader sh, struct pass *pass)
 {
     pl_shader_info shader = &sh->info->info;
+    struct pl_dispatch_info info = { .profile_requested = SH_PARAMS(sh).profile };
+    int profile_slot = profile_collect(dp, pass, &info);
+    // Also retain buffers after a failed submission: it may have queued work.
+    if (profile_slot >= 0)
+        pass->profile_pending[profile_slot] = true;
     if (pass->prepared) {
         switch (pl_prepared_pass_run(pass->prepared, &pass->run_params)) {
         case PL_PREPARED_PASS_RUN_OK: break;
@@ -1390,7 +1573,6 @@ static enum pl_dispatch_result run_pass(pl_dispatch dp, pl_shader sh, struct pas
     if (!dp->info_callback)
         return PL_DISPATCH_OK;
 
-    struct pl_dispatch_info info;
     info.signature = pass->signature;
     info.shader = shader;
 
@@ -1911,6 +2093,9 @@ void pl_dispatch_description_destroy(pl_dispatch_description *ptr)
 static void pass_resources_reset(pl_dispatch dp, struct pass *pass)
 {
     pl_buf_destroy(dp->gpu, &pass->ubo);
+    for (int i = 0; i < PL_ARRAY_SIZE(pass->profile_buf); i++)
+        pl_buf_destroy(dp->gpu, &pass->profile_buf[i]);
+    memset(pass->profile_pending, 0, sizeof(pass->profile_pending));
     pl_timer_destroy(dp->gpu, &pass->timer);
     pl_free(pass->run_params.push_constants);
     pl_free(pass->run_params.desc_bindings);

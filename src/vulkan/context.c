@@ -214,6 +214,8 @@ static const struct vk_ext vk_device_extensions[] = {
         .name = VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,
 #endif
     }, {
+        .name = VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
+    }, {
         .name = VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(GetDeviceImageMemoryRequirements),
@@ -232,6 +234,7 @@ static const struct vk_ext vk_device_extensions[] = {
 
 // Make sure to keep this in sync with the above!
 const char * const pl_vulkan_recommended_extensions[] = {
+    VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
@@ -295,13 +298,20 @@ static const VkPhysicalDeviceCooperativeMatrixFeaturesKHR recommended_cooperativ
 };
 #endif
 
-static const VkPhysicalDeviceVideoMaintenance2FeaturesKHR video_maintenance2 = {
-    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR,
+static const VkPhysicalDeviceShaderClockFeaturesKHR shader_clock = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR,
 #ifdef VK_KHR_cooperative_matrix
     .pNext = (void *) &recommended_cooperative_matrix,
 #elif defined(VK_KHR_internally_synchronized_queues)
     .pNext = (void *) &synchronized_queues,
 #endif
+    .shaderSubgroupClock = true,
+    .shaderDeviceClock = true,
+};
+
+static const VkPhysicalDeviceVideoMaintenance2FeaturesKHR video_maintenance2 = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR,
+    .pNext = (void *) &shader_clock,
     .videoMaintenance2 = true,
 };
 
@@ -413,7 +423,8 @@ static bool check_required_features(struct vk_ctx *vk)
 // List of mandatory device-level functions
 //
 // Note: Also includes VK_EXT_debug_utils functions, even though they aren't
-// mandatory, simply because we load that extension in a special way.
+// mandatory. Resolve them through the instance: a device lookup may expose
+// entry points even when the instance extension was not enabled.
 static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(AllocateCommandBuffers),
     PL_VK_DEV_FUN(AllocateDescriptorSets),
@@ -421,7 +432,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(BeginCommandBuffer),
     PL_VK_DEV_FUN(BindBufferMemory),
     PL_VK_DEV_FUN(BindImageMemory),
-    PL_VK_DEV_FUN(CmdBeginDebugUtilsLabelEXT),
+    PL_VK_INST_FUN(CmdBeginDebugUtilsLabelEXT),
     PL_VK_DEV_FUN(CmdBeginRenderPass),
     PL_VK_DEV_FUN(CmdBindDescriptorSets),
     PL_VK_DEV_FUN(CmdBindIndexBuffer),
@@ -437,7 +448,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(CmdDispatchIndirect),
     PL_VK_DEV_FUN(CmdDraw),
     PL_VK_DEV_FUN(CmdDrawIndexed),
-    PL_VK_DEV_FUN(CmdEndDebugUtilsLabelEXT),
+    PL_VK_INST_FUN(CmdEndDebugUtilsLabelEXT),
     PL_VK_DEV_FUN(CmdEndRenderPass),
     PL_VK_DEV_FUN(CmdPipelineBarrier),
     PL_VK_DEV_FUN(CmdPushConstants),
@@ -500,7 +511,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(QueueWaitIdle),
     PL_VK_DEV_FUN(ResetQueryPool),
     PL_VK_DEV_FUN(ResetFences),
-    PL_VK_DEV_FUN(SetDebugUtilsObjectNameEXT),
+    PL_VK_INST_FUN(SetDebugUtilsObjectNameEXT),
     PL_VK_DEV_FUN(UpdateDescriptorSets),
     PL_VK_DEV_FUN(WaitSemaphores),
     PL_VK_DEV_FUN(WaitForFences),
@@ -1642,6 +1653,7 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
         .vulkan = pl_vk,
         .alloc = pl_vk,
         .log = log,
+        .trace_present = getenv("PL_VK_PRESENT_TRACE") != NULL,
         .inst = params->instance,
         .GetInstanceProcAddr = get_proc_addr_fallback(log, params->get_proc_addr),
     };
@@ -1766,6 +1778,7 @@ pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *par
         .vulkan = pl_vk,
         .alloc = pl_vk,
         .log = log,
+        .trace_present = getenv("PL_VK_PRESENT_TRACE") != NULL,
         .imported = true,
         .inst = params->instance,
         .physd = params->phys_device,

@@ -659,6 +659,7 @@ int main(void)
     priv->vk->CreateComputePipelines = observe_compute;
     priv->vk->CreateGraphicsPipelines = observe_graphics;
     pl_dispatch dp = pl_dispatch_create(log, gpu);
+    pl_dispatch_profile(dp, getenv("PL_TEST_SHADER_PROFILE") != NULL);
     struct pl_tex_params params = {
         .w = 4, .h = 4, .format = pl_find_named_fmt(gpu, "rgba8"),
         .renderable = true, .host_readable = true, .blit_dst = true,

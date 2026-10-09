@@ -116,6 +116,12 @@ struct pl_error_diffusion_params {
     // Error diffusion kernel to use. Optional. If unspecified, defaults to
     // `&pl_error_diffusion_sierra_lite`.
     const struct pl_error_diffusion_kernel *kernel;
+
+    // Description-only metadata, copied during shader construction when the
+    // corresponding texture is absent. Real textures take precedence.
+    // Execution requires both actual texture bindings.
+    const struct pl_tex_params *input_texture;
+    const struct pl_tex_params *output_texture;
 };
 
 #define pl_error_diffusion_params(...) (&(struct pl_error_diffusion_params) { __VA_ARGS__ })

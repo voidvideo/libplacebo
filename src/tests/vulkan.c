@@ -254,6 +254,11 @@ static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
     ));
     REQUIRE(sw);
 
+#ifndef _WIN32
+    REQUIRE(pl_vulkan_swapchain_set_exclusive_target(sw, NULL) ==
+            VK_ERROR_EXTENSION_NOT_PRESENT);
+#endif
+
     // Attempt actually initializing the swapchain
     int w = 640, h = 480;
     REQUIRE(pl_swapchain_resize(sw, &w, &h));

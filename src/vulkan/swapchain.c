@@ -50,6 +50,7 @@ struct priv {
     PL_ARRAY(struct vk_swapchain*) retired;
 #ifdef PL_HAVE_WIN32
     HMONITOR exclusive_monitor;
+    bool exclusive_managed;
     bool exclusive_acquired;
     VkResult exclusive_result;
     atomic_uint_fast64_t exclusive_snapshot;
@@ -636,7 +637,8 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
 #ifdef PL_HAVE_WIN32
         .fullScreenExclusive = p->exclusive_monitor
             ? VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
-            : VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,
+            : p->exclusive_managed ? VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT
+                                   : VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,
 #else
         .fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,
 #endif
@@ -880,7 +882,8 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
 #ifdef PL_HAVE_WIN32
         .fullScreenExclusive = p->exclusive_monitor
             ? VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
-            : VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,
+            : p->exclusive_managed ? VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT
+                                   : VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,
 #else
         .fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,
 #endif
@@ -895,7 +898,9 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     if (p->exclusive_monitor)
         vk_link_struct(&sinfo, &monitor);
     else if (vk->AcquireFullScreenExclusiveModeEXT)
-        PL_INFO(sw, "[Fullscreen] Vulkan exclusive policy: allowed (driver-managed; acquisition not confirmed)");
+        PL_INFO(sw, "[Fullscreen] Vulkan exclusive policy: %s", p->exclusive_managed
+                ? "disallowed (windowed or inactive)"
+                : "allowed (driver-managed; acquisition not confirmed)");
     else
         PL_WARN(sw, "[Fullscreen] VK_EXT_full_screen_exclusive unavailable; using driver default behavior");
 #endif
@@ -1127,6 +1132,7 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     VkSemaphore sem_out = current->sems_out.elem[idx];
     current->last_imgidx = -1;
 
+    pl_clock_t t0 = vk->trace_present ? pl_clock_now() : 0;
     bool held = pl_vulkan_hold_ex(gpu, pl_vulkan_hold_params(
         .tex        = current->images.elem[idx],
         .layout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -1139,7 +1145,9 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
         return false;
     }
 
+    pl_clock_t t1 = vk->trace_present ? pl_clock_now() : 0;
     struct vk_cmd *cmd = CMD_BEGIN(GRAPHICS);
+    pl_clock_t t2 = vk->trace_present ? pl_clock_now() : 0;
     if (!cmd) {
         pl_mutex_unlock(&p->lock);
         return false;
@@ -1152,6 +1160,7 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
         pl_mutex_unlock(&p->lock);
         return false;
     }
+    pl_clock_t t3 = vk->trace_present ? pl_clock_now() : 0;
     struct vk_cmdpool *pool = vk->pool_graphics;
     VkQueue queue = pool->queues[qidx];
 
@@ -1159,6 +1168,7 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     vk_malloc_garbage_collect(vk->ma);
     cleanup_retired_swapchains(sw, 0);
 
+    pl_clock_t t4 = vk->trace_present ? pl_clock_now() : 0;
     VkSwapchainPresentFenceInfoKHR fenceInfo = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
         .swapchainCount = 1,
@@ -1180,9 +1190,22 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     }
 
     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
+    pl_clock_t t5 = vk->trace_present ? pl_clock_now() : 0;
     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
+    pl_clock_t t6 = vk->trace_present ? pl_clock_now() : 0;
     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
+    pl_clock_t t7 = vk->trace_present ? pl_clock_now() : 0;
     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
+    if (vk->trace_present) {
+        PL_INFO(vk, "[PresentTrace] present start=%"PRIu64" image=%u size=%dx%d mode=%d "
+                "hold_ms=%.3f cmd_begin_ms=%.3f cmd_submit_ms=%.3f maintenance_ms=%.3f "
+                "setup_ms=%.3f lock_ms=%.3f driver_ms=%.3f total_ms=%.3f result=%d",
+                (uint64_t) t0, idx, p->cur_width, p->cur_height, (int) p->protoInfo.presentMode,
+                pl_clock_diff(t1, t0) * 1e3, pl_clock_diff(t2, t1) * 1e3,
+                pl_clock_diff(t3, t2) * 1e3, pl_clock_diff(t4, t3) * 1e3,
+                pl_clock_diff(t5, t4) * 1e3, pl_clock_diff(t6, t5) * 1e3,
+                pl_clock_diff(t7, t6) * 1e3, pl_clock_diff(t7, t0) * 1e3, (int) res);
+    }
 #ifdef PL_HAVE_WIN32
     if (res == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
         exclusive_lost(p);
@@ -1298,7 +1321,47 @@ done:
 #endif
 }
 
-VkResult pl_vulkan_swapchain_exclusive_status(pl_swapchain sw, bool *acquired)
+VkResult pl_vulkan_swapchain_set_exclusive_target(pl_swapchain sw,
+                                                 void *native_monitor)
+{
+#ifdef PL_HAVE_WIN32
+    struct priv *p = PL_PRIV(sw);
+    struct vk_ctx *vk = p->vk;
+    pl_mutex_lock(&p->lock);
+    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+    if (p->current && p->current->last_imgidx >= 0)
+        goto done;
+    result = VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!vk->AcquireFullScreenExclusiveModeEXT ||
+        !vk->ReleaseFullScreenExclusiveModeEXT ||
+        !vk->GetPhysicalDeviceSurfaceCapabilities2KHR)
+        goto done;
+    result = VK_SUCCESS;
+    if (p->exclusive_managed &&
+        p->exclusive_monitor == (HMONITOR) native_monitor)
+        goto done;
+
+    release_exclusive(p);
+    p->exclusive_managed = true;
+    p->exclusive_monitor = (HMONITOR) native_monitor;
+    p->exclusive_result = VK_NOT_READY;
+    publish_exclusive(p);
+    p->needs_recreate = true;
+done:
+    pl_mutex_unlock(&p->lock);
+    return result;
+#else
+    (void) sw;
+    (void) native_monitor;
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+#endif
+}
+
+// Reports actual acquisition and the last acquisition/query/create/loss result.
+// Does not acquire or infer exclusivity from window flags. A successful config
+// initially reports VK_NOT_READY and acquired=false. Uses a nonblocking atomic
+// snapshot; the caller must keep sw alive for the duration of this call.
+PL_API VkResult pl_vulkan_swapchain_exclusive_status(pl_swapchain sw, bool *acquired)
 {
     *acquired = false;
 #ifdef PL_HAVE_WIN32

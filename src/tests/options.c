@@ -101,17 +101,17 @@ int main()
 
     // Changing quality presets must preserve application-owned color mapping.
     pl_options_reset(test, NULL);
-    const struct pl_hook color_hook = { .stages = PL_HOOK_COLOR_MAP };
+    const struct pl_hook color_hook = { .stages = PL_HOOK_TONE_MAP };
     const struct pl_hook *color_hooks[] = { &color_hook };
-    test->params.color_map_hooks = color_hooks;
-    test->params.num_color_map_hooks = PL_ARRAY_SIZE(color_hooks);
+    test->params.hooks = color_hooks;
+    test->params.num_hooks = PL_ARRAY_SIZE(color_hooks);
     REQUIRE(pl_options_load(test, "preset=fast"));
-    REQUIRE(test->params.color_map_hooks == color_hooks);
-    REQUIRE(test->params.num_color_map_hooks == 1);
+    REQUIRE(test->params.hooks == color_hooks);
+    REQUIRE(test->params.num_hooks == 1);
     REQUIRE_STREQ(pl_options_save(test), "");
     REQUIRE(pl_options_load(test, "preset=high_quality"));
-    REQUIRE(test->params.color_map_hooks == color_hooks);
-    REQUIRE(test->params.num_color_map_hooks == 1);
+    REQUIRE(test->params.hooks == color_hooks);
+    REQUIRE(test->params.num_hooks == 1);
     REQUIRE_STREQ(pl_options_save(test), hq_opts);
 
     // Test error paths

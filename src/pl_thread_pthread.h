@@ -21,6 +21,10 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 #include <pl_assert.h>
 
@@ -134,4 +138,22 @@ static inline bool pl_thread_sleep(double t)
     ts.tv_nsec = (t - ts.tv_sec) * 1e9;
 
     return nanosleep(&ts, NULL) == 0;
+}
+
+// Logical CPUs available to the calling thread, or one if detection fails.
+static inline unsigned pl_thread_num_processors(void)
+{
+#ifdef __linux__
+    cpu_set_t affinity;
+    if (!sched_getaffinity(0, sizeof(affinity), &affinity)) {
+        int count = CPU_COUNT(&affinity);
+        return count > 0 ? (unsigned) count : 1;
+    }
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+    long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count > 0 ? (unsigned) count : 1;
+#else
+    return 1;
+#endif
 }

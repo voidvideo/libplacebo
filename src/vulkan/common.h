@@ -62,6 +62,7 @@ struct vk_ctx {
     struct vk_malloc *ma; // VRAM malloc layer
     pl_vk_inst internal_instance;
     pl_log log;
+    bool trace_present; // opt-in CPU submission/presentation diagnostics
     VkInstance inst;
     VkPhysicalDevice physd;
     VkPhysicalDeviceProperties props;

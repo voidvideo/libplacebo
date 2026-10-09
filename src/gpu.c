@@ -644,6 +644,7 @@ static bool pl_buf_params_superset(struct pl_buf_params a, struct pl_buf_params 
            (a.host_mapped    || !b.host_mapped) &&
            (a.uniform        || !b.uniform) &&
            (a.storable       || !b.storable) &&
+           (a.indirect       || !b.indirect) &&
            (a.drawable       || !b.drawable);
 }
 
@@ -1287,7 +1288,8 @@ enum pl_prepared_pass_run_result pl_pass_run_checked(
             require(gpu->limits.indirect_dispatch);
             require(ind->params.indirect);
             require(params->indirect_offset % 4 == 0);
-            require(params->indirect_offset + 3 * sizeof(uint32_t) <= ind->params.size);
+            require(params->indirect_offset <= ind->params.size);
+            require(ind->params.size - params->indirect_offset >= 3 * sizeof(uint32_t));
         } else {
             for (int i = 0; i < PL_ARRAY_SIZE(params->compute_groups); i++) {
                 require(params->compute_groups[i] >= 0);

@@ -101,9 +101,18 @@ struct pl_sampler_override {
     // sampler. OK means a NONE -> COLOR sampler was emitted. Other results
     // fail the render/preparation; never append fallback to a partial shader.
     // The snapshot owner retains this descriptor and immutable priv resources.
+    // The same source/output contract applies: append a NONE -> COLOR sampler
+    // to sh, optionally using routed auxiliary passes. The final stage remains
+    // fused with the renderer. Immutable resources belong to the snapshot owner;
+    // use invocation-local bookkeeping, not mutable shared traversal state.
+    // UNSUPPORTED must precede both shader changes and context operations.
+    // Routed failures are latched even if the callback returns OK.
+    // Also called for explicit nearest/oversample/bicubic/Hermite/Gaussian
+    // upscalers. Native direct/free sampling remains outside this boundary.
     enum pl_dispatch_result (*sample)(void *priv, pl_shader sh,
         enum pl_sampler_target target, const struct pl_sample_src *src,
-        const struct pl_sample_filter_params *params);
+        const struct pl_sample_filter_params *params,
+        const struct pl_hook_context *context);
 };
 
 enum pl_lut_type {
@@ -256,22 +265,15 @@ struct pl_render_params {
     // nor change the aspect ratio of the image.
     const struct pl_distort_params *distort_params;
 
-    // List of custom user shaders / hooks.
-    // See <libplacebo/shaders/custom.h> for more information.
+    // Custom shaders, including replacement color stages (see shaders/custom.h).
+    // Color stages run in fixed order: TONE_MAP, GAMUT_MAP, COLOR_CONVERT;
+    // hooks within a stage run in list order. An empty stage keeps its native
+    // operation. Color hooks declare explicit color_input/color_output domains.
+    // They run after scaling and before frame caching; ICC/target LUT processing
+    // remains downstream. Descriptors are borrowed during rendering or retained
+    // by the preparation snapshot owner. Ordinary hook lifecycle/cache rules apply.
     const struct pl_hook * const *hooks;
     int num_hooks;
-
-    // Optional replacement for the complete image -> target color mapping.
-    // Empty preserves native tone/gamut mapping, LUT and ICC behavior.
-    // A non-empty chain replaces those operations; every entry must declare
-    // PL_HOOK_COLOR_MAP and its final result must describe target RGB.
-    // The chain runs after scaling, with independent alpha, before the
-    // existing per-frame cache. Source decoding and presentation are unchanged.
-    // Do not also register these entries in 'hooks'. Descriptors and private
-    // resources are borrowed until rendering returns. Descriptor/signature
-    // changes invalidate cached pixels just like ordinary non-output hooks.
-    const struct pl_hook * const *color_map_hooks;
-    int num_color_map_hooks;
 
     // Color mapping LUT. If present, this will be applied as part of the
     // image being rendered, in normalized RGB space.
@@ -394,6 +396,10 @@ struct pl_render_params {
     // Note: `info` is only valid until this function returns.
     void (*info_callback)(void *priv, const struct pl_render_info *info);
     void *info_priv;
+
+    // Sample named shader sections, reported through info_callback. Optional
+    // diagnostic instrumentation; see pl_dispatch_info for units and overhead.
+    bool profile;
 
     // Optional upscaler replacement at the actual sampling boundary. NULL keeps
     // the existing renderer. This descriptor is part of the frozen snapshot.
@@ -921,8 +927,20 @@ PL_API extern const int pl_num_scale_filters; // excluding trailing {0}
 PL_DEPRECATED_IN(v6.323) PL_API size_t pl_renderer_save(pl_renderer rr, uint8_t *out_cache);
 PL_DEPRECATED_IN(v6.323) PL_API void pl_renderer_load(pl_renderer rr, const uint8_t *cache);
 
-// Progressive strict renderer interface. This does not enable preparation for
-// legacy render calls. Unsupported selected features are rejected explicitly.
+// Preparation policy. This does not alter legacy pl_render_image[_mix] calls.
+// These modes control CPU preparation; GPU rendering still happens at execution.
+enum pl_renderer_prepare_mode {
+    // Require asynchronous pass compilation. Unsupported graphs are rejected.
+    // Zero preserves the strict contract of existing preparation callers.
+    PL_RENDERER_PREPARE_ASYNC = 0,
+    // Prefer asynchronous preparation. If the selected graph cannot be
+    // described, retain a synchronous renderer instead. Errors are not fallback.
+    PL_RENDERER_PREPARE_AUTO,
+    // Use ordinary synchronous rendering at execution, without worker requests.
+    PL_RENDERER_PREPARE_SYNC,
+};
+
+// Retained renderer interface.
 // All handles are single-owner and their GPU/dispatch dependencies must outlive
 // them. snapshot owns immutable parameters, pointed-to options, hook contexts
 // and resource-layout inputs; retain/release are required, and stack snapshots
@@ -932,6 +950,7 @@ struct pl_renderer_snapshot {
     void *owner;
     void (*retain)(void *owner);
     void (*release)(void *owner);
+    enum pl_renderer_prepare_mode mode;
 };
 
 typedef struct pl_renderer_preparation_t *pl_renderer_preparation;
@@ -946,20 +965,36 @@ enum pl_renderer_prepare_result {
 
 // Describe only: no GPU resource allocation, compilation, dispatch, ordinary hook
 // invocation or reset. Source/target textures are read for metadata on this
-// caller only and are not retained. The complete selected path is collected.
+// caller only and are not retained. ASYNC collects the complete selected path;
+// SYNC retains the snapshot without describing ordinary callbacks.
 PL_API enum pl_renderer_prepare_result pl_renderer_describe_image(
     pl_renderer renderer, const struct pl_frame *image, const struct pl_frame *target,
     const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out);
 // Stage candidate-owned resources and submit asynchronous pass preparation.
+// SYNC submission marks the handle ready without compiling or rendering.
+// Worker capacity is temporary backpressure, not a failed candidate. Poll
+// collects ready passes and submits remaining descriptions as capacity frees;
+// it may stage their per-pass resources, but never compiles or runs a shader.
 PL_API enum pl_renderer_prepare_result pl_renderer_prepare_submit(pl_renderer_preparation preparation);
 PL_API enum pl_pass_prepare_state pl_renderer_prepare_poll(pl_renderer_preparation preparation);
+// Effective mode selected during description: ASYNC or SYNC, never AUTO.
+// The handle must be non-NULL. A SYNC handle may allocate/compile and invoke
+// ordinary hooks/acquire/release at execution. Its preflight checks readiness
+// only; it cannot promise whole-graph validation before GPU work.
+PL_API enum pl_renderer_prepare_mode pl_renderer_prepare_mode(pl_renderer_preparation preparation);
 PL_API const char *pl_renderer_prepare_error(pl_renderer_preparation preparation);
 PL_API void pl_renderer_prepare_destroy(pl_renderer_preparation *preparation);
-// Preflight reconstructs the whole selected graph and compares every exact
+// For ASYNC handles, preflight reconstructs the selected graph and compares every exact
 // pass before execution can begin. render_prepared performs that preflight
 // itself, then executes only through retained prepared entries. The snapshot
 // and runtime hook inputs must remain unchanged throughout the call. No frame
-// acquire/release callbacks are invoked: inputs must already be accessible.
+// acquire/release callbacks run during description or standalone preflight.
+// Describe frames with valid texture/layout metadata up front. ASYNC execution
+// acquires frames using ordinary ownership rules, then revalidates acquired
+// bindings before dispatch; incompatible changes return NOT_READY (invalid
+// frames return INVALID). Acquired frames are released on success and failure.
+// Temporal sources are acquired/released sequentially; cached sources need no
+// acquisition. SYNC handles follow ordinary renderer callback behavior.
 PL_API enum pl_renderer_prepare_result pl_renderer_preflight_image(
     pl_renderer_preparation preparation, const struct pl_frame *image,
     const struct pl_frame *target);
@@ -967,15 +1002,16 @@ PL_API enum pl_renderer_prepare_result pl_render_image_prepared(
     pl_renderer_preparation preparation, const struct pl_frame *image,
     const struct pl_frame *target);
 
-// Strict equivalents of pl_render_image_mix for a disabled frame mixer. The
-// nearest input frame is selected; the ordinary skip_caching_single_frame /
-// trivial-parameters rule selects direct rendering or candidate-owned caching.
-// Both cache population and presentation are prepared up front. Repeated input
-// signatures reuse the cached frame and do not rerun source/analysis hooks.
-// The caller must change the input signature when source content or upstream
-// hook runtime values change (e.g. combine a content revision with that signature).
-// Enabled mixing and empty input are currently UNSUPPORTED. Preparations made
-// with these APIs must also be preflighted/executed with the mix variants.
+// Prepared equivalent of pl_render_image_mix. Disabled mixing selects the
+// nearest frame. Enabled mixing describes source caches and output variants
+// for up to 16 simultaneous contributors. The supplied source window may be
+// larger; it is retained separately from the contributor limit. Runtime weights and
+// eligible contributor counts can change without compilation. A larger graph
+// requires a new preparation. Cache retention follows ordinary mixing.
+// Input signatures must change when source content or upstream hook values
+// change. ASYNC handles preflight every contributor and output before GPU work.
+// Empty input is supported by SYNC or AUTO fallback, not ASYNC.
+// Use the mix variants for both preflight and execution of these handles.
 PL_API enum pl_renderer_prepare_result pl_renderer_describe_image_mix(
     pl_renderer renderer, const struct pl_frame_mix *images, const struct pl_frame *target,
     const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out);

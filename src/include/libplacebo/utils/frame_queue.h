@@ -252,6 +252,10 @@ PL_API bool pl_queue_peek(pl_queue queue, int idx, struct pl_source_frame *out);
 //
 // Note: triggers GPU upload of the frame's textures via the source's `map`
 // callback, identical to the upload path used internally by `pl_queue_update`.
+// The returned frame is a borrowed shallow copy: this call does not retain its
+// textures or user data. The caller must prevent update/advance/reset/destroy
+// from retiring the entry until it has finished using the frame. The queue's
+// internal locks protect the call, not use of the returned frame afterward.
 PL_API bool pl_queue_peek_mapped(pl_queue queue, int idx, struct pl_frame *out);
 
 // Cull frames from the queue whose pts is <= `pts`, keeping the most recent

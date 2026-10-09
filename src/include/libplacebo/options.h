@@ -136,7 +136,7 @@ PL_API void pl_options_remove_hook_at(pl_options opts, int idx);
 //
 // Note: By necessity, this option list does not cover every single field
 // present in `pl_render_params`. In particular, fields like `info_callback`,
-// `lut`, `hooks` and `color_map_hooks` cannot be configured through the options system, as doing
+// `lut` and `hooks` cannot be configured through the options system, as doing
 // so would require interop with C code or I/O. (However, see
 // `pl_options_add_hook` and related)
 

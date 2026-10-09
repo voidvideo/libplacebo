@@ -20,6 +20,9 @@
 
 // Color space transformation shaders. These all input and output a color
 // value (PL_SHADER_SIG_COLOR).
+// Adjacent affine decode/conversion/encode operations may be composed on the
+// CPU before shader emission. Nonlinear math and custom shader body code are
+// ordering barriers; callers do not need an additional optimizer API.
 
 #include <libplacebo/colorspace.h>
 #include <libplacebo/gamut_mapping.h>
@@ -381,6 +384,41 @@ struct pl_color_map_params {
 PL_API extern const struct pl_color_map_params pl_color_map_default_params;
 PL_API extern const struct pl_color_map_params pl_color_map_high_quality_params;
 
+// Working-space extensions for representations not described by pl_color_repr.
+// NATIVE uses the existing representation and color-space descriptors, including
+// RGB, YCbCr, XYZ, ICtCp and YCgCo. This is not a second color-system enum.
+enum pl_color_working_space {
+    PL_COLOR_WORKING_NATIVE = 0,
+    PL_COLOR_WORKING_IPT,      // libplacebo's absolute PQ-LMS IPT
+    PL_COLOR_WORKING_JZAZBZ,  // absolute Safdar et al. (2017) JzAzBz
+    PL_COLOR_WORKING_LMS,     // linear LMS basis from pl_ipt_rgb2lms
+    PL_COLOR_WORKING_COUNT,
+};
+
+struct pl_color_domain {
+    // Standard libplacebo descriptors. Conversion uses the native decode,
+    // encode and transfer functions, including levels, bit encoding and alpha.
+    // Dovi metadata is borrowed, with the same lifetime as this descriptor.
+    struct pl_color_repr repr;
+    struct pl_color_space color;
+
+    // Zero/default means the native descriptors above. For working-space
+    // extensions only repr.alpha is meaningful; color and encoded representation
+    // fields are ignored. Unknown alpha means independent at this boundary.
+    enum pl_color_working_space working_space;
+
+    // Nits represented by linear RGB/LMS 1.0. Zero means PL_COLOR_SDR_WHITE.
+    // Ignored for encoded native signals and absolute opponent spaces.
+    float linear_scale;
+};
+
+// Pure representation conversion, without clipping, tone or gamut mapping.
+// Adjacent linear matrices are composed on the CPU. Matching domains emit
+// nothing. Input/output descriptors are borrowed for this call.
+PL_API void pl_shader_color_convert_ex(pl_shader sh,
+                                       const struct pl_color_domain *src,
+                                       const struct pl_color_domain *dst);
+
 // Execution arguments for the `pl_shader_color_map_ex` call. Distinct from
 // `pl_color_map_params` because it is filled by internally-provided execution
 // metadata, instead of user-tunable aesthetic parameters.
@@ -393,6 +431,14 @@ struct pl_color_map_args {
     // the caller (e.g. as part of a previous linear light scaling operation).
     bool prelinearized;
 
+    // Optional explicit pixel boundaries. NULL uses src/dst RGB, with
+    // prelinearized applying only to the implicit input. No mapping operation
+    // is implied by a boundary's model.
+    const struct pl_color_domain *input;
+    const struct pl_color_domain *output;
+    bool skip_tone_mapping;
+    bool skip_gamut_mapping;
+
     // Object to be used to store generated LUTs. Note that this is the same
     // state object used by `pl_shader_detect_peak`, and if that function has
     // been called on `state` prior to `pl_shader_color_map`, the detected
@@ -404,6 +450,11 @@ struct pl_color_map_args {
     // `pl_shader_extract_features`. Optional. No effect if
     // `params->contrast_recovery` is disabled.
     pl_tex feature_map;
+
+    // Description-only metadata for the feature map when no texture is bound.
+    // Copied by shader construction; a real feature_map takes precedence.
+    // Execution still requires the actual texture binding.
+    const struct pl_tex_params *feature_map_texture;
 };
 
 #define pl_color_map_args(...) (&(struct pl_color_map_args) { __VA_ARGS__ })

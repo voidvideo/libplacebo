@@ -145,7 +145,7 @@ bool pl_needs_fg_h274(const struct pl_film_grain_params *params)
 bool pl_shader_fg_h274(pl_shader sh, pl_shader_obj *grain_state,
                        const struct pl_film_grain_params *params)
 {
-    if (!sh_require(sh, PL_SHADER_SIG_NONE, params->tex->params.w, params->tex->params.h))
+    if (!sh_require(sh, PL_SHADER_SIG_NONE, params->texture->w, params->texture->h))
         return false;
 
     size_t shmem_req = 0;
@@ -187,6 +187,7 @@ bool pl_shader_fg_h274(pl_shader sh, pl_shader_obj *grain_state,
     // Load the color value of the tex itself
     ident_t tex = sh_desc(sh, (struct pl_shader_desc) {
         .binding.object = params->tex,
+        .texture = params->texture,
         .desc = (struct pl_desc) {
             .name = "tex",
             .type = PL_DESC_SAMPLED_TEX,

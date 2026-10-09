@@ -4,6 +4,8 @@ This example roughly builds off the [previous entry](./basic-rendering.md),
 and as such will not cover the basics of how to create a window, initialize a
 `pl_gpu` and get pixels onto the screen.
 
+For this fork’s retained preparation API, see [Renderer preparation](./renderer-preparation.md).
+
 ## Renderer
 
 The `pl_renderer` set of APIs represents the highest-level interface into
@@ -45,6 +47,51 @@ exposes. By default, libplacebo provides several presets to use:
 Covering all of the possible options exposed by `pl_render_params` is
 out-of-scope of this example and would be better served by looking at [the API
 documentation](https://code.videolan.org/videolan/libplacebo/-/blob/master/src/include/libplacebo/renderer.h#L94).
+
+### Replacing color operations (fork API)
+
+`pl_render_params.hooks` supports three independent stages, in execution
+order: `PL_HOOK_TONE_MAP`, `PL_HOOK_GAMUT_MAP`, and `PL_HOOK_COLOR_CONVERT`.
+An empty stage retains native behavior. Register each replacement only in this
+array, with exactly one stage and explicit `color_input` and `color_output`.
+The renderer bridges adjacent domains; matching domains emit no conversion.
+
+For example, a gamut hook working in linear BT.2020 can declare:
+
+```c
+struct pl_color_domain working = {
+    .repr = {.sys = PL_COLOR_SYSTEM_RGB, .alpha = PL_ALPHA_INDEPENDENT},
+    .color = {
+        .primaries = PL_COLOR_PRIM_BT_2020,
+        .transfer = PL_COLOR_TRC_LINEAR,
+    },
+    .linear_scale = PL_COLOR_SDR_WHITE,
+};
+struct pl_hook gamut = {
+    .stages = PL_HOOK_GAMUT_MAP,
+    .input = PL_HOOK_SIG_COLOR,
+    .color_input = working,
+    .color_output = working,
+    .hook = my_gamut_hook,
+    .signature = my_configuration_signature,
+};
+const struct pl_hook *hooks[] = { &gamut };
+render_params.hooks = hooks;
+render_params.num_hooks = 1;
+```
+
+The callback returns COLOR or TEX while preserving alpha and dimensions. COLOR
+can append to the supplied shader to preserve fusion. IPT and JzAzBz are also
+available domains; neither is required by a stage. A custom final converter
+that emits encoded destination RGB replaces the native conversion/encoding;
+other output domains are bridged to the actual target. ICC and target LUTs stay
+downstream. Existing conversion-LUT precedence is retained.
+
+Descriptors are borrowed during ordinary rendering and retained by the snapshot
+owner during preparation. Prepared stages use the same `describe` and
+`execute_prepared` contract as other hooks. Descriptor changes invalidate cached
+frames; private shader changes must change the signature. See the declarations
+in `shaders/custom.h` and `shaders/colorspace.h` for the complete pixel contract.
 
 ### Frames
 
@@ -300,3 +347,16 @@ adjacent fields/frames. To take advantage of this, all you need to do is set
 the appropriate field (`pl_source_frame.first_frame`), as well as enabling
 [deinterlacing
 parameters](https://code.videolan.org/videolan/libplacebo/-/blob/master/src/include/libplacebo/renderer.h#L186).
+
+### Conversion implementation
+
+Native color boundaries reuse `pl_color_repr` and `pl_color_space`, including
+native range and bit encoding. Working-space extensions cover absolute IPT,
+JzAzBz, and the linear LMS basis used by `pl_ipt_rgb2lms`. Dolby Vision output
+still has no native inverse reshaping implementation.
+
+Adjacent affine operations in native decoding, primaries conversion and encoding
+compose on the CPU using `pl_transform3x3`. Arbitrary shader body emission is an
+ordering barrier; nonlinear math is not collapsed. Dispatch resolves the chain
+before resource layout and cache hashing. No public optimizer is introduced. Multi-transform results reuse the
+GPU-attached `pl_cache`; cache keys include the ordered matrices and offsets.

@@ -12,6 +12,8 @@
 // Bounds queued work and unclaimed results alike. Admission never waits for a
 // slot: callers retire obsolete requests and explicitly retry rejected work.
 #define PREPARE_CAPACITY 64
+// Bound compiler memory and CPU use independently of queue capacity.
+#define PREPARE_WORKERS 4
 
 struct pl_prepared_pass_t {
     pl_gpu gpu;
@@ -26,13 +28,15 @@ struct pl_pass_preparation_t {
     enum pl_pass_prepare_state state;
     enum pl_pass_prepare_phase phase;
     bool released;
+    bool running; // Exclusively owned by one worker until its backend call returns.
 };
 
 struct pl_pass_prepare_service {
     pl_gpu gpu;
     pl_mutex lock;
     pl_cond wake;
-    pl_thread worker;
+    pl_thread workers[PREPARE_WORKERS];
+    unsigned num_workers;
     pl_pass_preparation requests;
     unsigned count;
     bool stopping;
@@ -60,6 +64,8 @@ static PL_THREAD_VOID prepare_worker(void *arg)
                 r->state = PL_PASS_PREPARE_CANCELLED;
                 r->released = true;
             }
+            if (r->running)
+                continue;
             if (r->state == PL_PASS_PREPARE_PENDING || r->released ||
                 (r->state == PL_PASS_PREPARE_CANCELLED && r->prepared))
                 break;
@@ -88,6 +94,7 @@ static PL_THREAD_VOID prepare_worker(void *arg)
             continue;
         }
 
+        r->running = true;
         pl_prepared_pass prepared = r->prepared;
         pl_mutex_unlock(&s->lock);
         enum pl_pass_prepare_phase phase = PL_PASS_PREPARE_PHASE_RESOURCES;
@@ -97,6 +104,7 @@ static PL_THREAD_VOID prepare_worker(void *arg)
         prepared->pass = impl->pass_create_prepared(s->gpu, &prepared->params,
                                                    &phase);
         pl_mutex_lock(&s->lock);
+        r->running = false;
         if (r->state == PL_PASS_PREPARE_PENDING) {
             r->state = prepared->pass ? PL_PASS_PREPARE_READY : PL_PASS_PREPARE_FAILED;
             r->phase = prepared->pass ? PL_PASS_PREPARE_PHASE_NONE : phase;
@@ -132,7 +140,15 @@ void pl_pass_prepare_init(pl_gpu gpu)
         pl_free(s);
         return;
     }
-    if (pl_thread_create(&s->worker, prepare_worker, s)) {
+    const unsigned cpus = pl_thread_num_processors();
+    const unsigned workers = PL_MIN(PREPARE_WORKERS, cpus > 1 ? cpus - 1 : 1);
+    for (unsigned i = 0; i < workers; i++) {
+        if (pl_thread_create(&s->workers[i], prepare_worker, s))
+            break;
+        s->num_workers++;
+    }
+    // Partial startup remains useful; unavailable only if no worker started.
+    if (!s->num_workers) {
         pl_cond_destroy(&s->wake);
         pl_mutex_destroy(&s->lock);
         pl_free(s);
@@ -149,11 +165,12 @@ void pl_pass_prepare_uninit(pl_gpu gpu)
         return;
     pl_mutex_lock(&s->lock);
     s->stopping = true;
-    pl_cond_signal(&s->wake);
+    pl_cond_broadcast(&s->wake);
     pl_mutex_unlock(&s->lock);
     // This is the only worker join. The caller is explicitly destroying the
     // GPU; requests/cache/backend resources are still alive until it finishes.
-    pl_thread_join(s->worker);
+    for (unsigned i = 0; i < s->num_workers; i++)
+        pl_thread_join(s->workers[i]);
     pl_cond_destroy(&s->wake);
     pl_mutex_destroy(&s->lock);
     pl_free(s);

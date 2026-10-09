@@ -435,6 +435,18 @@ PL_API bool pl_vulkan_swapchain_suboptimal(pl_swapchain sw);
 PL_API VkResult pl_vulkan_swapchain_request_exclusive(pl_swapchain sw,
                                                      void *native_monitor);
 
+// Change policy between frames, with no image currently acquired by the caller.
+// Non-null selects application-controlled exclusive access on that HMONITOR;
+// null releases it and disallows driver-managed exclusive acquisition.
+// The next resize/start_frame recreates the swapchain with the new policy.
+// VK_SUCCESS configures the request; it does not confirm acquisition.
+// Repeating the configured target is a no-op. Returns
+// VK_ERROR_INITIALIZATION_FAILED if an image is currently acquired, or
+// VK_ERROR_EXTENSION_NOT_PRESENT when the required Vulkan functions/platform
+// are unavailable. These failures leave the configured policy unchanged.
+PL_API VkResult pl_vulkan_swapchain_set_exclusive_target(pl_swapchain sw,
+                                                        void *native_monitor);
+
 // Reports actual acquisition and the last acquisition/query/create/loss result.
 // Does not acquire or infer exclusivity from window flags. A successful config
 // initially reports VK_NOT_READY and acquired=false. Uses a nonblocking atomic

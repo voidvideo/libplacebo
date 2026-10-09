@@ -66,11 +66,21 @@ struct pl_shader_params {
     // shaders which expect to have their values change constantly.
     bool dynamic_constants;
 
+    // Optional sampled section diagnostics. Requires dispatch through
+    // pl_dispatch. Unsupported GPUs produce normal shaders without scopes.
+    // Instrumentation changes shader identity; prepare a new candidate when
+    // toggling this. Does not change the mathematical operations or fusion.
+    bool profile;
+
+
     // Build resource descriptions only. Shader objects must be candidate-owned,
     // never shared with a live renderer. LUT generation retains CPU data and
     // reports the LUT object for explicit resource staging before readiness;
     // it does not create/upload textures. Matching already staged candidate
-    // LUTs may be described read-only, but changed LUTs require a new candidate.
+    // LUT layouts/signatures are immutable after staging. Internal dynamic
+    // tone and AV1 grain LUTs may refresh candidate-owned CPU contents with the same layout;
+    // the corresponding upload is deferred until execution. Other changed
+    // LUTs require a new candidate.
     // This flag is not permission to replay arbitrary custom shader hooks.
     bool description_only;
     void (*describe_lut)(void *priv, pl_shader_obj lut);
@@ -130,6 +140,21 @@ enum pl_shader_sig {
                            // specifics depend on how the shader was generated
 };
 
+// A section ID is local to the final fused shader, not a persistent UI ID.
+struct pl_shader_section {
+    unsigned id;
+    const char *name;
+};
+
+// Optional diagnostic scopes around generated shader body code. Names are
+// copied. Returns zero when disabled/unavailable; ending zero is a no-op.
+// End each scope once, in the same shader builder and lexical control-flow
+// region. Nested scopes are inclusive. Early return/discard yields no sample.
+// Tokens must not be reused after reset/fusion/finalization. These functions
+// neither introduce a GLSL block nor split a shader into additional passes.
+PL_API unsigned pl_shader_profile_begin(pl_shader sh, const char *name);
+PL_API void pl_shader_profile_end(pl_shader sh, unsigned section);
+
 // Structure encapsulating information about a shader. This is internally
 // refcounted, to allow moving it around without having to create deep copies.
 typedef const struct pl_shader_info_t {
@@ -144,6 +169,10 @@ typedef const struct pl_shader_info_t {
     // As a convenience, this contains a pretty-printed version of the
     // above list, with entries tallied and separated by commas
     const char *description;
+
+    // Section attribution survives fusion and follows this refcounted object.
+    const struct pl_shader_section *sections;
+    int num_sections;
 } *pl_shader_info;
 
 PL_API pl_shader_info pl_shader_info_ref(pl_shader_info info);

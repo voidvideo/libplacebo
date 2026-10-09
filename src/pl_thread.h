@@ -58,6 +58,9 @@ typedef void pl_thread;
 int pl_thread_create(pl_thread *thread, PL_THREAD_VOID (*fun)(void *), void *arg);
 int pl_thread_join(pl_thread thread);
 
+// Logical CPUs available to this process/thread; conservative fallback is one.
+unsigned pl_thread_num_processors(void);
+
 // Returns true if slept the full time, false otherwise
 bool pl_thread_sleep(double t);
 

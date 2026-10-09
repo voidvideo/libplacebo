@@ -305,6 +305,7 @@ struct sh_lut_obj {
     bool error; // reset if params change
     bool description_owned;
     bool staged;
+    bool upload_pending;
     struct pl_tex_params texture;
     char *texture_tag;
 
@@ -517,8 +518,15 @@ next_dim: ; // `continue` out of the inner loop
     update |= method != lut->method;
 
     // Once staged, a candidate's resource identity is immutable. Preflight can
-    // emit its description repeatedly, but never regenerate its contents.
-    if (lut->description_owned && lut->staged && update) {
+    // emit its description repeatedly. Only explicitly mutable, same-layout
+    // LUTs may refresh CPU contents; GPU uploads wait for execution.
+    const bool dynamic_update = params->update_prepared && params->dynamic &&
+        type == lut->type &&
+        method == lut->method && vartype == lut->vartype && params->fmt == lut->fmt &&
+        params->width == lut->width && params->height == lut->height &&
+        params->depth == lut->depth && params->comps == lut->comps &&
+        (type == SH_LUT_UNIFORM || (type == SH_LUT_TEXTURE && lut->texture.host_writable));
+    if (lut->description_owned && lut->staged && update && !dynamic_update) {
         SH_FAIL(sh, "Prepared LUT changed; a new preparation candidate is required");
         return NULL_IDENT;
     }
@@ -582,6 +590,7 @@ next_dim: ; // `continue` out of the inner loop
                 lut->texture = tex_params;
                 lut->texture.initial_data = NULL;
                 lut->texture.debug_tag = lut->texture_tag;
+                lut->upload_pending = lut->staged;
                 break;
             }
 
@@ -601,6 +610,8 @@ next_dim: ; // `continue` out of the inner loop
                 ok = lut->tex;
             }
 
+            lut->upload_pending = false;
+            pl_free_ptr(&lut->data);
             if (!ok) {
                 PL_ERR(sh, "Failed creating LUT texture!");
                 goto error;
@@ -670,6 +681,13 @@ next_dim: ; // `continue` out of the inner loop
         lut->comps = params->comps;
         lut->signature = params->signature;
         pl_cache_set(params->cache, &obj);
+    }
+
+    if (!describe && lut->upload_pending) {
+        if (!pl_tex_upload(gpu, pl_tex_transfer_params(.tex = lut->tex, .ptr = lut->data)))
+            goto error;
+        pl_free_ptr(&lut->data);
+        lut->upload_pending = false;
     }
 
     // Done updating, generate the GLSL

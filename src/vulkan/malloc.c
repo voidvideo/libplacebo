@@ -61,7 +61,7 @@
 // each of which contains a list of slabs of differing page sizes.
 struct vk_slab {
     pl_mutex lock;
-    pl_debug_tag debug_tag; // debug tag of the triggering allocation
+    char *debug_tag; // owned tag; the triggering allocation may be retired first
     VkDeviceMemory mem;     // underlying device allocation
     VkDeviceSize size;      // total allocated size of `mem`
     VkMemoryType mtype;     // underlying memory type
@@ -385,7 +385,7 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
         .age = ma->age,
         .size = params->reqs.size,
         .handle_type = params->export_handle,
-        .debug_tag = params->debug_tag,
+        .debug_tag = params->debug_tag ? pl_strdup0(slab, pl_str0(params->debug_tag)) : NULL,
     };
     pl_mutex_init(&slab->lock);
 
@@ -1060,8 +1060,11 @@ bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
         // consumers are always aligned properly.
         size = PL_ALIGN(size, align);
         slab->used += size;
-        if (params->debug_tag)
-            slab->debug_tag = params->debug_tag;
+        if (params->debug_tag && (!slab->debug_tag || strcmp(slab->debug_tag, params->debug_tag))) {
+            char *tag = pl_strdup0(slab, pl_str0(params->debug_tag));
+            pl_free(slab->debug_tag);
+            slab->debug_tag = tag;
+        }
         pl_mutex_unlock(&slab->lock);
     }
 

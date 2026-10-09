@@ -62,6 +62,7 @@ static struct sh_info *sh_info_recycle(struct sh_info *info)
     pl_rc_ref(&info->rc);
     info->desc.len = 0;
     info->steps.num = 0;
+    info->sections.num = 0;
     return info;
 }
 
@@ -153,6 +154,7 @@ void pl_shader_reset(pl_shader sh, const struct pl_shader_params *params)
         .vars.elem      = sh->vars.elem,
         .descs.elem     = sh->descs.elem,
         .consts.elem    = sh->consts.elem,
+        .color_transforms.elem = sh->color_transforms.elem,
     };
 
     // Preserve buffer allocations
@@ -358,6 +360,58 @@ ident_t sh_var_mat3(pl_shader sh, const char *name, pl_matrix3x3 val)
         .var     = pl_var_mat3(name),
         .data    = PL_TRANSPOSE_3X3(val.m),
     });
+}
+
+void sh_color_transform(pl_shader sh, const pl_transform3x3 *transform)
+{
+    if (memcmp(transform, &pl_transform3x3_identity, sizeof(*transform)))
+        PL_ARRAY_APPEND(sh, sh->color_transforms, *transform);
+}
+
+void sh_color_matrix(pl_shader sh, pl_matrix3x3 matrix)
+{
+    sh_color_transform(sh, &(pl_transform3x3) {.mat = matrix});
+}
+
+void sh_color_transform_flush(pl_shader sh)
+{
+    const int count = sh->color_transforms.num;
+    if (!count)
+        return;
+    sh->color_transforms.num = 0; // GLSL emission below must not recurse
+    const pl_transform3x3 *chain = sh->color_transforms.elem;
+    pl_transform3x3 combined = chain[0];
+    pl_cache cache = count > 1 ? SH_CACHE(sh) : NULL;
+    pl_cache_obj obj = {.key = CACHE_KEY_COLOR_MATRIX};
+    if (cache)
+        pl_hash_merge(&obj.key, pl_mem_hash(chain, count * sizeof(*chain)));
+    if (pl_cache_get(cache, &obj) && obj.size == sizeof(combined)) {
+        memcpy(&combined, obj.data, sizeof(combined));
+    } else {
+        // For y = A*x + a followed by z = B*y + b:
+        // z = (B*A)*x + (B*a + b).
+        for (int i = 1; i < count; i++) {
+            pl_transform3x3_apply(&chain[i], combined.c);
+            pl_matrix3x3_rmul(&chain[i].mat, &combined.mat);
+        }
+        if (cache) {
+            pl_cache_obj_resize(NULL, &obj, sizeof(combined));
+            memcpy(obj.data, &combined, sizeof(combined));
+        }
+    }
+    pl_cache_set(cache, &obj);
+    const pl_transform3x3 *tr = &combined;
+    if (!memcmp(tr, &pl_transform3x3_identity, sizeof(*tr)))
+        return;
+    ident_t matrix = sh_var_mat3(sh, "color_matrix", tr->mat);
+    if (tr->c[0] || tr->c[1] || tr->c[2]) {
+        ident_t offset = sh_var(sh, (struct pl_shader_var) {
+            .var = pl_var_vec3("color_offset"), .data = tr->c,
+        });
+        GLSL("color.rgb = "$" * color.rgb + "$"; \n", matrix, offset);
+    } else {
+        GLSL("color.rgb = "$" * color.rgb; \n", matrix);
+    }
 }
 
 ident_t sh_desc(pl_shader sh, struct pl_shader_desc sd)
@@ -645,6 +699,50 @@ size_t sh_buf_desc_size(const struct pl_shader_desc *buf_desc)
     return last->layout.offset + last->layout.size;
 }
 
+bool sh_profile_enabled(pl_shader sh)
+{
+    pl_gpu gpu = SH_GPU(sh);
+    return SH_PARAMS(sh).profile && gpu && gpu->glsl.vulkan &&
+           gpu->glsl.fragment_stores && gpu->limits.max_ssbo_size >= 32768 &&
+           (gpu->glsl.shader_clock_subgroup || gpu->glsl.shader_clock_device);
+}
+
+unsigned pl_shader_profile_begin(pl_shader sh, const char *name)
+{
+    if (!sh->mutable || sh->failed || !sh_profile_enabled(sh))
+        return 0;
+    ident_t id = sh_fresh(sh, "section");
+    PL_ARRAY_APPEND(sh->info, sh->info->sections, (struct pl_shader_section) {
+        .id = id, .name = pl_strdup0(sh->info->tmp, pl_str0(name ? name : "(unnamed)")),
+    });
+    // Private globals avoid changing the lexical scope of generated code.
+    GLSLH("uvec3 "$" = uvec3(0u);\n", id);
+    GLSL("if (_pl_profile_selected()) "$" = uvec3(_pl_profile_clock(), 1u);\n", id);
+    return id;
+}
+
+void pl_shader_profile_end(pl_shader sh, unsigned section)
+{
+    if (!section || !sh->mutable || sh->failed)
+        return;
+    GLSL("if ("$".z != 0u) { _pl_profile_record(%uu, "$".xy, "
+         "_pl_profile_clock()); "$".z = 0u; }\n",
+         (ident_t) section, section, (ident_t) section, (ident_t) section);
+}
+
+void sh_profile_close(pl_shader sh)
+{
+    pl_shader_profile_end(sh, sh->profile_auto);
+    sh->profile_auto = 0;
+}
+
+void sh_describe(pl_shader sh, const char *desc)
+{
+    sh_profile_close(sh);
+    PL_ARRAY_APPEND(sh->info, sh->info->steps, desc);
+    sh->profile_auto = pl_shader_profile_begin(sh, desc);
+}
+
 void sh_describef(pl_shader sh, const char *fmt, ...)
 {
     va_list ap;
@@ -719,6 +817,11 @@ ident_t sh_subpass(pl_shader sh, pl_shader sub)
     sh->output_w = res_w;
     sh->output_h = res_h;
 
+    sh_profile_close(sub);
+    SH_PARAMS(sh).profile |= SH_PARAMS(sub).profile;
+
+    sh_color_transform_flush(sub);
+
     // Append the prelude and header
     pl_str_builder_concat(sh->buffers[SH_BUF_PRELUDE], sub->buffers[SH_BUF_PRELUDE]);
     pl_str_builder_concat(sh->buffers[SH_BUF_HEADER], sub->buffers[SH_BUF_HEADER]);
@@ -761,6 +864,9 @@ ident_t sh_subpass(pl_shader sh, pl_shader sub)
     sub->tmp = pl_tmp(sub);
     sub->failed = true;
 
+    PL_ARRAY_CONCAT(sh->info, sh->info->sections, sub->info->sections);
+    sub->info->sections.num = 0;
+
     // Steal the shader steps array (and allocations)
     pl_assert(pl_rc_count(&sub->info->rc) == 1);
     PL_ARRAY_CONCAT(sh->info, sh->info->steps, sub->info->steps);
@@ -776,6 +882,9 @@ pl_str_builder sh_finalize_internal(pl_shader sh)
     pl_assert(sh->mutable); // this function should only ever be called once
     if (sh->failed)
         return NULL;
+
+    sh_profile_close(sh);
+    sh_color_transform_flush(sh);
 
     // Padding for readability
     GLSLP("\n");
@@ -799,6 +908,8 @@ pl_str_builder sh_finalize_internal(pl_shader sh)
 
     // Generate the shader info
     struct sh_info *info = sh->info;
+    info->info.sections = info->sections.elem;
+    info->info.num_sections = info->sections.num;
     info->info.steps = info->steps.elem;
     info->info.num_steps = info->steps.num;
     info->info.description = "(unknown shader)";

@@ -71,6 +71,16 @@ struct pl_sample_src {
 
 #define pl_sample_src(...) (&(struct pl_sample_src) { __VA_ARGS__ })
 
+struct pl_custom_shader;
+// Emit a custom sampler using native source binding, crop/siting coordinates
+// and normalization. The custom body assigns raw sampled values to `color`;
+// normalization is applied once afterwards. Available aliases in header/body:
+// SRC (sampler), src_pos (sampling coordinate), src_pt (one texel in sampler
+// units). All other resources/compute requirements come from the custom shader.
+// Source output dimensions determine the shader size. No intermediate is added.
+PL_API bool pl_shader_sample_custom(pl_shader sh, const struct pl_sample_src *src,
+    enum pl_tex_sample_mode mode, const struct pl_custom_shader *custom);
+
 struct pl_deband_params {
     // The number of debanding steps to perform per sample. Each step reduces a
     // bit more banding, but takes time to compute. Note that the strength of
@@ -246,6 +256,10 @@ struct pl_distort_params {
     //
     // Note: `address_mode` has no effect when this is specified.
     enum pl_alpha_mode alpha_mode;
+
+    // Description-only source metadata when no texture is bound. Copied during
+    // construction; a real texture takes precedence and is required to execute.
+    const struct pl_tex_params *texture;
 };
 
 #define PL_DISTORT_DEFAULTS \

@@ -92,6 +92,13 @@ struct pl_glsl_version {
     // doing all its math by converting to fp32.
     bool fp16_storage;
 
+    // 64-bit shader clocks, exposed independently of subgroup operations and
+    // integer arithmetic. Units are implementation-defined clock ticks, NOT ns.
+    bool shader_clock_subgroup; // GL_ARB_shader_clock (clock2x32ARB)
+    bool shader_clock_device;   // GL_EXT_shader_realtime_clock
+    // Storage writes/atomics from fragment shaders (compute always permits it).
+    bool fragment_stores;
+
     // Miscellaneous shader limits
     int16_t min_gather_offset;  // minimum `textureGatherOffset` offset
     int16_t max_gather_offset;  // maximum `textureGatherOffset` offset

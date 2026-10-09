@@ -80,9 +80,11 @@ struct sh_info {
     pl_rc_t rc;
     pl_str desc;
     PL_ARRAY(const char *) steps;
+    PL_ARRAY(struct pl_shader_section) sections;
 };
 
 struct pl_shader_t {
+    unsigned profile_auto;
     pl_log log;
     void *tmp; // temporary allocations (freed on pl_shader_reset)
     struct sh_info *info;
@@ -95,6 +97,7 @@ struct pl_shader_t {
     int output_w;
     int output_h;
     bool transpose;
+    PL_ARRAY(pl_transform3x3) color_transforms;
     pl_str_builder buffers[SH_BUF_COUNT];
     enum pl_shader_type type;
     bool flexible_work_groups;
@@ -226,18 +229,29 @@ bool sh_buf_desc_append(void *alloc, pl_gpu gpu,
 size_t sh_buf_desc_size(const struct pl_shader_desc *buf_desc);
 
 
+// Accumulate adjacent color transforms with native CPU matrix operations.
+// Any subsequent shader-body emission is a conservative ordering barrier.
+void sh_color_transform(pl_shader sh, const pl_transform3x3 *transform);
+void sh_color_matrix(pl_shader sh, pl_matrix3x3 matrix);
+void sh_color_transform_flush(pl_shader sh);
+
 // Underlying function for appending text to a shader
 #define sh_append(sh, buf, ...) \
-    pl_str_builder_addf((sh)->buffers[buf], __VA_ARGS__)
+    do { \
+        if ((buf) == SH_BUF_BODY) sh_color_transform_flush(sh); \
+        pl_str_builder_addf((sh)->buffers[buf], __VA_ARGS__); \
+    } while (0)
 
 #define sh_append_str(sh, buf, str) \
-    pl_str_builder_str((sh)->buffers[buf], str)
+    ((buf) == SH_BUF_BODY ? sh_color_transform_flush(sh) : (void) 0, \
+     pl_str_builder_str((sh)->buffers[buf], str))
 
 // Append text BY REFERENCE. Only the pointer is recorded, so the caller must
 // guarantee the text is immutable and outlives every pass generated from it --
 // see `pl_custom_shader.static_text`, which is the only thing that sets this.
 #define sh_append_const_str(sh, buf, str) \
-    pl_str_builder_const_str((sh)->buffers[buf], str)
+    ((buf) == SH_BUF_BODY ? sh_color_transform_flush(sh) : (void) 0, \
+     pl_str_builder_const_str((sh)->buffers[buf], str))
 
 #define GLSLP(...) sh_append(sh, SH_BUF_PRELUDE, __VA_ARGS__)
 #define GLSLH(...) sh_append(sh, SH_BUF_HEADER, __VA_ARGS__)
@@ -248,10 +262,9 @@ size_t sh_buf_desc_size(const struct pl_shader_desc *buf_desc);
 void sh_describef(pl_shader sh, const char *fmt, ...)
     PL_PRINTF(2, 3);
 
-static inline void sh_describe(pl_shader sh, const char *desc)
-{
-    PL_ARRAY_APPEND(sh->info, sh->info->steps, desc);
-};
+void sh_describe(pl_shader sh, const char *desc);
+bool sh_profile_enabled(pl_shader sh);
+void sh_profile_close(pl_shader sh);
 
 // Requires that the share is mutable, has an output signature compatible
 // with the given input signature, as well as an output size compatible with
@@ -358,6 +371,12 @@ struct sh_lut_params {
     // If set to true, shader objects will be preserved and updated in-place
     // rather than being treated as read-only.
     bool dynamic;
+
+    // Permit content updates of a staged dynamic LUT with unchanged layout,
+    // including changes to the content signature. This does not permit a new
+    // format, dimensions, interpolation method, or resource identity.
+    // Description retains CPU data; execution uploads to the staged texture.
+    bool update_prepared;
 
     // If set , generated shader objects are automatically cached in this
     // cache. Requires `signature` to be set (and uniquely identify the LUT).

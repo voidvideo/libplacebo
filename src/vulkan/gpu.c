@@ -501,6 +501,12 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
         },
     };
 
+    const VkPhysicalDeviceShaderClockFeaturesKHR *clocks = vk_find_struct(
+        &vk->features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR);
+    gpu->glsl.shader_clock_subgroup = clocks && clocks->shaderSubgroupClock;
+    gpu->glsl.shader_clock_device = clocks && clocks->shaderDeviceClock;
+    gpu->glsl.fragment_stores = vk->features.features.fragmentStoresAndAtomics;
+
     VkShaderStageFlags req_stages = VK_SHADER_STAGE_FRAGMENT_BIT |
                                     VK_SHADER_STAGE_COMPUTE_BIT;
     VkSubgroupFeatureFlags req_flags = VK_SUBGROUP_FEATURE_BASIC_BIT |

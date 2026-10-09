@@ -43,6 +43,16 @@ static void sh_grain_uninit(pl_gpu gpu, void *ptr)
 bool pl_shader_film_grain(pl_shader sh, pl_shader_obj *grain_state,
                           const struct pl_film_grain_params *params)
 {
+    struct pl_film_grain_params resolved = *params;
+    if (resolved.tex)
+        resolved.texture = &resolved.tex->params;
+    if (resolved.luma_tex)
+        resolved.luma_texture = &resolved.luma_tex->params;
+    params = &resolved;
+    if (!params->texture) {
+        SH_FAIL(sh, "Film grain requires a texture description");
+        return false;
+    }
     if (!pl_needs_film_grain(params)) {
         // FIXME: Instead of erroring, sample directly
         SH_FAIL(sh, "pl_shader_film_grain called but no film grain needs to be "

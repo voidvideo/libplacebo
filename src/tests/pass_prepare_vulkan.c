@@ -96,6 +96,71 @@ static void test_raster(pl_gpu gpu)
     pl_tex_destroy(gpu, &target);
 }
 
+// Storage conversions deliberately do not request shaderFloat16 arithmetic.
+// The only optional requirement is storageBuffer16BitAccess.
+static void test_fp16_storage(pl_gpu gpu)
+{
+    if (!gpu->glsl.fp16_storage) {
+        printf("SKIP FP16 storage roundtrip: storageBuffer16BitAccess disabled\n");
+        return;
+    }
+    const float values[] = {0.0f, -1.0f, 0.5f, 1.0009765625f, 0.00006103515625f, 65504.0f};
+    const uint16_t expected[] = {0x0000, 0xbc00, 0x3800, 0x3c01, 0x0400, 0x7bff};
+    const char *sources[] = {
+        "#version 450\n"
+        "#extension GL_EXT_shader_16bit_storage : require\n"
+        "layout(local_size_x=1) in;\n"
+        "layout(std430,binding=0) readonly buffer Input { float value[]; };\n"
+        "layout(std430,binding=1) writeonly buffer Output { float16_t result[]; };\n"
+        "void main() { uint i=gl_GlobalInvocationID.x; result[i]=float16_t(value[i]); }\n",
+        "#version 450\n"
+        "#extension GL_EXT_shader_16bit_storage : require\n"
+        "layout(local_size_x=1) in;\n"
+        "layout(std430,binding=0) readonly buffer Input { float16_t value[]; };\n"
+        "layout(std430,binding=1) writeonly buffer Output { float result[]; };\n"
+        "void main() { uint i=gl_GlobalInvocationID.x; result[i]=float(value[i]); }\n",
+    };
+    pl_buf buffers[] = {
+        pl_buf_create(gpu, pl_buf_params(.size = sizeof(values), .storable = true,
+                                        .initial_data = values)),
+        pl_buf_create(gpu, pl_buf_params(.size = sizeof(expected), .storable = true,
+                                        .host_readable = true)),
+        pl_buf_create(gpu, pl_buf_params(.size = sizeof(values), .storable = true,
+                                        .host_readable = true)),
+    };
+    REQUIRE(buffers[0] && buffers[1] && buffers[2]);
+    pl_prepared_pass passes[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        const struct pl_desc descs[] = {
+            {.name = "Input", .binding = 0, .type = PL_DESC_BUF_STORAGE,
+             .access = PL_DESC_ACCESS_READONLY},
+            {.name = "Output", .binding = 1, .type = PL_DESC_BUF_STORAGE,
+             .access = PL_DESC_ACCESS_WRITEONLY},
+        };
+        pl_pass_preparation request = NULL;
+        REQUIRE(pl_pass_prepare_submit(gpu, pl_pass_params(
+            .type = PL_PASS_COMPUTE, .glsl_shader = sources[i],
+            .num_descriptors = 2, .descriptors = (struct pl_desc *) descs),
+            &request) == PL_PASS_PREPARE_ACCEPTED);
+        passes[i] = take_prepared(&request);
+        REQUIRE(pl_prepared_pass_run(passes[i], pl_pass_run_params(
+            .desc_bindings = (struct pl_desc_binding[]) {
+                {.object = buffers[i]}, {.object = buffers[i+1]}},
+            .compute_groups = {PL_ARRAY_SIZE(values), 1, 1})) == PL_PREPARED_PASS_RUN_OK);
+    }
+    uint16_t packed[PL_ARRAY_SIZE(expected)];
+    float actual[PL_ARRAY_SIZE(values)];
+    REQUIRE(pl_buf_read(gpu, buffers[1], 0, packed, sizeof(packed)));
+    REQUIRE(pl_buf_read(gpu, buffers[2], 0, actual, sizeof(actual)));
+    REQUIRE_MEMEQ(packed, expected, sizeof(expected));
+    REQUIRE_MEMEQ(actual, values, sizeof(values));
+    printf("FP16 SSBO storage roundtrip/readback passed\n");
+    for (int i = 0; i < 2; i++)
+        pl_prepared_pass_destroy(&passes[i]);
+    for (int i = 0; i < 3; i++)
+        pl_buf_destroy(gpu, &buffers[i]);
+}
+
 #ifdef VK_KHR_cooperative_matrix
 static void test_cooperative_matrix_pass(pl_vulkan vk)
 {
@@ -116,8 +181,10 @@ static void test_cooperative_matrix_pass(pl_vulkan vk)
         }
     }
 
-    if (!matrix)
+    if (!matrix || !vk->gpu->glsl.subgroup_size) {
+        printf("SKIP cooperative matrix execution: no suitable subgroup configuration\n");
         return;
+    }
 
     char source[4096];
     int len = snprintf(source, sizeof(source),
@@ -133,6 +200,11 @@ static void test_cooperative_matrix_pass(pl_vulkan vk)
         "shared float16_t b_data[%u];\n"
         "shared float c_data[%u];\n"
         "void main() {\n"
+        "  for (uint i = gl_LocalInvocationIndex; i < a_data.length(); i += gl_WorkGroupSize.x)\n"
+        "    a_data[i] = float16_t(float(int(i %% 3u) - 1));\n"
+        "  for (uint i = gl_LocalInvocationIndex; i < b_data.length(); i += gl_WorkGroupSize.x)\n"
+        "    b_data[i] = float16_t(float(int(i %% 5u) - 2));\n"
+        "  barrier();\n"
         "  coopmat<float16_t, gl_ScopeSubgroup, %u, %u, gl_MatrixUseA> a;\n"
         "  coopmat<float16_t, gl_ScopeSubgroup, %u, %u, gl_MatrixUseB> b;\n"
         "  coopmat<float, gl_ScopeSubgroup, %u, %u, gl_MatrixUseAccumulator> c =\n"
@@ -167,6 +239,30 @@ static void test_cooperative_matrix_pass(pl_vulkan vk)
     ), &request) == PL_PASS_PREPARE_ACCEPTED);
     pl_prepared_pass pass = take_prepared(&request);
     REQUIRE(pass);
+    size_t count = (size_t) matrix->m * matrix->n;
+    pl_buf result = pl_buf_create(vk->gpu, pl_buf_params(
+        .size = count * sizeof(float), .storable = true, .host_readable = true));
+    REQUIRE(result);
+    REQUIRE(pl_prepared_pass_run(pass, pl_pass_run_params(
+        .desc_bindings = &(struct pl_desc_binding) { .object = result },
+        .compute_groups = {1, 1, 1})) == PL_PREPARED_PASS_RUN_OK);
+    float *actual = pl_alloc(NULL, count * sizeof(float));
+    REQUIRE(pl_buf_read(vk->gpu, result, 0, actual, count * sizeof(float)));
+    for (unsigned row = 0; row < matrix->m; row++) {
+        for (unsigned col = 0; col < matrix->n; col++) {
+            float expected = 0;
+            for (unsigned k = 0; k < matrix->k; k++) {
+                int a = (row * matrix->k + k) % 3;
+                int b = (k * matrix->n + col) % 5;
+                expected += (a - 1) * (b - 2);
+            }
+            REQUIRE_FEQ(actual[row * matrix->n + col], expected, 1e-5);
+        }
+    }
+    printf("Cooperative matrix execution/readback passed: %ux%ux%u\n",
+           matrix->m, matrix->n, matrix->k);
+    pl_free(actual);
+    pl_buf_destroy(vk->gpu, &result);
     pl_prepared_pass_destroy(&pass);
 }
 #endif
@@ -258,6 +354,8 @@ int main(void)
     original_graphics = priv->vk->CreateGraphicsPipelines;
     priv->vk->CreateGraphicsPipelines = observed_graphics;
 
+    test_fp16_storage(gpu);
+
 #ifdef VK_KHR_cooperative_matrix
     test_cooperative_matrix_pass(vk);
 #endif
@@ -266,6 +364,37 @@ int main(void)
         .size = sizeof(uint32_t), .storable = true, .host_readable = true,
     ));
     REQUIRE(buffer);
+    // Prove actual backend calls overlap at both translation and pipeline
+    // creation, then check every independently specialized result on the GPU.
+    unsigned cpus = pl_thread_num_processors();
+    int workers = PL_MIN(4, cpus > 1 ? cpus - 1 : 1);
+    int initial_translations = atomic_load(&translations);
+    int initial_pipelines = atomic_load(&pipelines);
+    latch_arm(&translation);
+    latch_arm(&pipeline);
+    pl_pass_preparation parallel[4];
+    pl_prepared_pass results[4];
+    for (int i = 0; i < workers; i++)
+        parallel[i] = submit_compute(gpu, 101 + i);
+    pl_clock_t start = pl_clock_now();
+    while (atomic_load(&translations) < initial_translations + workers) {
+        REQUIRE(pl_clock_diff(pl_clock_now(), start) < 10.0);
+        pl_thread_sleep(0.001);
+    }
+    latch_release(&translation);
+    start = pl_clock_now();
+    while (atomic_load(&pipelines) < initial_pipelines + workers) {
+        REQUIRE(pl_clock_diff(pl_clock_now(), start) < 10.0);
+        pl_thread_sleep(0.001);
+    }
+    latch_release(&pipeline);
+    for (int i = 0; i < workers; i++)
+        results[i] = take_prepared(&parallel[i]);
+    for (int i = 0; i < workers; i++) {
+        execute_and_check(gpu, results[i], buffer, 101 + i);
+        pl_prepared_pass_destroy(&results[i]);
+    }
+
     pl_pass_preparation request = submit_compute(gpu, 23);
     pl_prepared_pass active = take_prepared(&request);
     REQUIRE(atomic_load(&translations) > 0);

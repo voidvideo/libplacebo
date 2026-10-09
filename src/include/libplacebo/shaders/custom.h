@@ -27,6 +27,7 @@
 #include <libplacebo/shaders.h>
 #include <libplacebo/dispatch.h>
 #include <libplacebo/colorspace.h>
+#include <libplacebo/shaders/colorspace.h>
 
 PL_API_BEGIN
 
@@ -157,8 +158,11 @@ enum pl_hook_stage {
     PL_HOOK_PRE_OUTPUT      = 1 << 14, // After color management, before blending/rotation
     PL_HOOK_OUTPUT          = 1 << 15, // After blending/rotation, before dithering
     // Exclusive color-mapping chain, before the renderer's frame cache.
-    // Only dispatched through pl_render_params.color_map_hooks.
-    PL_HOOK_COLOR_MAP       = 1 << 16,
+    // Replacement stages, dispatched only through pl_render_params.hooks.
+    // A hook declares exactly one stage and explicit color_input/color_output.
+    PL_HOOK_TONE_MAP        = 1 << 16,
+    PL_HOOK_GAMUT_MAP       = 1 << 17,
+    PL_HOOK_COLOR_CONVERT   = 1 << 18,
 };
 
 // Returns true if a given hook stage is resizable
@@ -182,7 +186,9 @@ static inline bool pl_hook_stage_resizable(enum pl_hook_stage stage) {
     case PL_HOOK_SCALED:
     case PL_HOOK_PRE_OUTPUT:
     case PL_HOOK_OUTPUT:
-    case PL_HOOK_COLOR_MAP:
+    case PL_HOOK_TONE_MAP:
+    case PL_HOOK_GAMUT_MAP:
+    case PL_HOOK_COLOR_CONVERT:
         return false;
     }
 
@@ -261,12 +267,9 @@ struct pl_hook_params {
     pl_rect2df src_rect;
     pl_rect2d dst_rect;
 
-    // Non-NULL only for PL_HOOK_COLOR_MAP. Borrowed for this invocation.
-    // The prepared native mapping describes the original image, real target,
-    // prelinearization and renderer-owned peak/contrast state. A replacement
-    // can delegate to pl_shader_color_map_ex without creating another state.
-    // Later hooks must use 'color' for their current pixels, not blindly
-    // reapply this original-source mapping.
+    // Non-NULL for replacement color stages. Borrowed for this invocation.
+    // src/dst describe the original mapping problem; actual shader pixels
+    // follow the hook's declared color_input/color_output domains.
     const struct pl_color_map_args *color_map;
     const struct pl_color_map_params *color_map_params;
 };
@@ -353,21 +356,31 @@ struct pl_hook_texture {
     enum pl_sampler_type sampler_type;
 };
 
+// Renderer-routed dispatch operations shared by prepared hooks and samplers.
+// Borrowed for one callback. Description exposes metadata-only textures;
+// execution exposes real bindings. All auxiliary dispatches must use this
+// context so ordinary and prepared traversal construct the same graph.
+struct pl_hook_context {
+    pl_gpu gpu;
+    pl_dispatch dispatch;
+    void *priv;
+    pl_shader (*begin)(void *priv, pl_dispatch destination, bool unique);
+    void (*abort)(void *priv, pl_dispatch destination, pl_shader *shader);
+    enum pl_dispatch_result (*finish)(void *priv, pl_dispatch destination,
+        const struct pl_dispatch_params *params, const struct pl_tex_params *target);
+    enum pl_dispatch_result (*compute)(void *priv, pl_dispatch destination,
+        const struct pl_dispatch_compute_params *params);
+    // Frame-local renderer storage; NULL format selects the working format.
+    // Never destroy the returned texture or retain its contents across frames.
+    const struct pl_hook_texture *(*get_tex)(void *priv, int width, int height, pl_fmt format);
+};
+
 struct pl_hook_prepare_params {
     pl_gpu gpu;
     pl_dispatch dispatch;
-    void *context;
-    // Per-preparation storage owned by the renderer. This is zero-initialized
-    // once and retained across description, preflight and prepared execution.
-    // It is private to this hook and preparation object.
+    const struct pl_hook_context *context;
+    // Zeroed once per hook/preparation and owned by the renderer.
     void *state;
-    pl_shader (*begin)(void *context, pl_dispatch destination, bool unique);
-    void (*abort)(void *context, pl_dispatch destination, pl_shader *shader);
-    enum pl_dispatch_result (*finish)(void *context, pl_dispatch destination,
-        const struct pl_dispatch_params *params, const struct pl_tex_params *target);
-    enum pl_dispatch_result (*compute)(void *context, pl_dispatch destination,
-        const struct pl_dispatch_compute_params *params);
-    const struct pl_hook_texture *(*get_tex)(void *context, int width, int height);
     enum pl_hook_stage stage;
     pl_shader sh;
     struct pl_hook_texture tex;
@@ -403,11 +416,23 @@ struct pl_hook_prepare_result {
 struct pl_hook {
     enum pl_hook_stage stages;  // Which stages to hook on
     enum pl_hook_sig input;     // Which input signature this hook expects
+
+    // Required pixel contract for replacement color stages, ignored elsewhere.
+    // Native domains reuse pl_color_repr and pl_color_space. Working-space
+    // extensions specify `working_space`. Preserve alpha and dimensions.
+    // COLOR transport can
+    // append to the supplied shader for fusion; TEX permits separate passes.
+    struct pl_color_domain color_input;
+    struct pl_color_domain color_output;
     void *priv;                 // Arbitrary user context
 
     // Custom tunable shader parameters exported by this hook. These may be
     // updated at any time by the user, to influence the behavior of the hook.
     // Contents are arbitrary and subject to the method of hook construction.
+    // For prepared MPV hooks, VARIABLE/DYNAMIC values may change between
+    // render calls, with caller serialization and stable values throughout
+    // preflight/execution. Changes affecting pass topology still require a
+    // new candidate, as do changes to CONSTANT/DEFINE parameters.
     const struct pl_hook_par *parameters;
     int num_parameters;
 

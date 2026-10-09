@@ -325,8 +325,12 @@ void pl_shader_decode_color_ex(pl_shader sh,
         return;
 
     sh_describe(sh, "color decoding");
-    GLSL("// pl_shader_decode_color \n"
-         "{ \n");
+    bool scoped = repr->sys == PL_COLOR_SYSTEM_BT_2020_C ||
+                  repr->sys == PL_COLOR_SYSTEM_BT_2100_PQ ||
+                  repr->sys == PL_COLOR_SYSTEM_BT_2100_HLG ||
+                  repr->sys == PL_COLOR_SYSTEM_DOLBYVISION;
+    if (scoped)
+        GLSL("{ \n");
 
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
     {
@@ -349,19 +353,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
     enum pl_color_system orig_sys = repr->sys;
     pl_transform3x3 tr = pl_color_repr_decode(repr, params);
 
-    if (memcmp(&tr, &pl_transform3x3_identity, sizeof(tr))) {
-        ident_t cmat = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_mat3("cmat"),
-            .data = PL_TRANSPOSE_3X3(tr.mat.m),
-        });
-
-        ident_t cmat_c = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_vec3("cmat_c"),
-            .data = tr.c,
-        });
-
-        GLSL("color.rgb = "$" * color.rgb + "$"; \n", cmat, cmat_c);
-    }
+    sh_color_transform(sh, &tr);
 
     switch (orig_sys) {
     case PL_COLOR_SYSTEM_BT_2020_C:
@@ -511,7 +503,8 @@ void pl_shader_decode_color_ex(pl_shader sh,
     }
 
     pl_shader_set_alpha(sh, repr, PL_ALPHA_INDEPENDENT);
-    GLSL("}\n");
+    if (scoped)
+        GLSL("}\n");
 }
 
 void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
@@ -529,8 +522,12 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
         return;
 
     sh_describe(sh, "color encoding");
-    GLSL("// pl_shader_encode_color \n"
-         "{ \n");
+    bool scoped = repr->sys == PL_COLOR_SYSTEM_BT_2020_C ||
+                  repr->sys == PL_COLOR_SYSTEM_BT_2100_PQ ||
+                  repr->sys == PL_COLOR_SYSTEM_BT_2100_HLG ||
+                  repr->sys == PL_COLOR_SYSTEM_DOLBYVISION;
+    if (scoped)
+        GLSL("{ \n");
 
     if (repr->alpha == PL_ALPHA_PREMULTIPLIED)
         GLSL("color.rgb *= vec3(color.a); \n");
@@ -620,20 +617,11 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
         pl_transform3x3 tr = pl_color_repr_decode(&copy, NULL);
         pl_transform3x3_invert(&tr);
 
-        ident_t cmat = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_mat3("cmat"),
-            .data = PL_TRANSPOSE_3X3(tr.mat.m),
-        });
-
-        ident_t cmat_c = sh_var(sh, (struct pl_shader_var) {
-            .var  = pl_var_vec3("cmat_c"),
-            .data = tr.c,
-        });
-
-        GLSL("color.rgb = "$" * color.rgb + "$"; \n", cmat, cmat_c);
+        sh_color_transform(sh, &tr);
     }
 
-    GLSL("}\n");
+    if (scoped)
+        GLSL("}\n");
 }
 
 static ident_t sh_luma_coeffs(pl_shader sh, const struct pl_raw_primaries *prim)
@@ -650,6 +638,15 @@ static ident_t sh_luma_coeffs(pl_shader sh, const struct pl_raw_primaries *prim)
     return coeffs;
 }
 
+static void color_scale(pl_shader sh, float scale, float offset)
+{
+    pl_transform3x3 tr = pl_transform3x3_identity;
+    pl_matrix3x3_scale(&tr.mat, scale);
+    for (int i = 0; i < 3; i++)
+        tr.c[i] = offset;
+    sh_color_transform(sh, &tr);
+}
+
 void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
@@ -657,6 +654,10 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
 
     if (csp->transfer == PL_COLOR_TRC_LINEAR)
         return;
+    if (csp->transfer == PL_COLOR_TRC_SCRGB) {
+        color_scale(sh, PL_COLOR_SCRGB_WHITE / PL_COLOR_SDR_WHITE, 0);
+        return;
+    }
 
     float csp_min, csp_max;
     pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
@@ -782,8 +783,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
 
 scale_out:
     if (csp_max != 1 || csp_min != 0) {
-        GLSL("color.rgb = "$" * color.rgb + vec3("$"); \n",
-             SH_FLOAT(csp_max - csp_min), SH_FLOAT(csp_min));
+        color_scale(sh, csp_max - csp_min, csp_min);
     }
 }
 
@@ -794,6 +794,10 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
 
     if (csp->transfer == PL_COLOR_TRC_LINEAR)
         return;
+    if (csp->transfer == PL_COLOR_TRC_SCRGB) {
+        color_scale(sh, PL_COLOR_SDR_WHITE / PL_COLOR_SCRGB_WHITE, 0);
+        return;
+    }
 
     float csp_min, csp_max;
     pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
@@ -1093,12 +1097,15 @@ struct sh_color_map_obj {
 
     // Gamut map state
     struct {
+        bool prepared;
         pl_shader_obj lut;
     } gamut;
 
     // Peak detection state
     struct {
         struct pl_peak_detect_params params;    // currently active parameters
+        bool enabled;
+        bool prepared;
         pl_buf buf;                             // pending peak detection buffer
         pl_buf readback;                        // readback buffer (fallback)
         float avg_pq;                           // current (smoothed) values
@@ -1338,57 +1345,62 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
     if (!obj)
         return false;
 
-    if (peak_detect_params_eq(&obj->peak.params, params)) {
-        update_peak_buf(gpu, obj, true); // prevent over-writing previous frame
-    } else {
-        pl_reset_detected_peak(*state);
-    }
+    const bool describe = SH_PARAMS(sh).description_only;
+    if (!describe) {
+        if (peak_detect_params_eq(&obj->peak.params, params)) {
+            update_peak_buf(gpu, obj, true); // prevent over-writing previous frame
+        } else {
+            pl_reset_detected_peak(*state);
+        }
 
-    pl_assert(!obj->peak.buf);
-    static const struct peak_buf_data zero = {0};
+        pl_assert(!obj->peak.buf);
+        static const struct peak_buf_data zero = {0};
 
 retry_ssbo:
-    if (obj->peak.readback) {
-        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
-            .size           = sizeof(struct peak_buf_data),
-            .storable       = true,
-            .initial_data   = &zero,
-        ));
-    } else {
-        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
-            .size           = sizeof(struct peak_buf_data),
-            .memory_type    = PL_BUF_MEM_DEVICE,
-            .host_readable  = true,
-            .storable       = true,
-            .initial_data   = &zero,
-        ));
-    }
+        if (obj->peak.readback) {
+            obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+                .size           = sizeof(struct peak_buf_data),
+                .storable       = true,
+                .initial_data   = &zero,
+            ));
+        } else {
+            obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+                .size           = sizeof(struct peak_buf_data),
+                .memory_type    = PL_BUF_MEM_DEVICE,
+                .host_readable  = true,
+                .storable       = true,
+                .initial_data   = &zero,
+            ));
+        }
 
-    if (!obj->peak.buf && !obj->peak.readback) {
-        PL_WARN(sh, "Failed creating host-readable peak detection SSBO, "
-                "retrying with fallback buffer");
-        obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
-            .size           = sizeof(struct peak_buf_data),
-            .host_readable  = true,
-        ));
-        if (obj->peak.readback)
-            goto retry_ssbo;
-    }
+        if (!obj->peak.buf && !obj->peak.readback) {
+            PL_WARN(sh, "Failed creating host-readable peak detection SSBO, "
+                    "retrying with fallback buffer");
+            obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
+                .size           = sizeof(struct peak_buf_data),
+                .host_readable  = true,
+            ));
+            if (obj->peak.readback)
+                goto retry_ssbo;
+        }
 
-    if (!obj->peak.buf) {
-        SH_FAIL(sh, "Failed creating peak detection SSBO!");
-        return false;
-    }
+        if (!obj->peak.buf) {
+            SH_FAIL(sh, "Failed creating peak detection SSBO!");
+            return false;
+        }
 
+    }
     obj->peak.params = *params;
-
+    obj->peak.enabled = true;
+    obj->peak.prepared |= describe;
     sh_desc(sh, (struct pl_shader_desc) {
         .desc = {
             .name   = "PeakBuf",
             .type   = PL_DESC_BUF_STORAGE,
             .access = PL_DESC_ACCESS_READWRITE,
         },
-        .binding.object  = obj->peak.buf,
+        .binding.object  = describe ? NULL : obj->peak.buf,
+        .buffer = pl_buf_params(.size = sizeof(struct peak_buf_data), .storable = true),
         .buffer_vars     = (struct pl_buffer_var *) peak_buf_vars,
         .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars),
     });
@@ -1532,14 +1544,15 @@ retry_ssbo:
     return true;
 }
 
-bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
-                                  struct pl_hdr_metadata *out)
+static bool get_detected_hdr_metadata(const pl_shader_obj state,
+                                      struct pl_hdr_metadata *out, bool readback)
 {
     if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
         return false;
 
     struct sh_color_map_obj *obj = state->priv;
-    update_peak_buf(state->gpu, obj, false);
+    if (readback)
+        update_peak_buf(state->gpu, obj, false);
     if (!obj->peak.avg_pq)
         return false;
 
@@ -1557,6 +1570,12 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
     for (int i = 0; i < PL_ARRAY_SIZE(out->scene_max); i++)
         out->scene_max[i] = scene_max;
     return true;
+}
+
+bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+                                  struct pl_hdr_metadata *out)
+{
+    return get_detected_hdr_metadata(state, out, true);
 }
 
 void pl_reset_detected_peak(pl_shader_obj state)
@@ -1677,10 +1696,10 @@ static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
                                 ident_t lut, float hue, float theta,
                                 const struct pl_gamut_map_params *params)
 {
-    ident_t ipt2lms = SH_MAT3(pl_ipt_ipt2lms);
     ident_t lms2rgb_src = SH_MAT3(pl_ipt_lms2rgb(&params->input_gamut));
     ident_t lms2rgb_dst = SH_MAT3(pl_ipt_lms2rgb(&params->output_gamut));
 
+    ident_t ipt2lms = SH_MAT3(pl_ipt_ipt2lms);
     GLSL("// Visualize gamut mapping                            \n"
          "vec2 pos = "$";                                       \n"
          "float pqmin = "$";                                    \n"
@@ -1775,23 +1794,26 @@ static void ipt_convert(pl_shader sh, ident_t rgb2lms, ident_t lms2ipt,
                         bool declare)
 {
     const char *v = declare ? "vec3 " : "";
-    GLSL("%s""lms = "$" * color.rgb;                \n"
-         "%s""lmspq = %f * lms;                     \n"
+    if (rgb2lms)
+        GLSL("%slms = "$" * color.rgb; \n", v, rgb2lms);
+    else
+        GLSL("%slms = color.rgb; \n", v);
+    GLSL("%s""lmspq = %f * lms;                     \n"
          "lmspq = pow(max(lmspq, 0.0), vec3(%f));   \n"
          "lmspq = (vec3(%f) + %f * lmspq)           \n"
          "        / (vec3(1.0) + %f * lmspq);       \n"
          "lmspq = pow(lmspq, vec3(%f));             \n"
          "%s""ipt = "$" * lmspq;                    \n",
-         v, rgb2lms,
          v, PL_COLOR_SDR_WHITE / 10000,
          PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
          v, lms2ipt);
 }
 
-static void sample_feature_map(pl_shader sh, pl_tex feature_map)
+static void sample_feature_map(pl_shader sh, const struct pl_color_map_args *args)
 {
     ident_t pos, pt;
-    ident_t lowres = sh_bind(sh, feature_map, PL_TEX_ADDRESS_CLAMP,
+    ident_t lowres = sh_bind_metadata(sh, args->feature_map, args->feature_map_texture,
+                             PL_SAMPLER_NORMAL, PL_TEX_ADDRESS_CLAMP,
                              PL_TEX_SAMPLE_LINEAR, "feature_map",
                              NULL, &pos, &pt);
     GLSL("vec2 lpos  = "$";                                 \n"
@@ -1850,6 +1872,10 @@ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
     pl_free(tmp);
 }
 
+static void color_convert(pl_shader sh, const struct pl_color_domain *src,
+                          const struct pl_color_domain *dst,
+                          const pl_matrix3x3 *linear_transform);
+
 void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
                             const struct pl_color_map_args *args)
 {
@@ -1862,7 +1888,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         // Authored dynamic metadata takes precedence over the measurement,
         // which only fills in what the source did not provide
         struct pl_hdr_metadata detected = {0};
-        if (pl_get_detected_hdr_metadata(*args->state, &detected)) {
+        if (get_detected_hdr_metadata(*args->state, &detected,
+                                      !SH_PARAMS(sh).description_only)) {
             src.hdr.max_pq_y  = PL_DEF(src.hdr.max_pq_y,  detected.max_pq_y);
             src.hdr.avg_pq_y  = PL_DEF(src.hdr.avg_pq_y,  detected.avg_pq_y);
             src.hdr.scene_avg = PL_DEF(src.hdr.scene_avg, detected.scene_avg);
@@ -1878,9 +1905,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
     pl_color_space_infer_map(&src, &dst);
+    struct pl_color_domain input = args->input ? *args->input :
+        (struct pl_color_domain) {.color = src};
+    struct pl_color_domain output = args->output ? *args->output :
+        (struct pl_color_domain) {.color = dst};
+    if (!args->input && args->prelinearized)
+        input.color.transfer = PL_COLOR_TRC_LINEAR;
     if (pl_color_space_equal(&src, &dst)) {
-        if (args->prelinearized)
-            pl_shader_delinearize(sh, &dst);
+        pl_shader_color_convert_ex(sh, &input, &output);
         return;
     }
 
@@ -1963,7 +1995,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     // linearly: trading some average brightness buys headroom for the tone
     // mapping and the highlights, which gives far better results than
     // compressing e.g. a 10000 nits source directly into a 203 nits target.
-    if (obj && scene_avg > 0 && !params->inverse_tone_mapping &&
+    if (!args->skip_tone_mapping && obj && scene_avg > 0 && !params->inverse_tone_mapping &&
         tone.input_max > tone.output_max + 1e-4f)
     {
         // Smooth maximum of the display peak and a fixed perceptual (PQ)
@@ -2077,7 +2109,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         pl_unreachable();
     }
 
-    bool can_fast = !params->force_tone_mapping_lut;
+    const bool adaptive_peak = obj && obj->peak.enabled && obj->peak.prepared;
+    bool can_fast = !params->force_tone_mapping_lut && !adaptive_peak;
     if (!args->state) {
         // No state object provided, forcibly disable advanced methods
         can_fast = true;
@@ -2093,39 +2126,45 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         can_fast = true;
     }
 
-    bool need_tone_map = !pl_tone_map_params_noop(&tone) ||
-                         dt_exposure != 1.0f;
-    bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
-
-    if (!args->prelinearized)
-        pl_shader_linearize(sh, &src);
+    bool need_tone_map = !args->skip_tone_mapping &&
+                        (adaptive_peak || !pl_tone_map_params_noop(&tone) || dt_exposure != 1.0f);
+    bool need_gamut_map = !args->skip_gamut_mapping && !pl_gamut_map_params_noop(&gamut);
 
     pl_matrix3x3 rgb2lms = pl_ipt_rgb2lms(pl_raw_primaries_get(src.primaries));
-    pl_matrix3x3 lms2rgb = pl_ipt_lms2rgb(pl_raw_primaries_get(dst.primaries));
     ident_t lms2ipt = SH_MAT3(pl_ipt_lms2ipt);
-    ident_t ipt2lms = SH_MAT3(pl_ipt_ipt2lms);
 
+    pl_matrix3x3 saturation;
+    const pl_matrix3x3 *linear_transform = NULL;
     if (need_gamut_map && gamut.function == &pl_gamut_map_saturation && can_fast) {
-        const pl_matrix3x3 lms2src = pl_ipt_lms2rgb(&gamut.input_gamut);
+        const struct pl_raw_primaries *bt2020 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+        saturation = pl_ipt_lms2rgb(bt2020);
         const pl_matrix3x3 dst2lms = pl_ipt_rgb2lms(&gamut.output_gamut);
+        const pl_matrix3x3 lms2src = pl_ipt_lms2rgb(&gamut.input_gamut);
+        const pl_matrix3x3 bt2020_lms = pl_ipt_rgb2lms(bt2020);
+        pl_matrix3x3_mul(&saturation, &dst2lms);
+        pl_matrix3x3_mul(&saturation, &lms2src);
+        pl_matrix3x3_mul(&saturation, &bt2020_lms);
+        linear_transform = &saturation;
         sh_describe(sh, "gamut map (saturation)");
-        pl_matrix3x3_mul(&lms2rgb, &dst2lms);
-        pl_matrix3x3_mul(&lms2rgb, &lms2src);
         need_gamut_map = false;
     }
 
-    // Fast path: simply convert between primaries (if needed)
+    // Avoid nonlinear round trips when neither native operation is needed.
     if (!need_tone_map && !need_gamut_map) {
-        if (src.primaries != dst.primaries) {
-            sh_describe(sh, "colorspace conversion");
-            pl_matrix3x3_mul(&lms2rgb, &rgb2lms);
-            GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(lms2rgb));
-        }
-        goto done;
+        color_convert(sh, &input, &output, linear_transform);
+        GLSL("}\n");
+        return;
     }
 
+    const struct pl_color_domain linear_src = {
+        .color = {.primaries = src.primaries, .transfer = PL_COLOR_TRC_LINEAR},
+    };
+    const struct pl_color_domain ipt_domain = {.working_space = PL_COLOR_WORKING_IPT};
+    if (!args->skip_tone_mapping)
+        pl_shader_color_convert_ex(sh, &input, &linear_src);
+
     // Convert the pixel into the tone-mapping RGB space.
-    if (use_mast_space) {
+    if (use_mast_space && !args->skip_tone_mapping) {
         GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(space_mat));
         rgb2lms = pl_ipt_rgb2lms(src_space);
     }
@@ -2150,9 +2189,16 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     } else {
         mclip = 0.0f;
     }
-    if (mclip > 1e-3f) {
+    // Peak readback may become available between preflight and execution.
+    // Prepared graphs must retain this block even when its initial strength
+    // is zero; only the uniform changes as the measured peak evolves.
+    const bool prepared_mclip = adaptive_peak && params->mastering_clip > 0.0f;
+    if ((mclip > 1e-3f || prepared_mclip) && !args->skip_tone_mapping) {
+        if (mclip <= 1e-3f)
+            mclip = 0.0f;
         const float knee = 0.95f; // fraction of the peak where rolloff starts
-        const float m_norm = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_NORM, master_nits);
+        const float m_norm = master_nits > 0.0f
+            ? pl_hdr_rescale(PL_HDR_NITS, PL_HDR_NORM, master_nits) : 1.0f;
         #pragma GLSL /* mastering-peak soft clip */                             \
         {                                                                       \
         vec3 mcn = color.rgb * ${dynamic float: 1.0f / m_norm};                 \
@@ -2167,9 +2213,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
 
     // Full path: convert input from normalized RGB to IPT
     ident_t rgb2lms_i = SH_MAT3(rgb2lms);
-    ipt_convert(sh, rgb2lms_i, lms2ipt, true);
+    if (args->skip_tone_mapping) {
+        pl_shader_color_convert_ex(sh, &input, &ipt_domain);
+        GLSL("vec3 ipt = color.rgb; \n"
+             "vec3 lmspq, lms; \n");
+    } else {
+        ipt_convert(sh, rgb2lms_i, lms2ipt, true);
+    }
 
     if (params->show_clipping) {
+        if (args->skip_tone_mapping)
+            pl_shader_color_convert_ex(sh, &ipt_domain, &linear_src);
         const float eps = 1e-6f;
         GLSL("bool clip_hi, clip_lo;                            \n"
              "clip_hi = any(greaterThan(color.rgb, vec3("$"))); \n"
@@ -2226,7 +2280,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                 .width      = tone.lut_size,
                 .comps      = 1,
                 .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params),
-                .dynamic    = tone.input_avg > 0, // dynamic metadata
+                .dynamic    = adaptive_peak || tone.input_avg > 0, // dynamic metadata
+                .update_prepared = adaptive_peak,
                 .fill       = fill_tone_lut,
                 .priv       = &tone,
             ));
@@ -2254,9 +2309,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         // is linear, so both endpoints coincide and the application is
         // exact regardless of strength.
         const bool use_cr = need_recovery && params->contrast_recovery &&
-                            args->feature_map;
+                            (args->feature_map || args->feature_map_texture);
         if (use_cr)
-            sample_feature_map(sh, args->feature_map);
+            sample_feature_map(sh, args);
 
         const float flare_nits =
             pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone.output_min);
@@ -2340,8 +2395,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         sh_describef(sh, "gamut map (%s)", fun->name);
 
         pl_assert(obj);
+        obj->gamut.prepared |= SH_PARAMS(sh).description_only;
         ident_t lut = sh_lut(sh, sh_lut_params(
             .object     = &obj->gamut.lut,
+            .dynamic    = obj->gamut.prepared,
+            .update_prepared = obj->gamut.prepared,
             .var_type   = PL_VAR_FLOAT,
             .lut_type   = SH_LUT_TEXTURE,
             .fmt        = gamut_fmt,
@@ -2368,8 +2426,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
              "idx.z = %f * atan(ipt.z, ipt.y) + 0.5;\n"
              "ipt = "$"(idx).xyz;                   \n"
              "ipt.yz -= vec2(32768.0/65535.0);      \n",
-             SH_FLOAT(1.0f / lut_range),
-             SH_FLOAT(-gamut.min_luma / lut_range),
+             SH_FLOAT_DYN(1.0f / lut_range),
+             SH_FLOAT_DYN(-gamut.min_luma / lut_range),
              0.5f / M_PI, lut);
 
         if (params->show_clipping) {
@@ -2384,18 +2442,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         }
     }
 
-    // Convert IPT back to linear RGB
-    GLSL("lmspq = "$" * ipt;                        \n"
-         "lms = pow(max(lmspq, 0.0), vec3(1.0/%f)); \n"
-         "lms = max(lms - vec3(%f), 0.0)            \n"
-         "             / (vec3(%f) - %f * lms);     \n"
-         "lms = pow(lms, vec3(1.0/%f));             \n"
-         "lms *= %f;                                \n"
-         "color.rgb = "$" * lms;                    \n",
-         ipt2lms,
-         PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
-         10000 / PL_COLOR_SDR_WHITE,
-         SH_MAT3(lms2rgb));
+    GLSL("color.rgb = ipt; \n");
+    const struct pl_color_domain linear_dst = {
+        .color = {.primaries = dst.primaries, .transfer = PL_COLOR_TRC_LINEAR},
+    };
+    color_convert(sh, &ipt_domain,
+                  params->show_clipping ? &linear_dst : &output, linear_transform);
 
     if (params->show_clipping) {
         GLSL("if (clip_hi) {                                                \n"
@@ -2421,28 +2473,219 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         GLSL("#undef tone_map \n");
     }
 
-done:
-    pl_shader_delinearize(sh, &dst);
+    if (params->show_clipping)
+        pl_shader_color_convert_ex(sh, &linear_dst, &output);
     GLSL("}\n");
 }
 
 void pl_shader_color_convert(pl_shader sh, const struct pl_color_space *src,
                               const struct pl_color_space *dst)
 {
-    struct pl_color_space source = *src, target = *dst;
+    pl_shader_color_convert_ex(sh, &(struct pl_color_domain) {.color = *src},
+                                   &(struct pl_color_domain) {.color = *dst});
+}
+
+// JzAzBz's modified XYZ and LMS transforms, precomposed for linear BT.2020.
+// RGB basis changes are composed on the CPU, so each direction emits one
+// matrix multiply around the nonlinear JzAzBz transfer.
+static const pl_matrix3x3 bt2020_to_jz_lms = {{
+    {0.5300035764176864, 0.3557036333381700, 0.0860899899438397},
+    {0.2893882689234393, 0.5253948228498810, 0.1574815048285034},
+    {0.0910983944722720, 0.1475879790252511, 0.7342338837924466},
+}};
+
+static const pl_matrix3x3 jz_lms_to_bt2020 = {{
+    { 2.9906699974088204, -2.0497424169066347,  0.0889767942490976},
+    {-1.6345251299574355,  3.1456282090470493, -0.4830368859070917},
+    {-0.0425051454580045, -0.3779832173579201,  1.4480191746050939},
+}};
+
+static const pl_matrix3x3 jz_lms_to_iab = {{
+    {0.5,       0.5,       0.0},
+    {3.524000, -4.066708,  0.542708},
+    {0.199076,  1.096799, -1.295875},
+}};
+
+static const pl_matrix3x3 jz_iab_to_lms = {{
+    {1.0,  0.1386050432715393,  0.0580473161561189},
+    {1.0, -0.1386050432715393, -0.0580473161561189},
+    {1.0, -0.0960192420263189, -0.8118918960560390},
+}};
+
+static void color_convert(pl_shader sh, const struct pl_color_domain *src,
+                          const struct pl_color_domain *dst,
+                          const pl_matrix3x3 *linear_transform)
+{
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+        return;
+    if (src->working_space < 0 || src->working_space >= PL_COLOR_WORKING_COUNT ||
+        dst->working_space < 0 || dst->working_space >= PL_COLOR_WORKING_COUNT) {
+        SH_FAIL(sh, "Invalid color domain");
+        return;
+    }
+    const bool native_in = src->working_space == PL_COLOR_WORKING_NATIVE;
+    const bool native_out = dst->working_space == PL_COLOR_WORKING_NATIVE;
+    struct pl_color_repr input = src->repr, output = dst->repr;
+    input.sys = PL_DEF(input.sys, PL_COLOR_SYSTEM_RGB);
+    output.sys = PL_DEF(output.sys, PL_COLOR_SYSTEM_RGB);
+    input.alpha = PL_DEF(input.alpha, PL_ALPHA_INDEPENDENT);
+    output.alpha = PL_DEF(output.alpha, PL_ALPHA_INDEPENDENT);
+    if ((native_in && (input.sys < 0 || input.sys >= PL_COLOR_SYSTEM_COUNT ||
+                       (input.sys == PL_COLOR_SYSTEM_DOLBYVISION && !input.dovi))) ||
+        (native_out && (output.sys < 0 || output.sys >= PL_COLOR_SYSTEM_COUNT))) {
+        SH_FAIL(sh, "Invalid native color representation");
+        return;
+    }
+    struct pl_color_space source = src->color, target = dst->color;
+    // The native XYZ decoder/encoder uses DCI-P3 as its RGB basis, as in
+    // renderer.c:fix_frame. Honor an explicit linear XYZ transfer as well.
+    if (native_in && input.sys == PL_COLOR_SYSTEM_XYZ) {
+        source.primaries = PL_COLOR_PRIM_DCI_P3;
+        source.transfer = PL_DEF(source.transfer, PL_COLOR_TRC_ST428);
+    }
+    if (native_out && output.sys == PL_COLOR_SYSTEM_XYZ) {
+        target.primaries = PL_COLOR_PRIM_DCI_P3;
+        target.transfer = PL_DEF(target.transfer, PL_COLOR_TRC_ST428);
+    }
     pl_color_space_infer(&source);
     pl_color_space_infer(&target);
-    pl_shader_linearize(sh, &source);
-    if (source.primaries != target.primaries) {
-        pl_matrix3x3 mat = pl_get_color_mapping_matrix(
-            pl_raw_primaries_get(source.primaries),
-            pl_raw_primaries_get(target.primaries), PL_INTENT_RELATIVE_COLORIMETRIC);
-        GLSL("color.rgb = "$" * color.rgb; \n", sh_var(sh, (struct pl_shader_var) {
-            .var = pl_var_mat3("rgb_conversion"),
-            .data = PL_TRANSPOSE_3X3(mat.m),
-        }));
+    const float in_scale = PL_DEF(src->linear_scale, PL_COLOR_SDR_WHITE);
+    const float out_scale = PL_DEF(dst->linear_scale, PL_COLOR_SDR_WHITE);
+    bool same_units = in_scale == out_scale;
+    if (src->working_space == PL_COLOR_WORKING_NATIVE)
+        same_units |= source.transfer != PL_COLOR_TRC_LINEAR;
+    else if (src->working_space != PL_COLOR_WORKING_LMS)
+        same_units = true;
+    if (!linear_transform && src->working_space == dst->working_space &&
+        input.alpha == output.alpha && same_units &&
+        (!native_in || (pl_color_repr_equal(&input, &output) &&
+                        pl_color_space_equal(&source, &target))))
+        return;
+
+    if (!linear_transform && !native_in && src->working_space == dst->working_space) {
+        pl_shader_set_alpha(sh, &input, PL_ALPHA_INDEPENDENT);
+        if (src->working_space == PL_COLOR_WORKING_LMS && !same_units)
+            color_scale(sh, in_scale / out_scale, 0);
+        pl_shader_set_alpha(sh, &input, output.alpha);
+        return;
     }
-    pl_shader_delinearize(sh, &target);
+
+    static const char *const names[] = {"native", "IPT", "JzAzBz", "LMS"};
+    if (src->working_space != dst->working_space) {
+        const char *in_name = native_in ? (input.sys == PL_COLOR_SYSTEM_RGB ? "RGB" :
+                             pl_color_system_name(input.sys)) : names[src->working_space];
+        const char *out_name = native_out ? (output.sys == PL_COLOR_SYSTEM_RGB ? "RGB" :
+                              pl_color_system_name(output.sys)) : names[dst->working_space];
+        sh_describef(sh, "%s to %s", in_name, out_name);
+    }
+
+    if (!native_in)
+        pl_shader_set_alpha(sh, &input, PL_ALPHA_INDEPENDENT);
+
+    const struct pl_raw_primaries *bt2020 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+    pl_matrix3x3 from = pl_matrix3x3_identity, to = pl_matrix3x3_identity;
+    // Decode to linear RGB or to the model's native linear LMS basis. The
+    // change of basis below is a single CPU-composed matrix in every case.
+    switch (src->working_space) {
+    case PL_COLOR_WORKING_NATIVE:
+        if (input.sys == PL_COLOR_SYSTEM_XYZ) {
+            pl_shader_linearize(sh, &source);
+            pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr = &input));
+        } else {
+            pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr = &input));
+            pl_shader_linearize(sh, &source);
+        }
+        if (source.transfer == PL_COLOR_TRC_LINEAR && in_scale != PL_COLOR_SDR_WHITE)
+            color_scale(sh, in_scale / PL_COLOR_SDR_WHITE, 0);
+        from = pl_get_color_mapping_matrix(pl_raw_primaries_get(source.primaries),
+                                           bt2020, PL_INTENT_RELATIVE_COLORIMETRIC);
+        break;
+    case PL_COLOR_WORKING_JZAZBZ:
+        GLSL("color.x = (color.x + 1.6295499532821566e-11) / \n"
+             " (1.0 - 0.56 + 0.56 * (color.x + 1.6295499532821566e-11)); \n"
+             "color.rgb = "$" * color.rgb; \n", SH_MAT3(jz_iab_to_lms));
+        from = jz_lms_to_bt2020;
+        break;
+    case PL_COLOR_WORKING_LMS:
+        from = pl_ipt_lms2rgb(bt2020);
+        if (in_scale != PL_COLOR_SDR_WHITE)
+            color_scale(sh, in_scale / PL_COLOR_SDR_WHITE, 0);
+        break;
+    case PL_COLOR_WORKING_IPT:
+        GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(pl_ipt_ipt2lms));
+        from = pl_ipt_lms2rgb(bt2020);
+        break;
+    case PL_COLOR_WORKING_COUNT: pl_unreachable();
+    }
+    if (src->working_space == PL_COLOR_WORKING_IPT ||
+        src->working_space == PL_COLOR_WORKING_JZAZBZ) {
+        float m2 = src->working_space == PL_COLOR_WORKING_JZAZBZ ? 1.7 * PQ_M2 : PQ_M2;
+        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0 / %f)); \n"
+             "color.rgb = max(color.rgb - vec3(%f), 0.0) / (vec3(%f) - %f * color.rgb); \n"
+             "color.rgb = pow(color.rgb, vec3(1.0 / %f)) * %f; \n",
+             m2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000.0 / PL_COLOR_SDR_WHITE);
+    }
+    switch (dst->working_space) {
+    case PL_COLOR_WORKING_NATIVE:
+        to = pl_get_color_mapping_matrix(bt2020, pl_raw_primaries_get(target.primaries),
+                                         PL_INTENT_RELATIVE_COLORIMETRIC);
+        break;
+    case PL_COLOR_WORKING_JZAZBZ: to = bt2020_to_jz_lms; break;
+    case PL_COLOR_WORKING_LMS:
+    case PL_COLOR_WORKING_IPT: to = pl_ipt_rgb2lms(bt2020); break;
+    case PL_COLOR_WORKING_COUNT: pl_unreachable();
+    }
+    // RGB-to-RGB uses the direct chromatic adaptation matrix.
+    if (!linear_transform && src->working_space == PL_COLOR_WORKING_NATIVE && dst->working_space == PL_COLOR_WORKING_NATIVE) {
+        to = source.primaries == target.primaries ? pl_matrix3x3_identity :
+            pl_get_color_mapping_matrix(pl_raw_primaries_get(source.primaries),
+                pl_raw_primaries_get(target.primaries), PL_INTENT_RELATIVE_COLORIMETRIC);
+    } else {
+        if (linear_transform)
+            pl_matrix3x3_mul(&to, linear_transform);
+        pl_matrix3x3_mul(&to, &from);
+    }
+    if (memcmp(&to, &pl_matrix3x3_identity, sizeof(to)))
+        sh_color_matrix(sh, to);
+    if (dst->working_space == PL_COLOR_WORKING_IPT ||
+        dst->working_space == PL_COLOR_WORKING_JZAZBZ) {
+        float m2 = dst->working_space == PL_COLOR_WORKING_JZAZBZ ? 1.7 * PQ_M2 : PQ_M2;
+        GLSL("color.rgb *= %f; \n"
+             "color.rgb = pow(max(color.rgb, 0.0), vec3(%f)); \n"
+             "color.rgb = (vec3(%f) + %f * color.rgb) / (vec3(1.0) + %f * color.rgb); \n"
+             "color.rgb = pow(color.rgb, vec3(%f)); \n",
+             PL_COLOR_SDR_WHITE / 10000.0, PQ_M1, PQ_C1, PQ_C2, PQ_C3, m2);
+        if (dst->working_space == PL_COLOR_WORKING_JZAZBZ) {
+            GLSL("color.rgb = "$" * color.rgb; \n"
+                 "color.x = ((1.0 - 0.56) * color.x) / (1.0 - 0.56 * color.x) \n"
+                 " - 1.6295499532821566e-11; \n", SH_MAT3(jz_lms_to_iab));
+        } else {
+            GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(pl_ipt_lms2ipt));
+        }
+    } else if (dst->working_space == PL_COLOR_WORKING_LMS) {
+        if (out_scale != PL_COLOR_SDR_WHITE)
+            color_scale(sh, PL_COLOR_SDR_WHITE / out_scale, 0);
+    } else {
+        if (target.transfer == PL_COLOR_TRC_LINEAR && out_scale != PL_COLOR_SDR_WHITE)
+            color_scale(sh, PL_COLOR_SDR_WHITE / out_scale, 0);
+        if (output.sys == PL_COLOR_SYSTEM_XYZ) {
+            pl_shader_encode_color(sh, &output);
+            pl_shader_delinearize(sh, &target);
+        } else {
+            pl_shader_delinearize(sh, &target);
+            pl_shader_encode_color(sh, &output);
+        }
+    }
+    if (!native_out) {
+        struct pl_color_repr independent = {.alpha = PL_ALPHA_INDEPENDENT};
+        pl_shader_set_alpha(sh, &independent, output.alpha);
+    }
+}
+
+void pl_shader_color_convert_ex(pl_shader sh, const struct pl_color_domain *src,
+                                const struct pl_color_domain *dst)
+{
+    color_convert(sh, src, dst, NULL);
 }
 
 // Backwards compatibility wrapper around `pl_shader_color_map_ex`

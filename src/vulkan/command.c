@@ -552,9 +552,18 @@ bool vk_cmd_submit(struct vk_cmd **pcmd)
     }
 
     pl_assert(pool->sync[cmd->qindex].value == cmd->sync.value);
+    pl_clock_t trace_start = vk->trace_present ? pl_clock_now() : 0;
     vk->lock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
+    pl_clock_t trace_locked = vk->trace_present ? pl_clock_now() : 0;
     VkResult res = vk_queue_submit2(vk, cmd->queue, &sinfo, cmd->fence);
+    pl_clock_t trace_submitted = vk->trace_present ? pl_clock_now() : 0;
     vk->unlock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
+    if (vk->trace_present) {
+        PL_INFO(vk, "[PresentTrace] submit start=%"PRIu64" qf=%u queue=%d lock_ms=%.3f driver_ms=%.3f result=%d",
+                (uint64_t) trace_start, pool->qf, cmd->qindex,
+                pl_clock_diff(trace_locked, trace_start) * 1e3,
+                pl_clock_diff(trace_submitted, trace_locked) * 1e3, (int) res);
+    }
     PL_VK_ASSERT(res, "vkQueueSubmit2");
 
     pl_mutex_lock(&vk->lock);

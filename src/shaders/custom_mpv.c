@@ -896,7 +896,9 @@ static pl_str pl_stage_to_mp(enum pl_hook_stage stage)
     case PL_HOOK_SCALED:        return pl_str0("SCALED");
     case PL_HOOK_PRE_OUTPUT:    return pl_str0("PREOUTPUT");
     case PL_HOOK_OUTPUT:        return pl_str0("OUTPUT");
-    case PL_HOOK_COLOR_MAP:     return pl_str0(""); // programmatic replacement only
+    case PL_HOOK_GAMUT_MAP:
+    case PL_HOOK_COLOR_CONVERT:
+    case PL_HOOK_TONE_MAP:     return pl_str0(""); // programmatic replacement only
     };
 
     pl_unreachable();
@@ -1414,6 +1416,13 @@ static bool prepared_parameters_match(struct hook_priv *p,
     }
     for (int i = 0; i < p->hook_params.num; i++) {
         const struct pl_hook_par *hp = &p->hook_params.elem[i];
+        // Uniform parameters may change without rebuilding a pipeline. Use
+        // their current values for expressions too: the renderer's preflight
+        // still rejects any resulting change to the prepared pass graph.
+        if (hp->mode == PL_HOOK_PAR_VARIABLE || hp->mode == PL_HOOK_PAR_DYNAMIC) {
+            frozen[i] = *hp->data;
+            continue;
+        }
         switch (hp->type) {
         case PL_VAR_SINT:  if (frozen[i].i != hp->data->i) return false; break;
         case PL_VAR_UINT:  if (frozen[i].u != hp->data->u) return false; break;
@@ -1882,7 +1891,7 @@ static struct pl_hook_prepare_result prepared_hook(void *priv,
         if (!run)
             continue;
 
-        sh = params->begin(params->context, params->dispatch, false);
+        sh = params->context->begin(params->context->priv, params->dispatch, false);
         if (!sh)
             goto error;
 
@@ -1937,7 +1946,7 @@ static struct pl_hook_prepare_result prepared_hook(void *priv,
                 goto next_prepared_bind;
             }
 
-            params->abort(params->context, params->dispatch, &sh);
+            params->context->abort(params->context->priv, params->dispatch, &sh);
             skip = true;
             break;
 
@@ -2032,7 +2041,7 @@ next_prepared_bind: ;
         int out_h = roundf(out_size[1]);
         if (!sh_require(sh, PL_SHADER_SIG_NONE, out_w, out_h))
             goto error;
-        const struct pl_hook_texture *fbo = params->get_tex(params->context, out_w, out_h);
+        const struct pl_hook_texture *fbo = params->context->get_tex(params->context->priv, out_w, out_h, NULL);
         if (!fbo)
             goto error;
 
@@ -2050,7 +2059,7 @@ next_prepared_bind: ;
             }));
             sh->output = PL_SHADER_SIG_NONE;
             GLSL("hook(); \n");
-            status = params->compute(params->context, params->dispatch,
+            status = params->context->compute(params->context->priv, params->dispatch,
                 pl_dispatch_compute_params(
                     .shader = &sh,
                     .dispatch_size = { PL_DIV_UP(out_w, hook->block_w),
@@ -2059,7 +2068,7 @@ next_prepared_bind: ;
         } else {
             sh->type = PL_DEF(sh->type, SH_FRAGMENT);
             GLSL("vec4 color = hook(); \n");
-            status = params->finish(params->context, params->dispatch,
+            status = params->context->finish(params->context->priv, params->dispatch,
                 pl_dispatch_params(.shader = &sh, .target = fbo->texture),
                 &fbo->params);
         }
@@ -2111,7 +2120,7 @@ next_prepared_bind: ;
 
 error:
     if (sh)
-        params->abort(params->context, params->dispatch, &sh);
+        params->context->abort(params->context->priv, params->dispatch, &sh);
     res.status = PL_DISPATCH_FAILED;
     return res;
 }

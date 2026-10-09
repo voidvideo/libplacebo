@@ -180,3 +180,16 @@ end:
         CloseHandle(timer);
     return ret;
 }
+
+static inline unsigned pl_thread_num_processors(void)
+{
+    DWORD_PTR process_mask, system_mask;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
+        unsigned count = 0;
+        for (; process_mask; process_mask &= process_mask - 1)
+            count++;
+        if (count)
+            return count;
+    }
+    return 1;
+}

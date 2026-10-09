@@ -329,13 +329,21 @@ size_t pl_error_diffusion_shmem_req(const struct pl_error_diffusion_kernel *kern
 
 bool pl_shader_error_diffusion(pl_shader sh, const struct pl_error_diffusion_params *params)
 {
-    const int width = params->input_tex->params.w, height = params->input_tex->params.h;
+    const struct pl_tex_params *input = params->input_tex
+        ? &params->input_tex->params : params->input_texture;
+    const struct pl_tex_params *output = params->output_tex
+        ? &params->output_tex->params : params->output_texture;
+    if (!input || !output) {
+        SH_FAIL(sh, "Error diffusion requires input and output texture descriptions");
+        return false;
+    }
+    const int width = input->w, height = input->h;
     const struct pl_glsl_version glsl = sh_glsl(sh);
     const struct pl_error_diffusion_kernel *kernel =
         PL_DEF(params->kernel, &pl_error_diffusion_sierra_lite);
 
-    pl_assert(params->output_tex->params.w == width);
-    pl_assert(params->output_tex->params.h == height);
+    pl_assert(output->w == width);
+    pl_assert(output->h == height);
     if (!sh_require(sh, PL_SHADER_SIG_NONE, width, height))
         return false;
 
@@ -388,6 +396,7 @@ bool pl_shader_error_diffusion(pl_shader sh, const struct pl_error_diffusion_par
 
     ident_t in_tex = sh_desc(sh, (struct pl_shader_desc) {
         .binding.object = params->input_tex,
+        .texture = input,
         .desc = {
             .name   = "input_tex",
             .type   = PL_DESC_SAMPLED_TEX,
@@ -396,6 +405,7 @@ bool pl_shader_error_diffusion(pl_shader sh, const struct pl_error_diffusion_par
 
     ident_t out_img = sh_desc(sh, (struct pl_shader_desc) {
         .binding.object = params->output_tex,
+        .texture = output,
         .desc = {
             .name    = "output_tex",
             .type    = PL_DESC_STORAGE_IMG,

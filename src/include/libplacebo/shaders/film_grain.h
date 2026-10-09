@@ -110,6 +110,11 @@ struct pl_film_grain_params {
     pl_tex luma_tex;                // "luma" texture (see notes)
     int luma_comp;                  // index of luma in `luma_tex`
 
+    // Description-only metadata, copied during construction. Actual textures
+    // take precedence. Execution requires the corresponding real bindings.
+    const struct pl_tex_params *texture;
+    const struct pl_tex_params *luma_texture;
+
     // Notes for `luma_tex`:
     //  - `luma_tex` must be specified if the `tex` does not itself contain the
     //     "luma-like" component. For XYZ systems, the Y channel is the luma
