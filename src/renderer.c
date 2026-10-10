@@ -5437,7 +5437,7 @@ static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparat
                              mixed.prepared_tex->params.w, mixed.prepared_tex->params.h))
             goto failed;
     }
-check_graph:
+check_graph:;
     // Lack of an intermediate format is a native direct-render fallback,
     // not a failed graph, provided the shared builders completed successfully.
     enum pl_render_error errors = p->rr->errors;
