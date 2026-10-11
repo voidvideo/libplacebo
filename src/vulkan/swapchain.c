@@ -65,6 +65,8 @@ struct priv {
     bool has_swapchain_maintenance1;
     bool feedback_device_supported;
     bool feedback_surface_supported;
+    bool feedback_host_clock_supported;
+    VkTimeDomainKHR feedback_host_time_domain;
     enum pl_swapchain_present_clock feedback_clock;
     uint64_t feedback_clock_id;
     struct vk_present_feedback_state feedback;
@@ -74,6 +76,58 @@ struct priv {
 };
 
 static const struct pl_sw_fns vulkan_swapchain;
+
+static struct pl_swapchain_present_clock_correlation
+calibrate_present_clock(struct priv *p, VkTimeDomainKHR time_domain,
+                        uint64_t time_domain_id)
+{
+    struct pl_swapchain_present_clock_correlation result = {0};
+    struct vk_ctx *vk = p->vk;
+    if (!vk->GetCalibratedTimestampsKHR || !p->current)
+        return result;
+
+    if (!p->feedback_host_clock_supported)
+        return result;
+
+    const VkTimeDomainKHR host_domain = p->feedback_host_time_domain;
+    if (time_domain == host_domain)
+        return result;
+
+    VkSwapchainCalibratedTimestampInfoEXT swapchain_info = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT,
+        .swapchain = p->current->swapchain,
+        .presentStage = time_domain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT
+            ? VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT : 0,
+        .timeDomainId = time_domain_id,
+    };
+    const bool swapchain_local =
+        time_domain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT ||
+        time_domain == VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT;
+    const VkCalibratedTimestampInfoKHR timestamps_info[] = {{
+        .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR,
+        .pNext = swapchain_local ? &swapchain_info : NULL,
+        .timeDomain = time_domain,
+    }, {
+        .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR,
+        .timeDomain = host_domain,
+    }};
+    uint64_t timestamps[2] = {0};
+    uint64_t max_deviation_ns = 0;
+    VkResult res = vk->GetCalibratedTimestampsKHR(
+        vk->dev, PL_ARRAY_SIZE(timestamps_info), timestamps_info, timestamps,
+        &max_deviation_ns);
+    if (res != VK_SUCCESS || !timestamps[0] || !timestamps[1])
+        return result;
+
+    result = (struct pl_swapchain_present_clock_correlation) {
+        .clock_timestamp = timestamps[0],
+        .host_timestamp = timestamps[1],
+        .host_clock = vk_present_feedback_map_clock(host_domain),
+        .host_clock_id = 0,
+        .max_deviation_ns = max_deviation_ns,
+    };
+    return result;
+}
 
 #ifdef PL_HAVE_WIN32
 // Publish result and confirmed acquisition together. Status readers must never
@@ -428,6 +482,29 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
         vk->SetSwapchainPresentTimingQueueSizeEXT &&
         vk->GetSwapchainTimeDomainPropertiesEXT && vk->GetPastPresentationTimingEXT &&
         vk->GetPhysicalDeviceSurfaceCapabilities2KHR;
+    p->feedback_host_time_domain = vk_present_feedback_host_clock();
+    if (vk->GetPhysicalDeviceCalibrateableTimeDomainsKHR &&
+        vk->GetCalibratedTimestampsKHR)
+    {
+        uint32_t count = 0;
+        VkResult res = vk->GetPhysicalDeviceCalibrateableTimeDomainsKHR(
+            vk->physd, &count, NULL);
+        if (res == VK_SUCCESS && count) {
+            void *tmp = pl_tmp(NULL);
+            VkTimeDomainKHR *domains = pl_calloc_ptr(tmp, count, domains);
+            res = vk->GetPhysicalDeviceCalibrateableTimeDomainsKHR(
+                vk->physd, &count, domains);
+            if (res == VK_SUCCESS || res == VK_INCOMPLETE) {
+                for (uint32_t i = 0; i < count; i++) {
+                    if (domains[i] == p->feedback_host_time_domain) {
+                        p->feedback_host_clock_supported = true;
+                        break;
+                    }
+                }
+            }
+            pl_free(tmp);
+        }
+    }
     pl_assert(p->swapchain_depth > 0);
     atomic_init(&p->frames_in_flight, 0);
 #ifdef PL_HAVE_WIN32
@@ -1435,6 +1512,9 @@ static int vk_sw_poll_present_feedback(
         goto done;
     }
 
+    VkTimeDomainKHR correlation_domain = VK_TIME_DOMAIN_MAX_ENUM_KHR;
+    uint64_t correlation_domain_id = 0;
+    struct pl_swapchain_present_clock_correlation correlation = {0};
     for (uint32_t i = 0; i < properties.presentationTimingCount; i++) {
         if (!timings[i].reportComplete ||
             !vk_present_feedback_complete(&p->feedback, timings[i].presentId, &token))
@@ -1453,6 +1533,15 @@ static int vk_sw_poll_present_feedback(
             }
         }
 
+        if (timings[i].timeDomain != correlation_domain ||
+            timings[i].timeDomainId != correlation_domain_id)
+        {
+            correlation_domain = timings[i].timeDomain;
+            correlation_domain_id = timings[i].timeDomainId;
+            correlation = calibrate_present_clock(
+                p, correlation_domain, correlation_domain_id);
+        }
+
         out_feedback[written++] = (struct pl_swapchain_present_feedback) {
             .token = token,
             .completed_stages = first_pixel_out
@@ -1462,6 +1551,7 @@ static int vk_sw_poll_present_feedback(
             .timestamp = first_pixel_out_time,
             .clock = vk_present_feedback_map_clock(timings[i].timeDomain),
             .clock_id = timings[i].timeDomainId,
+            .correlation = correlation,
         };
     }
     pl_free(tmp);

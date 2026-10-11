@@ -21,6 +21,13 @@ int main(void)
                 ==, PL_SWAPCHAIN_PRESENT_CLOCK_PERFORMANCE_COUNTER, "d");
     REQUIRE_CMP(vk_present_feedback_map_clock(VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT),
                 ==, PL_SWAPCHAIN_PRESENT_CLOCK_SWAPCHAIN_LOCAL, "d");
+#ifdef PL_HAVE_WIN32
+    REQUIRE_CMP(vk_present_feedback_host_clock(), ==,
+                VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR, "d");
+#else
+    REQUIRE_CMP(vk_present_feedback_host_clock(), ==,
+                VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR, "d");
+#endif
 
     struct vk_present_feedback_state state = {0};
 

@@ -21,6 +21,15 @@ vk_present_feedback_map_clock(VkTimeDomainKHR domain)
     }
 }
 
+VkTimeDomainKHR vk_present_feedback_host_clock(void)
+{
+#ifdef PL_HAVE_WIN32
+    return VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+    return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+}
+
 enum pl_swapchain_present_clock
 vk_present_feedback_pick_clock(const VkTimeDomainKHR *domains,
                                const uint64_t *domain_ids, int num_domains,

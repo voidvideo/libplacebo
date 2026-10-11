@@ -184,6 +184,24 @@ enum pl_swapchain_present_clock {
     PL_SWAPCHAIN_PRESENT_CLOCK_DEVICE,
 };
 
+// Simultaneous samples which correlate the presentation clock to the host
+// clock used by the application. `clock_timestamp` uses the same domain,
+// identity and units as `pl_swapchain_present_feedback.timestamp`.
+// `host_timestamp` uses `host_clock`; MONOTONIC and MONOTONIC_RAW are in
+// nanoseconds and PERFORMANCE_COUNTER is in QPC ticks. `max_deviation_ns` is
+// the maximum deviation between the two samples in nanoseconds. A zero
+// `clock_timestamp`, `host_timestamp`, or UNKNOWN host clock means that no
+// correlation was available for this report.
+struct pl_swapchain_present_clock_correlation {
+    uint64_t clock_timestamp;
+    uint64_t host_timestamp;
+    enum pl_swapchain_present_clock host_clock;
+    // Native identifier for the host clock, or zero when the host domain does
+    // not require one.
+    uint64_t host_clock_id;
+    uint64_t max_deviation_ns;
+};
+
 struct pl_swapchain_present_feedback {
     uint64_t token;
     uint32_t completed_stages;
@@ -193,6 +211,10 @@ struct pl_swapchain_present_feedback {
     enum pl_swapchain_present_clock clock;
     // Native identifier distinguishing multiple clocks of the same kind.
     uint64_t clock_id;
+    // Optional mapping from the native presentation clock to the platform's
+    // application clock. This has one cross-platform meaning: CLOCK_MONOTONIC
+    // on POSIX systems and QPC on Windows.
+    struct pl_swapchain_present_clock_correlation correlation;
 };
 
 // Returns the presentation stages supported by this swapchain and its current

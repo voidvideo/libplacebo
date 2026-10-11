@@ -223,6 +223,11 @@ static const struct vk_ext vk_device_extensions[] = {
         },
     }, {
         .name = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_INST_FUN(GetPhysicalDeviceCalibrateableTimeDomainsKHR),
+            PL_VK_DEV_FUN(GetCalibratedTimestampsKHR),
+            {0}
+        },
     }, {
         .name = VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
     }, {

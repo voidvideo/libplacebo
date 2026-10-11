@@ -117,6 +117,7 @@ struct vk_ctx {
     PL_VK_FUN(GetPhysicalDeviceFormatProperties2);
     PL_VK_FUN(GetPhysicalDeviceImageFormatProperties2);
     PL_VK_FUN(GetPhysicalDeviceMemoryProperties);
+    PL_VK_FUN(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
     PL_VK_FUN(GetPhysicalDeviceProperties);
     PL_VK_FUN(GetPhysicalDeviceProperties2);
     PL_VK_FUN(GetPhysicalDeviceQueueFamilyProperties);
@@ -209,6 +210,7 @@ struct vk_ctx {
     PL_VK_FUN(FreeCommandBuffers);
     PL_VK_FUN(FreeMemory);
     PL_VK_FUN(GetBufferMemoryRequirements);
+    PL_VK_FUN(GetCalibratedTimestampsKHR);
     PL_VK_FUN(GetDeviceImageMemoryRequirements);
     PL_VK_FUN(GetDeviceQueue2);
     PL_VK_FUN(GetImageDrmFormatModifierPropertiesEXT);
