@@ -11,8 +11,11 @@ project('libplacebo', ['c', 'cpp'],
     # Major version
     7,
     # API version
-    {
-      '376': 'add host clock correlation to presentation feedback',
+    # Keep the upstream API in the leading digits and reserve four trailing
+    # digits for VoidVideo ABI revisions. `voidvideo-0` is not an upstream API
+    # entry, so exclude it from the upstream changelog count.
+    ({
+      'voidvideo-0': 'add host clock correlation to presentation feedback',
       '375': 'add timestamp and clock metadata to presentation feedback',
       '374': 'add pl_color_map_params.mastering_clip',
       '373': 'add pl_color_map_params.film_strength',
@@ -389,7 +392,7 @@ project('libplacebo', ['c', 'cpp'],
       '3': '',
       '2': '',
       '1': '',
-    }.keys().length(),
+    }.keys().length() - 1) * 10000,
     # Fix version
     0)
 )
