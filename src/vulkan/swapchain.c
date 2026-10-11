@@ -65,6 +65,8 @@ struct priv {
     bool has_swapchain_maintenance1;
     bool feedback_device_supported;
     bool feedback_surface_supported;
+    enum pl_swapchain_present_clock feedback_clock;
+    uint64_t feedback_clock_id;
     struct vk_present_feedback_state feedback;
     struct pl_color_repr color_repr;
     struct pl_color_space color_space;
@@ -423,7 +425,8 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
     p->has_swapchain_maintenance1 = sw_maint_features && sw_maint_features->swapchainMaintenance1;
     p->feedback_device_supported = timing_features && timing_features->presentTiming &&
         present_id_features && present_id_features->presentId2 &&
-        vk->SetSwapchainPresentTimingQueueSizeEXT && vk->GetPastPresentationTimingEXT &&
+        vk->SetSwapchainPresentTimingQueueSizeEXT &&
+        vk->GetSwapchainTimeDomainPropertiesEXT && vk->GetPastPresentationTimingEXT &&
         vk->GetPhysicalDeviceSurfaceCapabilities2KHR;
     pl_assert(p->swapchain_depth > 0);
     atomic_init(&p->frames_in_flight, 0);
@@ -989,6 +992,43 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
         }
     }
 
+    p->feedback_clock = PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN;
+    p->feedback_clock_id = 0;
+    if (p->feedback_surface_supported) {
+        VkSwapchainTimeDomainPropertiesEXT props = {
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT,
+        };
+        uint64_t counter = 0;
+        res = vk->GetSwapchainTimeDomainPropertiesEXT(vk->dev, current->swapchain,
+                                                       &props, &counter);
+        if (res == VK_SUCCESS && props.timeDomainCount) {
+            void *tmp = pl_tmp(NULL);
+            VkTimeDomainKHR *domains = pl_calloc_ptr(tmp, props.timeDomainCount, domains);
+            uint64_t *ids = pl_calloc_ptr(tmp, props.timeDomainCount, ids);
+            props.pTimeDomains = domains;
+            props.pTimeDomainIds = ids;
+            res = vk->GetSwapchainTimeDomainPropertiesEXT(vk->dev, current->swapchain,
+                                                           &props, &counter);
+#ifdef PL_HAVE_WIN32
+            const enum pl_swapchain_present_clock preferred =
+                PL_SWAPCHAIN_PRESENT_CLOCK_PERFORMANCE_COUNTER;
+#else
+            const enum pl_swapchain_present_clock preferred =
+                PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC;
+#endif
+            if (res == VK_SUCCESS || res == VK_INCOMPLETE) {
+                p->feedback_clock = vk_present_feedback_pick_clock(
+                    domains, ids, props.timeDomainCount, preferred,
+                    &p->feedback_clock_id);
+            }
+            pl_free(tmp);
+        }
+        if (p->feedback_clock == PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN) {
+            PL_WARN(vk, "No presentation timing clock is available");
+            p->feedback_surface_supported = false;
+        }
+    }
+
     // Get the new swapchain images
     VK(vk->GetSwapchainImagesKHR(vk->dev, current->swapchain, &num_images, NULL));
     PL_ARRAY_RESIZE(current, current->vkimages, num_images);
@@ -1247,7 +1287,11 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     };
     VkPresentTimingInfoEXT timing_info = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT,
+        .timeDomainId = p->feedback_clock_id,
         .presentStageQueries = VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT,
+        .targetTimeDomainPresentStage =
+            p->feedback_clock == PL_SWAPCHAIN_PRESENT_CLOCK_PRESENT_STAGE_LOCAL
+                ? VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT : 0,
     };
     VkPresentTimingsInfoEXT timings_info = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT,
@@ -1397,12 +1441,14 @@ static int vk_sw_poll_present_feedback(
             continue;
 
         bool first_pixel_out = false;
+        uint64_t first_pixel_out_time = 0;
         for (uint32_t n = 0; n < timings[i].presentStageCount; n++) {
             if ((timings[i].pPresentStages[n].stage &
                  VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT) &&
                 timings[i].pPresentStages[n].time != 0)
             {
                 first_pixel_out = true;
+                first_pixel_out_time = timings[i].pPresentStages[n].time;
                 break;
             }
         }
@@ -1413,6 +1459,9 @@ static int vk_sw_poll_present_feedback(
                 ? PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT : 0,
             .status = first_pixel_out ? PL_SWAPCHAIN_PRESENT_FEEDBACK_COMPLETED
                                       : PL_SWAPCHAIN_PRESENT_FEEDBACK_DISCARDED,
+            .timestamp = first_pixel_out_time,
+            .clock = vk_present_feedback_map_clock(timings[i].timeDomain),
+            .clock_id = timings[i].timeDomainId,
         };
     }
     pl_free(tmp);

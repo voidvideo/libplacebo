@@ -1,5 +1,61 @@
 #include "present_feedback.h"
 
+enum pl_swapchain_present_clock
+vk_present_feedback_map_clock(VkTimeDomainKHR domain)
+{
+    switch (domain) {
+    case VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC;
+    case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC_RAW;
+    case VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_PERFORMANCE_COUNTER;
+    case VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_PRESENT_STAGE_LOCAL;
+    case VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_SWAPCHAIN_LOCAL;
+    case VK_TIME_DOMAIN_DEVICE_KHR:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_DEVICE;
+    default:
+        return PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN;
+    }
+}
+
+enum pl_swapchain_present_clock
+vk_present_feedback_pick_clock(const VkTimeDomainKHR *domains,
+                               const uint64_t *domain_ids, int num_domains,
+                               enum pl_swapchain_present_clock preferred,
+                               uint64_t *out_domain_id)
+{
+    static const enum pl_swapchain_present_clock fallbacks[] = {
+        PL_SWAPCHAIN_PRESENT_CLOCK_SWAPCHAIN_LOCAL,
+        PL_SWAPCHAIN_PRESENT_CLOCK_PRESENT_STAGE_LOCAL,
+        PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC,
+        PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC_RAW,
+        PL_SWAPCHAIN_PRESENT_CLOCK_PERFORMANCE_COUNTER,
+        PL_SWAPCHAIN_PRESENT_CLOCK_DEVICE,
+    };
+    if (out_domain_id)
+        *out_domain_id = 0;
+    if (!domains || !domain_ids || num_domains <= 0)
+        return PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN;
+
+    for (int pass = -1; pass < (int) PL_ARRAY_SIZE(fallbacks); pass++) {
+        enum pl_swapchain_present_clock wanted =
+            pass < 0 ? preferred : fallbacks[pass];
+        if (pass >= 0 && wanted == preferred)
+            continue;
+        for (int i = 0; i < num_domains; i++) {
+            if (vk_present_feedback_map_clock(domains[i]) != wanted)
+                continue;
+            if (out_domain_id)
+                *out_domain_id = domain_ids[i];
+            return wanted;
+        }
+    }
+    return PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN;
+}
+
 uint64_t vk_present_feedback_track(void *parent,
                                    struct vk_present_feedback_state *state,
                                    uint64_t token)

@@ -13,6 +13,14 @@ struct vk_present_feedback_state {
     PL_ARRAY(uint64_t) discarded;
 };
 
+enum pl_swapchain_present_clock
+vk_present_feedback_map_clock(VkTimeDomainKHR domain);
+enum pl_swapchain_present_clock
+vk_present_feedback_pick_clock(const VkTimeDomainKHR *domains,
+                               const uint64_t *domain_ids, int num_domains,
+                               enum pl_swapchain_present_clock preferred,
+                               uint64_t *out_domain_id);
+
 uint64_t vk_present_feedback_track(void *parent,
                                    struct vk_present_feedback_state *state,
                                    uint64_t token);

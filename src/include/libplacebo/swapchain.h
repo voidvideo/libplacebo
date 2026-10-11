@@ -170,10 +170,29 @@ enum pl_swapchain_present_feedback_status {
     PL_SWAPCHAIN_PRESENT_FEEDBACK_DISCARDED,
 };
 
+// Clock containing a returned presentation-stage timestamp. The timestamp is
+// in the native units of this clock. MONOTONIC, MONOTONIC_RAW and the two
+// swapchain-local clocks use nanoseconds; PERFORMANCE_COUNTER uses QPC ticks;
+// DEVICE uses the device timestamp period.
+enum pl_swapchain_present_clock {
+    PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN = 0,
+    PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC,
+    PL_SWAPCHAIN_PRESENT_CLOCK_MONOTONIC_RAW,
+    PL_SWAPCHAIN_PRESENT_CLOCK_PERFORMANCE_COUNTER,
+    PL_SWAPCHAIN_PRESENT_CLOCK_PRESENT_STAGE_LOCAL,
+    PL_SWAPCHAIN_PRESENT_CLOCK_SWAPCHAIN_LOCAL,
+    PL_SWAPCHAIN_PRESENT_CLOCK_DEVICE,
+};
+
 struct pl_swapchain_present_feedback {
     uint64_t token;
     uint32_t completed_stages;
     enum pl_swapchain_present_feedback_status status;
+    // Timestamp for FIRST_PIXEL_OUT when that stage completed, otherwise zero.
+    uint64_t timestamp;
+    enum pl_swapchain_present_clock clock;
+    // Native identifier distinguishing multiple clocks of the same kind.
+    uint64_t clock_id;
 };
 
 // Returns the presentation stages supported by this swapchain and its current

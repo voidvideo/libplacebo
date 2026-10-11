@@ -229,6 +229,7 @@ static const struct vk_ext vk_device_extensions[] = {
         .name = VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(SetSwapchainPresentTimingQueueSizeEXT),
+            PL_VK_DEV_FUN(GetSwapchainTimeDomainPropertiesEXT),
             PL_VK_DEV_FUN(GetPastPresentationTimingEXT),
             {0}
         },
