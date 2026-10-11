@@ -20,6 +20,7 @@
 #include "formats.h"
 #include "utils.h"
 #include "gpu.h"
+#include "present_feedback.h"
 #include "swapchain.h"
 #include "pl_thread.h"
 
@@ -62,6 +63,9 @@ struct priv {
     bool suboptimal;                // true once VK_SUBOPTIMAL_KHR is returned
     bool needs_recreate;            // swapchain needs to be recreated
     bool has_swapchain_maintenance1;
+    bool feedback_device_supported;
+    bool feedback_surface_supported;
+    struct vk_present_feedback_state feedback;
     struct pl_color_repr color_repr;
     struct pl_color_space color_space;
     struct pl_hdr_metadata hdr_metadata;
@@ -404,6 +408,10 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
 
     const VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *sw_maint_features =
     vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR);
+    const VkPhysicalDevicePresentTimingFeaturesEXT *timing_features =
+    vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT);
+    const VkPhysicalDevicePresentId2FeaturesKHR *present_id_features =
+    vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR);
 
     struct priv *p = PL_PRIV(sw);
     pl_mutex_init(&p->lock);
@@ -413,6 +421,10 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
     p->surf = params->surface;
     p->swapchain_depth = PL_DEF(params->swapchain_depth, 3);
     p->has_swapchain_maintenance1 = sw_maint_features && sw_maint_features->swapchainMaintenance1;
+    p->feedback_device_supported = timing_features && timing_features->presentTiming &&
+        present_id_features && present_id_features->presentId2 &&
+        vk->SetSwapchainPresentTimingQueueSizeEXT && vk->GetPastPresentationTimingEXT &&
+        vk->GetPhysicalDeviceSurfaceCapabilities2KHR;
     pl_assert(p->swapchain_depth > 0);
     atomic_init(&p->frames_in_flight, 0);
 #ifdef PL_HAVE_WIN32
@@ -600,6 +612,7 @@ static void vk_sw_destroy(pl_swapchain sw)
     cleanup_retired_swapchains(sw, UINT64_MAX);
     swapchain_destroy(sw, &p->current, UINT64_MAX);
 
+    vk_present_feedback_uninit(&p->feedback);
     pl_mutex_destroy(&p->lock);
     pl_free((void *) sw);
 }
@@ -617,6 +630,9 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
 
     // Query the supported capabilities and update this struct as needed
     VkSurfaceCapabilitiesKHR caps = {0};
+    p->feedback_surface_supported = false;
+    info->flags &= ~(VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT |
+                     VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR);
     if (!vk->GetPhysicalDeviceSurfaceCapabilities2KHR) {
         VK(vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physd, p->surf, &caps));
         goto caps_ready;
@@ -660,12 +676,22 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT,
     };
 #endif
+    VkPresentTimingSurfaceCapabilitiesEXT timing_support = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT,
+    };
+    VkSurfaceCapabilitiesPresentId2KHR present_id_support = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR,
+    };
     VkSurfaceCapabilities2KHR surface_caps = {
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
 #ifdef PL_HAVE_WIN32
         .pNext = p->exclusive_monitor ? &exclusive_support : NULL,
 #endif
     };
+    if (p->feedback_device_supported) {
+        vk_link_struct(&surface_caps, &timing_support);
+        vk_link_struct(&surface_caps, &present_id_support);
+    }
     VkResult caps_res = vk->GetPhysicalDeviceSurfaceCapabilities2KHR(
         vk->physd, &surface_info, &surface_caps);
 #ifdef PL_HAVE_WIN32
@@ -685,6 +711,14 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
         return false;
     }
     caps = surface_caps.surfaceCapabilities;
+    p->feedback_surface_supported = p->feedback_device_supported &&
+        timing_support.presentTimingSupported && present_id_support.presentId2Supported &&
+        (timing_support.presentStageQueries &
+         VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
+    if (p->feedback_surface_supported) {
+        info->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT |
+                       VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+    }
 
 caps_ready:
     // Check for hidden/invisible window
@@ -866,6 +900,8 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     if (!update_swapchain_info(p, &p->protoInfo, w, h))
         return false;
 
+    vk_present_feedback_reset(&p->feedback);
+
     VkSwapchainCreateInfoKHR sinfo = p->protoInfo;
 
     VkSwapchainPresentModesCreateInfoKHR pminfo = {
@@ -941,6 +977,17 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     }
 #endif
     PL_VK_ASSERT(res, "vk->CreateSwapchainKHR(...)");
+
+    if (p->feedback_surface_supported) {
+        uint32_t queue_size = PL_MAX(8, p->swapchain_depth * 4);
+        res = vk->SetSwapchainPresentTimingQueueSizeEXT(vk->dev, current->swapchain,
+                                                        queue_size);
+        if (res != VK_SUCCESS) {
+            PL_WARN(vk, "Failed setting presentation timing queue size: %s",
+                    vk_res_str(res));
+            p->feedback_surface_supported = false;
+        }
+    }
 
     // Get the new swapchain images
     VK(vk->GetSwapchainImagesKHR(vk->dev, current->swapchain, &num_images, NULL));
@@ -1120,7 +1167,8 @@ static void present_cb(struct priv *p, void *arg)
 
 VK_CB_FUNC_DEF(present_cb);
 
-static bool vk_sw_submit_frame(pl_swapchain sw)
+static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
+    pl_swapchain sw, const struct pl_swapchain_submit_params *params)
 {
     pl_gpu gpu = sw->gpu;
     struct priv *p = PL_PRIV(sw);
@@ -1142,7 +1190,7 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     if (!held) {
         PL_ERR(gpu, "Failed holding swapchain image for presentation");
         pl_mutex_unlock(&p->lock);
-        return false;
+        return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
 
     pl_clock_t t1 = vk->trace_present ? pl_clock_now() : 0;
@@ -1150,7 +1198,7 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     pl_clock_t t2 = vk->trace_present ? pl_clock_now() : 0;
     if (!cmd) {
         pl_mutex_unlock(&p->lock);
-        return false;
+        return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
 
     pl_rc_ref(&p->frames_in_flight);
@@ -1158,7 +1206,7 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     int qidx = cmd->qindex;
     if (!CMD_SUBMIT(&cmd)) {
         pl_mutex_unlock(&p->lock);
-        return false;
+        return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
     pl_clock_t t3 = vk->trace_present ? pl_clock_now() : 0;
     struct vk_cmdpool *pool = vk->pool_graphics;
@@ -1186,7 +1234,31 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     if (current->fences_out.num > 0) {
         VkFence *pfence = &current->fences_out.elem[idx];
         fenceInfo.pFences = pfence;
-        pinfo.pNext = &fenceInfo;
+        vk_link_struct(&pinfo, &fenceInfo);
+    }
+
+    bool tracked = p->feedback_surface_supported && params &&
+        params->feedback_stages == PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT;
+    uint64_t present_id = 0;
+    VkPresentId2KHR present_id_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR,
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
+    VkPresentTimingInfoEXT timing_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT,
+        .presentStageQueries = VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT,
+    };
+    VkPresentTimingsInfoEXT timings_info = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT,
+        .swapchainCount = 1,
+        .pTimingInfos = &timing_info,
+    };
+    if (tracked) {
+        present_id = vk_present_feedback_track((void *) sw, &p->feedback,
+                                               params->token);
+        vk_link_struct(&pinfo, &present_id_info);
+        vk_link_struct(&pinfo, &timings_info);
     }
 
     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
@@ -1194,6 +1266,13 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
     pl_clock_t t6 = vk->trace_present ? pl_clock_now() : 0;
     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
+    if (res == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT && tracked) {
+        vk_present_feedback_discard(&p->feedback, present_id);
+        tracked = false;
+        pinfo.pNext = current->fences_out.num > 0 ? &fenceInfo : NULL;
+        fenceInfo.pNext = NULL;
+        res = vk->QueuePresentKHR(queue, &pinfo);
+    }
     pl_clock_t t7 = vk->trace_present ? pl_clock_now() : 0;
     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
     if (vk->trace_present) {
@@ -1208,30 +1287,139 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     }
 #ifdef PL_HAVE_WIN32
     if (res == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+        if (tracked)
+            vk_present_feedback_discard(&p->feedback, present_id);
         exclusive_lost(p);
         pl_mutex_unlock(&p->lock);
-        return false;
+        return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
 #endif
-    pl_mutex_unlock(&p->lock);
 
     switch (res) {
     case VK_SUBOPTIMAL_KHR:
         p->suboptimal = true;
         // fall through
     case VK_SUCCESS:
-        return true;
+        pl_mutex_unlock(&p->lock);
+        return tracked ? PL_SWAPCHAIN_SUBMITTED_TRACKED
+                       : PL_SWAPCHAIN_SUBMITTED_UNTRACKED;
 
     case VK_ERROR_OUT_OF_DATE_KHR:
         // We can silently ignore this error, since the next start_frame will
         // recreate the swapchain automatically.
-        return true;
+        if (tracked)
+            vk_present_feedback_discard(&p->feedback, present_id);
+        pl_mutex_unlock(&p->lock);
+        return PL_SWAPCHAIN_SUBMITTED_UNTRACKED;
 
     default:
+        if (tracked)
+            vk_present_feedback_discard(&p->feedback, present_id);
         PL_ERR(vk, "Failed presenting to queue %p: %s", (void *) queue,
                vk_res_str(res));
-        return false;
+        pl_mutex_unlock(&p->lock);
+        return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
+}
+
+static bool vk_sw_submit_frame(pl_swapchain sw)
+{
+    return vk_sw_submit_frame_ex(sw, NULL) != PL_SWAPCHAIN_SUBMIT_FAILED;
+}
+
+static uint32_t vk_sw_get_present_feedback_capabilities(pl_swapchain sw)
+{
+    struct priv *p = PL_PRIV(sw);
+    pl_mutex_lock(&p->lock);
+    uint32_t stages = p->feedback_surface_supported
+        ? PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT : 0;
+    pl_mutex_unlock(&p->lock);
+    return stages;
+}
+
+static int vk_sw_poll_present_feedback(
+    pl_swapchain sw, struct pl_swapchain_present_feedback *out_feedback,
+    int max_feedback)
+{
+    struct priv *p = PL_PRIV(sw);
+    struct vk_ctx *vk = p->vk;
+    int written = 0;
+
+    pl_mutex_lock(&p->lock);
+    uint64_t token;
+    while (written < max_feedback &&
+           vk_present_feedback_pop_discarded(&p->feedback, &token))
+    {
+        out_feedback[written++] = (struct pl_swapchain_present_feedback) {
+            .token = token,
+            .status = PL_SWAPCHAIN_PRESENT_FEEDBACK_DISCARDED,
+        };
+    }
+
+    if (written == max_feedback || !p->feedback_surface_supported || !p->current)
+        goto done;
+
+    VkPastPresentationTimingInfoEXT query = {
+        .sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT,
+        .swapchain = p->current->swapchain,
+    };
+    VkPastPresentationTimingPropertiesEXT properties = {
+        .sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT,
+    };
+    VkResult res = vk->GetPastPresentationTimingEXT(vk->dev, &query, &properties);
+    if (res != VK_SUCCESS || !properties.presentationTimingCount)
+        goto done;
+
+    void *tmp = pl_tmp(NULL);
+    uint32_t count = PL_MIN(properties.presentationTimingCount,
+                            (uint32_t) (max_feedback - written));
+    VkPastPresentationTimingEXT *timings = pl_calloc_ptr(tmp, count, timings);
+    VkPresentStageTimeEXT *stages = pl_calloc_ptr(tmp, count, stages);
+    for (uint32_t i = 0; i < count; i++) {
+        timings[i] = (VkPastPresentationTimingEXT) {
+            .sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT,
+            .presentStageCount = 1,
+            .pPresentStages = &stages[i],
+        };
+    }
+    properties.presentationTimingCount = count;
+    properties.pPresentationTimings = timings;
+    res = vk->GetPastPresentationTimingEXT(vk->dev, &query, &properties);
+    if (res != VK_SUCCESS && res != VK_INCOMPLETE) {
+        PL_WARN(vk, "Failed polling presentation timing: %s", vk_res_str(res));
+        pl_free(tmp);
+        goto done;
+    }
+
+    for (uint32_t i = 0; i < properties.presentationTimingCount; i++) {
+        if (!timings[i].reportComplete ||
+            !vk_present_feedback_complete(&p->feedback, timings[i].presentId, &token))
+            continue;
+
+        bool first_pixel_out = false;
+        for (uint32_t n = 0; n < timings[i].presentStageCount; n++) {
+            if ((timings[i].pPresentStages[n].stage &
+                 VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT) &&
+                timings[i].pPresentStages[n].time != 0)
+            {
+                first_pixel_out = true;
+                break;
+            }
+        }
+
+        out_feedback[written++] = (struct pl_swapchain_present_feedback) {
+            .token = token,
+            .completed_stages = first_pixel_out
+                ? PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT : 0,
+            .status = first_pixel_out ? PL_SWAPCHAIN_PRESENT_FEEDBACK_COMPLETED
+                                      : PL_SWAPCHAIN_PRESENT_FEEDBACK_DISCARDED,
+        };
+    }
+    pl_free(tmp);
+
+done:
+    pl_mutex_unlock(&p->lock);
+    return written;
 }
 
 static void vk_sw_swap_buffers(pl_swapchain sw)
@@ -1389,5 +1577,8 @@ static const struct pl_sw_fns vulkan_swapchain = {
     .colorspace_hint    = vk_sw_colorspace_hint,
     .start_frame        = vk_sw_start_frame,
     .submit_frame       = vk_sw_submit_frame,
+    .get_present_feedback_capabilities = vk_sw_get_present_feedback_capabilities,
+    .submit_frame_ex    = vk_sw_submit_frame_ex,
+    .poll_present_feedback = vk_sw_poll_present_feedback,
     .swap_buffers       = vk_sw_swap_buffers,
 };

@@ -220,6 +220,7 @@ struct vk_ctx {
     PL_VK_FUN(GetPipelineCacheData);
     PL_VK_FUN(GetQueryPoolResults);
     PL_VK_FUN(GetSemaphoreFdKHR);
+    PL_VK_FUN(GetPastPresentationTimingEXT);
     PL_VK_FUN(GetSwapchainImagesKHR);
     PL_VK_FUN(InvalidateMappedMemoryRanges);
     PL_VK_FUN(MapMemory);
@@ -231,6 +232,7 @@ struct vk_ctx {
     PL_VK_FUN(ResetFences);
     PL_VK_FUN(SetDebugUtilsObjectNameEXT);
     PL_VK_FUN(SetHdrMetadataEXT);
+    PL_VK_FUN(SetSwapchainPresentTimingQueueSizeEXT);
     PL_VK_FUN(TransitionImageLayoutEXT);
     PL_VK_FUN(UpdateDescriptorSets);
     PL_VK_FUN(WaitSemaphores);

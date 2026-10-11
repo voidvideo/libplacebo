@@ -139,6 +139,7 @@ tests = [
   'lut.c',
   'filters.c',
   'options.c',
+  'present_feedback.c',
   'string.c',
   'tone_mapping.c',
   'utils.c',

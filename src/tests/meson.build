@@ -14,7 +14,7 @@ foreach t : tests
   if t == 'opengl_surfaceless.c'
     deps += glad_dep
   endif
-  if t == 'vulkan.c' or t == 'pass_prepare_vulkan.c' or t == 'dispatch_prepare.c' or t == 'sampling_prepare.c' or t == 'lut_prepare.c' or t == 'renderer_prepare.c'
+  if t == 'vulkan.c' or t == 'present_feedback.c' or t == 'pass_prepare_vulkan.c' or t == 'dispatch_prepare.c' or t == 'sampling_prepare.c' or t == 'lut_prepare.c' or t == 'renderer_prepare.c'
     deps += vulkan_headers
   endif
   sources = []

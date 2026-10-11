@@ -36,6 +36,7 @@ if vulkan_build.allowed()
     'vulkan/gpu_tex.c',
     'vulkan/gpu_pass.c',
     'vulkan/malloc.c',
+    'vulkan/present_feedback.c',
     'vulkan/swapchain.c',
     'vulkan/utils.c',
   ]

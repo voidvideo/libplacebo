@@ -161,9 +161,19 @@ struct pl_swapchain_submit_params {
     uint32_t feedback_stages;
 };
 
+enum pl_swapchain_present_feedback_status {
+    // Every requested stage in `completed_stages` was definitively reached.
+    PL_SWAPCHAIN_PRESENT_FEEDBACK_COMPLETED = 0,
+    // The presentation request will not produce completion proof, for example
+    // because the native swapchain was replaced or the requested stage was
+    // definitively not reached.
+    PL_SWAPCHAIN_PRESENT_FEEDBACK_DISCARDED,
+};
+
 struct pl_swapchain_present_feedback {
     uint64_t token;
     uint32_t completed_stages;
+    enum pl_swapchain_present_feedback_status status;
 };
 
 // Returns the presentation stages supported by this swapchain and its current
@@ -176,8 +186,8 @@ PL_API uint32_t pl_swapchain_get_present_feedback_capabilities(pl_swapchain sw);
 PL_API enum pl_swapchain_submit_result pl_swapchain_submit_frame_ex(
     pl_swapchain sw, const struct pl_swapchain_submit_params *params);
 
-// Non-blockingly drains up to `max_feedback` completed presentation reports.
-// Returns the number written to `out_feedback`.
+// Non-blockingly drains up to `max_feedback` completed or discarded
+// presentation reports. Returns the number written to `out_feedback`.
 PL_API int pl_swapchain_poll_present_feedback(
     pl_swapchain sw, struct pl_swapchain_present_feedback *out_feedback,
     int max_feedback);

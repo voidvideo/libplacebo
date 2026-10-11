@@ -295,6 +295,9 @@ static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
         int num_feedback = pl_swapchain_poll_present_feedback(sw, feedback,
                                                                PL_ARRAY_SIZE(feedback));
         REQUIRE_CMP(num_feedback, >=, 0, "d");
+        for (int n = 0; n < num_feedback; n++)
+            REQUIRE_CMP(feedback[n].status, ==,
+                        PL_SWAPCHAIN_PRESENT_FEEDBACK_COMPLETED, "d");
         if (!(feedback_caps & PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT))
             REQUIRE_CMP(num_feedback, ==, 0, "d");
 

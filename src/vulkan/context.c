@@ -221,6 +221,17 @@ static const struct vk_ext vk_device_extensions[] = {
             PL_VK_DEV_FUN(GetDeviceImageMemoryRequirements),
             {0}
         },
+    }, {
+        .name = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+    }, {
+        .name = VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+    }, {
+        .name = VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(SetSwapchainPresentTimingQueueSizeEXT),
+            PL_VK_DEV_FUN(GetPastPresentationTimingEXT),
+            {0}
+        },
 #ifdef VK_KHR_cooperative_matrix
     }, {
         .name = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
@@ -266,6 +277,9 @@ const char * const pl_vulkan_recommended_extensions[] = {
     VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,
 #endif
     VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
+    VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+    VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+    VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
 #ifdef VK_KHR_cooperative_matrix
     VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
 #endif
@@ -300,11 +314,19 @@ static const VkPhysicalDeviceCooperativeMatrixFeaturesKHR recommended_cooperativ
 
 static const VkPhysicalDeviceShaderClockFeaturesKHR shader_clock = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR,
+    .pNext = (void *) &(const VkPhysicalDevicePresentTimingFeaturesEXT) {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+        .pNext = (void *) &(const VkPhysicalDevicePresentId2FeaturesKHR) {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
 #ifdef VK_KHR_cooperative_matrix
-    .pNext = (void *) &recommended_cooperative_matrix,
+            .pNext = (void *) &recommended_cooperative_matrix,
 #elif defined(VK_KHR_internally_synchronized_queues)
-    .pNext = (void *) &synchronized_queues,
+            .pNext = (void *) &synchronized_queues,
 #endif
+            .presentId2 = true,
+        },
+        .presentTiming = true,
+    },
     .shaderSubgroupClock = true,
     .shaderDeviceClock = true,
 };
