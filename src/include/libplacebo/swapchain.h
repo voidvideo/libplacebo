@@ -131,6 +131,57 @@ PL_API bool pl_swapchain_start_frame(pl_swapchain sw, struct pl_swapchain_frame 
 // `pl_swapchain_submit_frame` is finished.
 PL_API bool pl_swapchain_submit_frame(pl_swapchain sw);
 
+// Presentation stages which a swapchain may be able to report after a frame
+// has been submitted. Support is surface-specific and must be queried with
+// `pl_swapchain_get_present_feedback_capabilities`.
+enum pl_swapchain_present_stage {
+    // The first pixel of the submitted image has reached the presentation
+    // target. On a physical display this is the start of scanout; a compositor
+    // may define the target at its own presentation boundary.
+    PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT = 1 << 0,
+};
+
+// Result of an extended frame submission.
+enum pl_swapchain_submit_result {
+    // The frame was not submitted.
+    PL_SWAPCHAIN_SUBMIT_FAILED = 0,
+    // The frame was submitted, but no completion feedback will be produced.
+    PL_SWAPCHAIN_SUBMITTED_UNTRACKED,
+    // The frame was submitted and completion feedback was accepted.
+    PL_SWAPCHAIN_SUBMITTED_TRACKED,
+};
+
+struct pl_swapchain_submit_params {
+    // Opaque caller value returned unchanged in `pl_swapchain_present_feedback`.
+    // A value of zero is valid.
+    uint64_t token;
+
+    // Bitwise combination of `enum pl_swapchain_present_stage`. Unsupported
+    // stages make the successful submission untracked rather than failing it.
+    uint32_t feedback_stages;
+};
+
+struct pl_swapchain_present_feedback {
+    uint64_t token;
+    uint32_t completed_stages;
+};
+
+// Returns the presentation stages supported by this swapchain and its current
+// surface. The returned mask may change after swapchain recreation.
+PL_API uint32_t pl_swapchain_get_present_feedback_capabilities(pl_swapchain sw);
+
+// Submits the previously started frame and optionally requests asynchronous
+// presentation feedback. This consumes the started frame in all cases, just
+// like `pl_swapchain_submit_frame`.
+PL_API enum pl_swapchain_submit_result pl_swapchain_submit_frame_ex(
+    pl_swapchain sw, const struct pl_swapchain_submit_params *params);
+
+// Non-blockingly drains up to `max_feedback` completed presentation reports.
+// Returns the number written to `out_feedback`.
+PL_API int pl_swapchain_poll_present_feedback(
+    pl_swapchain sw, struct pl_swapchain_present_feedback *out_feedback,
+    int max_feedback);
+
 // Performs a "buffer swap", or some generalization of the concept. In layman's
 // terms, this blocks until the execution of the Nth previously submitted frame
 // has been "made complete" in some sense. (The N derives from the swapchain's

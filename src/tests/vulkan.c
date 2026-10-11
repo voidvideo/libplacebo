@@ -263,6 +263,9 @@ static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
     int w = 640, h = 480;
     REQUIRE(pl_swapchain_resize(sw, &w, &h));
 
+    uint32_t feedback_caps = pl_swapchain_get_present_feedback_capabilities(sw);
+    REQUIRE(!(feedback_caps & ~PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT));
+
     for (int i = 0; i < 10; i++) {
         struct pl_swapchain_frame frame;
         REQUIRE(pl_swapchain_start_frame(sw, &frame));
@@ -273,8 +276,27 @@ static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
         struct pl_frame target;
         pl_frame_from_swapchain(&target, &frame);
 
-        REQUIRE(pl_swapchain_submit_frame(sw));
+        if (i == 0) {
+            enum pl_swapchain_submit_result result = pl_swapchain_submit_frame_ex(sw,
+                &(struct pl_swapchain_submit_params) {
+                    .token = 42,
+                    .feedback_stages = PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT,
+                });
+            if (feedback_caps & PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT)
+                REQUIRE_CMP(result, ==, PL_SWAPCHAIN_SUBMITTED_TRACKED, "d");
+            else
+                REQUIRE_CMP(result, ==, PL_SWAPCHAIN_SUBMITTED_UNTRACKED, "d");
+        } else {
+            REQUIRE(pl_swapchain_submit_frame(sw));
+        }
         pl_swapchain_swap_buffers(sw);
+
+        struct pl_swapchain_present_feedback feedback[2];
+        int num_feedback = pl_swapchain_poll_present_feedback(sw, feedback,
+                                                               PL_ARRAY_SIZE(feedback));
+        REQUIRE_CMP(num_feedback, >=, 0, "d");
+        if (!(feedback_caps & PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT))
+            REQUIRE_CMP(num_feedback, ==, 0, "d");
 
         // Try resizing the swapchain in the middle of rendering
         if (i == 5) {

@@ -87,6 +87,37 @@ bool pl_swapchain_submit_frame(pl_swapchain sw)
     return impl->submit_frame(sw);
 }
 
+uint32_t pl_swapchain_get_present_feedback_capabilities(pl_swapchain sw)
+{
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (!impl->get_present_feedback_capabilities)
+        return 0;
+
+    return impl->get_present_feedback_capabilities(sw);
+}
+
+enum pl_swapchain_submit_result pl_swapchain_submit_frame_ex(
+    pl_swapchain sw, const struct pl_swapchain_submit_params *params)
+{
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (impl->submit_frame_ex)
+        return impl->submit_frame_ex(sw, params);
+
+    return impl->submit_frame(sw) ? PL_SWAPCHAIN_SUBMITTED_UNTRACKED
+                                  : PL_SWAPCHAIN_SUBMIT_FAILED;
+}
+
+int pl_swapchain_poll_present_feedback(
+    pl_swapchain sw, struct pl_swapchain_present_feedback *out_feedback,
+    int max_feedback)
+{
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (!impl->poll_present_feedback || !out_feedback || max_feedback <= 0)
+        return 0;
+
+    return impl->poll_present_feedback(sw, out_feedback, max_feedback);
+}
+
 void pl_swapchain_swap_buffers(pl_swapchain sw)
 {
     const struct pl_sw_fns *impl = PL_PRIV(sw);
