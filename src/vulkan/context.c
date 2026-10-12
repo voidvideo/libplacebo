@@ -230,6 +230,14 @@ static const struct vk_ext vk_device_extensions[] = {
         },
     }, {
         .name = VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+#ifdef VK_KHR_present_wait2
+    }, {
+        .name = VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(WaitForPresent2KHR),
+            {0}
+        },
+#endif
     }, {
         .name = VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
@@ -285,6 +293,9 @@ const char * const pl_vulkan_recommended_extensions[] = {
     VK_KHR_MAINTENANCE_4_EXTENSION_NAME,
     VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
     VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+#ifdef VK_KHR_present_wait2
+    VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME,
+#endif
     VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
 #ifdef VK_KHR_cooperative_matrix
     VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
@@ -324,7 +335,17 @@ static const VkPhysicalDeviceShaderClockFeaturesKHR shader_clock = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
         .pNext = (void *) &(const VkPhysicalDevicePresentId2FeaturesKHR) {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+#ifdef VK_KHR_present_wait2
+            .pNext = (void *) &(const VkPhysicalDevicePresentWait2FeaturesKHR) {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR,
 #ifdef VK_KHR_cooperative_matrix
+                .pNext = (void *) &recommended_cooperative_matrix,
+#elif defined(VK_KHR_internally_synchronized_queues)
+                .pNext = (void *) &synchronized_queues,
+#endif
+                .presentWait2 = true,
+            },
+#elif defined(VK_KHR_cooperative_matrix)
             .pNext = (void *) &recommended_cooperative_matrix,
 #elif defined(VK_KHR_internally_synchronized_queues)
             .pNext = (void *) &synchronized_queues,

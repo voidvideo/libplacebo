@@ -65,14 +65,19 @@ vk_present_feedback_pick_clock(const VkTimeDomainKHR *domains,
     return PL_SWAPCHAIN_PRESENT_CLOCK_UNKNOWN;
 }
 
-uint64_t vk_present_feedback_track(void *parent,
-                                   struct vk_present_feedback_state *state,
-                                   uint64_t token)
+uint64_t vk_present_feedback_next_id(struct vk_present_feedback_state *state)
 {
     if (!state->next_present_id)
         state->next_present_id = 1;
 
-    uint64_t present_id = state->next_present_id++;
+    return state->next_present_id++;
+}
+
+uint64_t vk_present_feedback_track(void *parent,
+                                   struct vk_present_feedback_state *state,
+                                   uint64_t token)
+{
+    uint64_t present_id = vk_present_feedback_next_id(state);
     PL_ARRAY_APPEND(parent, state->pending, (struct vk_present_feedback_entry) {
         .present_id = present_id,
         .token = token,

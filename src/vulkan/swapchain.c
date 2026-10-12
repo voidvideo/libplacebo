@@ -34,6 +34,7 @@ struct vk_swapchain {
     PL_ARRAY(VkFence) fences_out;   // pool of fences for presented images
     int idx_sems_in;                // index of next free semaphore to acquire
     int last_imgidx;                // the image index last acquired (for submit)
+    uint64_t last_present_id;       // most recent native present not yet waited
 };
 
 struct priv {
@@ -66,6 +67,10 @@ struct priv {
     bool feedback_device_supported;
     bool feedback_surface_supported;
     bool feedback_host_clock_supported;
+#ifdef VK_KHR_present_wait2
+    bool present_wait2_device_supported;
+    bool present_wait2_surface_supported;
+#endif
     VkTimeDomainKHR feedback_host_time_domain;
     enum pl_swapchain_present_clock feedback_clock;
     uint64_t feedback_clock_id;
@@ -468,6 +473,10 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
     vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT);
     const VkPhysicalDevicePresentId2FeaturesKHR *present_id_features =
     vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR);
+#ifdef VK_KHR_present_wait2
+    const VkPhysicalDevicePresentWait2FeaturesKHR *present_wait2_features =
+    vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR);
+#endif
 
     struct priv *p = PL_PRIV(sw);
     pl_mutex_init(&p->lock);
@@ -482,6 +491,11 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
         vk->SetSwapchainPresentTimingQueueSizeEXT &&
         vk->GetSwapchainTimeDomainPropertiesEXT && vk->GetPastPresentationTimingEXT &&
         vk->GetPhysicalDeviceSurfaceCapabilities2KHR;
+#ifdef VK_KHR_present_wait2
+    p->present_wait2_device_supported = present_id_features && present_id_features->presentId2 &&
+        present_wait2_features && present_wait2_features->presentWait2 &&
+        vk->WaitForPresent2KHR && vk->GetPhysicalDeviceSurfaceCapabilities2KHR;
+#endif
     p->feedback_host_time_domain = vk_present_feedback_host_clock();
     if (vk->GetPhysicalDeviceCalibrateableTimeDomainsKHR &&
         vk->GetCalibratedTimestampsKHR)
@@ -762,15 +776,29 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
     VkSurfaceCapabilitiesPresentId2KHR present_id_support = {
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR,
     };
+#ifdef VK_KHR_present_wait2
+    VkSurfaceCapabilitiesPresentWait2KHR present_wait2_support = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_WAIT_2_KHR,
+    };
+#endif
     VkSurfaceCapabilities2KHR surface_caps = {
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
 #ifdef PL_HAVE_WIN32
         .pNext = p->exclusive_monitor ? &exclusive_support : NULL,
 #endif
     };
-    if (p->feedback_device_supported) {
-        vk_link_struct(&surface_caps, &timing_support);
+    if (p->feedback_device_supported
+#ifdef VK_KHR_present_wait2
+        || p->present_wait2_device_supported
+#endif
+    ) {
         vk_link_struct(&surface_caps, &present_id_support);
+        if (p->feedback_device_supported)
+            vk_link_struct(&surface_caps, &timing_support);
+#ifdef VK_KHR_present_wait2
+        if (p->present_wait2_device_supported)
+            vk_link_struct(&surface_caps, &present_wait2_support);
+#endif
     }
     VkResult caps_res = vk->GetPhysicalDeviceSurfaceCapabilities2KHR(
         vk->physd, &surface_info, &surface_caps);
@@ -795,10 +823,18 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
         timing_support.presentTimingSupported && present_id_support.presentId2Supported &&
         (timing_support.presentStageQueries &
          VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
-    if (p->feedback_surface_supported) {
-        info->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT |
-                       VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
-    }
+#ifdef VK_KHR_present_wait2
+    p->present_wait2_surface_supported = p->present_wait2_device_supported &&
+        present_id_support.presentId2Supported && present_wait2_support.presentWait2Supported;
+#endif
+    if (p->feedback_surface_supported)
+        info->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+    if (p->feedback_surface_supported
+#ifdef VK_KHR_present_wait2
+        || p->present_wait2_surface_supported
+#endif
+    )
+        info->flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
 
 caps_ready:
     // Check for hidden/invisible window
@@ -1356,6 +1392,12 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
 
     bool tracked = p->feedback_surface_supported && params &&
         params->feedback_stages == PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT;
+#ifdef VK_KHR_present_wait2
+    bool wait_present = p->swapchain_depth == 1 &&
+        p->present_wait2_surface_supported;
+#else
+    bool wait_present = false;
+#endif
     uint64_t present_id = 0;
     VkPresentId2KHR present_id_info = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR,
@@ -1378,9 +1420,13 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     if (tracked) {
         present_id = vk_present_feedback_track((void *) sw, &p->feedback,
                                                params->token);
-        vk_link_struct(&pinfo, &present_id_info);
-        vk_link_struct(&pinfo, &timings_info);
+    } else if (wait_present) {
+        present_id = vk_present_feedback_next_id(&p->feedback);
     }
+    if (present_id)
+        vk_link_struct(&pinfo, &present_id_info);
+    if (tracked)
+        vk_link_struct(&pinfo, &timings_info);
 
     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
     pl_clock_t t5 = vk->trace_present ? pl_clock_now() : 0;
@@ -1392,6 +1438,8 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         tracked = false;
         pinfo.pNext = current->fences_out.num > 0 ? &fenceInfo : NULL;
         fenceInfo.pNext = NULL;
+        if (wait_present)
+            vk_link_struct(&pinfo, &present_id_info);
         res = vk->QueuePresentKHR(queue, &pinfo);
     }
     pl_clock_t t7 = vk->trace_present ? pl_clock_now() : 0;
@@ -1421,6 +1469,10 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         p->suboptimal = true;
         // fall through
     case VK_SUCCESS:
+#ifdef VK_KHR_present_wait2
+        if (wait_present)
+            current->last_present_id = present_id;
+#endif
         pl_mutex_unlock(&p->lock);
         return tracked ? PL_SWAPCHAIN_SUBMITTED_TRACKED
                        : PL_SWAPCHAIN_SUBMITTED_UNTRACKED;
@@ -1571,6 +1623,24 @@ static void vk_sw_swap_buffers(pl_swapchain sw)
         vk_poll_commands(p->vk, UINT64_MAX);
         pl_mutex_lock(&p->lock);
     }
+#ifdef VK_KHR_present_wait2
+    if (p->swapchain_depth == 1 && p->present_wait2_surface_supported &&
+        p->current && p->current->last_present_id)
+    {
+        const uint64_t present_id = p->current->last_present_id;
+        VkPresentWait2InfoKHR wait = {
+            .sType = VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR,
+            .presentId = present_id,
+            .timeout = UINT64_MAX,
+        };
+        VkResult res = p->vk->WaitForPresent2KHR(p->vk->dev, p->current->swapchain, &wait);
+        p->current->last_present_id = 0;
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+            PL_WARN(p->vk, "Disabling native present wait after failure: %s", vk_res_str(res));
+            p->present_wait2_surface_supported = false;
+        }
+    }
+#endif
     pl_mutex_unlock(&p->lock);
 }
 

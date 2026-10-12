@@ -22,6 +22,7 @@ vk_present_feedback_pick_clock(const VkTimeDomainKHR *domains,
                                enum pl_swapchain_present_clock preferred,
                                uint64_t *out_domain_id);
 
+uint64_t vk_present_feedback_next_id(struct vk_present_feedback_state *state);
 uint64_t vk_present_feedback_track(void *parent,
                                    struct vk_present_feedback_state *state,
                                    uint64_t token);
