@@ -144,6 +144,7 @@ struct pl_renderer_preparation_t {
     int pass_index, texture_index;
     PL_ARRAY(struct prepared_capture) captures;
     bool captures_valid;
+    pl_renderer_preparation capture_active; // borrowed only during capture execution
     enum pl_hook_stage capture_stages;
     uint8_t shader_id, frame_index;
     struct pass_state *current;
@@ -512,6 +513,12 @@ static void prepare_lut(void *priv, pl_shader_obj lut)
     for (int i = 0; i < p->luts.num; i++)
         if (p->luts.elem[i] == lut)
             return;
+    if (p->capture_active) {
+        for (int i = 0; i < p->capture_active->luts.num; i++) {
+            if (p->capture_active->luts.elem[i] == lut)
+                return;
+        }
+    }
     if (p->checking) {
         prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "new LUT during preflight");
         return;
@@ -6004,6 +6011,8 @@ static enum pl_renderer_prepare_result render_image_prepared(pl_renderer_prepara
     if (result == PL_RENDERER_PREPARE_OK) {
         p->executing = true;
         p->captures_valid = false;
+        for (int i = 0; i < p->captures.num; i++)
+            p->captures.elem[i].image.texture = NULL;
         result = preparation_traverse(p, image ? &access.image : NULL, &access.target, signature);
         p->executing = false;
     }
@@ -6228,6 +6237,135 @@ enum pl_renderer_prepare_result pl_render_image_mix_prepared(pl_renderer_prepara
     uint64_t signature;
     enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
     return result == PL_RENDERER_PREPARE_OK ? render_image_prepared(p, image, target, signature) : result;
+}
+
+// Capture graphs use separate shader manifests and observation storage, but
+// execute against the live renderer state. Cached source frames are borrowed,
+// never re-analysed just to obtain a diagnostic image.
+static void capture_shader_state(pl_renderer a, pl_renderer b)
+{
+    PL_SWAP(a->tone_map_state, b->tone_map_state);
+    PL_SWAP(a->dither_state, b->dither_state);
+    for (int i = 0; i < 4; i++)
+        PL_SWAP(a->grain_state[i], b->grain_state[i]);
+}
+
+static bool capture_cache_compatible(pl_renderer_preparation p,
+                                     pl_renderer_preparation active)
+{
+    if (p->mix_direct != active->mix_direct || p->num_sources != active->num_sources)
+        return false;
+    const struct pl_hook_texture *a = p->mix_frame.prepared_tex;
+    const struct pl_hook_texture *b = active->mix_frame.prepared_tex;
+    if (!!a != !!b || (a && (a->params.w != b->params.w ||
+        a->params.h != b->params.h || a->params.format != b->params.format)))
+        return false;
+    for (int i = 0; i < p->num_sources; i++) {
+        if (!capture_cache_compatible(p->sources[i], active->sources[i]))
+            return false;
+    }
+    return true;
+}
+
+struct capture_cache {
+    struct cached_frame frame;
+    struct pl_hook_texture *storage;
+};
+
+static void capture_cache_begin(pl_renderer_preparation p,
+                                pl_renderer_preparation active,
+                                struct capture_cache *saved)
+{
+    p->capture_active = active;
+    saved->frame = p->mix_frame;
+    saved->storage = (struct pl_hook_texture *) p->mix_frame.prepared_tex;
+    p->frame_index = active->frame_index;
+    p->mix_signature = active->mix_signature;
+    p->mix_valid = active->mix_valid;
+    if (active->mix_valid)
+        p->mix_frame = active->mix_frame;
+}
+
+static void capture_cache_end(pl_renderer_preparation p,
+                              pl_renderer_preparation active,
+                              const struct capture_cache *saved, bool success)
+{
+    struct pl_hook_texture *dst = (struct pl_hook_texture *) active->mix_frame.prepared_tex;
+    if (success) {
+        active->frame_index = p->frame_index;
+        active->mix_valid = p->mix_valid;
+        active->mix_signature = p->mix_signature;
+        if (p->mix_valid && p->mix_frame.prepared_tex != dst) {
+            // Same-shaped owned storage, so ownership can move without a copy
+            // submission or waiting for the GPU. The capture retains the old
+            // cache texture until worker cleanup.
+            pl_assert(dst && saved->storage);
+            PL_SWAP(dst->texture, saved->storage->texture);
+            active->mix_frame = p->mix_frame;
+            active->mix_frame.prepared_tex = dst;
+        }
+    } else {
+        // A partially executed graph may have advanced analysis state. Never
+        // reuse a source cache under assumptions from before that execution.
+        active->mix_valid = false;
+    }
+    p->capture_active = NULL;
+    p->mix_frame = saved->frame;
+    p->mix_valid = false;
+}
+
+static enum pl_renderer_prepare_result render_capture(pl_renderer_preparation p,
+    pl_renderer_preparation active, const struct pl_frame *image,
+    const struct pl_frame_mix *images, const struct pl_frame *target)
+{
+    if (!p || !active || p == active || !p->capture_stages || active->capture_stages ||
+        p->synchronous || active->synchronous || p->mix != active->mix ||
+        p->snapshot.params != active->snapshot.params || p->rr->gpu != active->rr->gpu ||
+        !capture_cache_compatible(p, active))
+        return PL_RENDERER_PREPARE_INVALID;
+    struct capture_cache saved[MAX_MIX_FRAMES + 1];
+    capture_cache_begin(p, active, &saved[0]);
+    for (int i = 0; i < p->num_sources; i++)
+        capture_cache_begin(p->sources[i], active->sources[i], &saved[i + 1]);
+    capture_shader_state(p->rr, active->rr);
+    enum pl_renderer_prepare_result result = p->mix
+        ? pl_render_image_mix_prepared(p, images, target)
+        : pl_render_image_prepared(p, image, target);
+    capture_shader_state(p->rr, active->rr);
+    capture_cache_end(p, active, &saved[0], result == PL_RENDERER_PREPARE_OK);
+    for (int i = 0; i < p->num_sources; i++)
+        capture_cache_end(p->sources[i], active->sources[i], &saved[i + 1],
+                          result == PL_RENDERER_PREPARE_OK);
+    return result;
+}
+
+enum pl_renderer_prepare_result pl_render_image_prepared_capture(
+    pl_renderer_preparation capture, pl_renderer_preparation active,
+    const struct pl_frame *image, const struct pl_frame *target)
+{
+    if (!capture || capture->mix)
+        return PL_RENDERER_PREPARE_INVALID;
+    return render_capture(capture, active, image, NULL, target);
+}
+
+enum pl_renderer_prepare_result pl_render_image_mix_prepared_capture(
+    pl_renderer_preparation capture, pl_renderer_preparation active,
+    const struct pl_frame_mix *images, const struct pl_frame *target)
+{
+    if (!capture || !capture->mix)
+        return PL_RENDERER_PREPARE_INVALID;
+    return render_capture(capture, active, NULL, images, target);
+}
+
+int pl_renderer_capture_count(pl_renderer_preparation p, enum pl_hook_stage stage)
+{
+    if (!p) return 0;
+    int count = 0;
+    for (int i = 0; i < p->captures.num; i++)
+        count += p->captures.elem[i].image.stage == stage;
+    for (int i = 0; i < p->num_sources; i++)
+        count += pl_renderer_capture_count(p->sources[i], stage);
+    return count;
 }
 
 static bool get_capture(pl_renderer_preparation p, enum pl_hook_stage stage,

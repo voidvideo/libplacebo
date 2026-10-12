@@ -623,6 +623,8 @@ static void test_renderer(pl_gpu gpu, struct pl_frame image, int width, bool hoo
     test_renderer_sampler(gpu, image, width, hook, ewa, 0);
 }
 
+static void wait_prepared(pl_renderer_preparation preparation);
+
 static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
 {
     pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
@@ -665,7 +667,7 @@ static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
         .num_frames = 2, .frames = frames, .signatures = signatures,
         .timestamps = timestamps, .vsync_duration = 1.0,
     };
-    pl_renderer_preparation preparation = NULL;
+    pl_renderer_preparation preparation = NULL, capture = NULL;
     srand(1234);
     describing = true;
     REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot,
@@ -681,6 +683,9 @@ static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
     }
     REQUIRE(state == PL_PASS_PREPARE_READY);
     forbid_compile = false;
+    REQUIRE(pl_renderer_describe_image_mix_capture(renderer, &mix, &target, &snapshot,
+        PL_HOOK_NATIVE | PL_HOOK_PRE_OUTPUT | PL_HOOK_OUTPUT, &capture) == PL_RENDERER_PREPARE_OK);
+    wait_prepared(capture);
     uint8_t expected[8 * 8 * 4], actual[8 * 8 * 4];
     for (int i = 0; i < 4; i++) {
         signatures[1] = 7 + i / 2;
@@ -692,7 +697,13 @@ static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
         if (hook && !direct && i % 2)
             REQUIRE(owner->descriptions == descriptions + 1);
         describing = false;
-        enum pl_renderer_prepare_result result = pl_render_image_mix_prepared(preparation, &mix, &target);
+        enum pl_renderer_prepare_result result = i == 1 || i == 2
+            ? pl_render_image_mix_prepared_capture(capture, preparation, &mix, &target)
+            : pl_render_image_mix_prepared(preparation, &mix, &target);
+        if (i == 1 || i == 2) {
+            struct pl_renderer_capture observation;
+            REQUIRE(pl_renderer_get_capture(capture, PL_HOOK_NATIVE, 0, &observation) == (direct || i == 2));
+        }
         if (result != PL_RENDERER_PREPARE_OK)
             fprintf(stderr, "mix result %d: %s\n", result, pl_renderer_prepare_error(preparation));
         REQUIRE(result == PL_RENDERER_PREPARE_OK);
@@ -708,7 +719,12 @@ static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
         REQUIRE(pl_render_image_mix(reference_renderer, &mix, &reference_target, &owner->params));
         REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = reference, .ptr = expected)));
         REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
-        REQUIRE_MEMEQ(expected, actual, sizeof(expected));
+        if (i == 1 || i == 2) {
+            for (int j = 0; j < sizeof(expected); j++)
+                REQUIRE(abs((int) expected[j] - actual[j]) <= 1);
+        } else {
+            REQUIRE_MEMEQ(expected, actual, sizeof(expected));
+        }
         if (hook) {
             REQUIRE(owner->ordinary == owner->executions);
             REQUIRE(owner->ordinary - ordinary == 1 + (direct || !(i & 1)));
@@ -731,6 +747,7 @@ static void test_mix(pl_gpu gpu, struct pl_frame image, bool direct, bool hook)
         REQUIRE(owner->executions == executions);
         REQUIRE(pl_renderer_prepare_poll(preparation) == PL_PASS_PREPARE_READY);
     }
+    pl_renderer_prepare_destroy(&capture);
     pl_renderer_prepare_destroy(&preparation);
     REQUIRE(owner->refs == 1);
     pl_dispatch_destroy(&owner->auxiliary);
@@ -1245,15 +1262,17 @@ static void test_temporal_mix(pl_gpu gpu, const struct pl_filter_config *filter,
         .num_frames = wide ? 17 : 3, .frames = frames, .signatures = signatures,
         .timestamps = timestamps, .vsync_duration = 1.0f,
     };
-    pl_renderer_preparation preparation = NULL;
+    pl_renderer_preparation preparation = NULL, capture = NULL;
     describing = true;
-    REQUIRE(pl_renderer_describe_image_mix_capture(renderer, &mix, &target, &snapshot,
-        PL_HOOK_RGB_INPUT | PL_HOOK_NATIVE | PL_HOOK_RGB | PL_HOOK_OUTPUT | PL_HOOK_LUMA_INPUT | PL_HOOK_CHROMA_INPUT | PL_HOOK_LINEAR | PL_HOOK_PRE_KERNEL | PL_HOOK_POST_KERNEL | PL_HOOK_SCALED | PL_HOOK_PRE_OUTPUT,
+    REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot,
                                            &preparation) == PL_RENDERER_PREPARE_OK);
     describing = false;
     forbid_compile = true;
     wait_prepared(preparation);
     forbid_compile = false;
+    REQUIRE(pl_renderer_describe_image_mix_capture(renderer, &mix, &target, &snapshot,
+        PL_HOOK_NATIVE | PL_HOOK_PRE_OUTPUT | PL_HOOK_OUTPUT, &capture) == PL_RENDERER_PREPARE_OK);
+    wait_prepared(capture);
     for (int step = 0; step < (wide ? 1 : 6); step++) {
         if (step == 1) { timestamps[0] = -0.75f; timestamps[1] = 0.25f; }
         if (step == 2) mix.num_frames = 1;
@@ -1272,7 +1291,9 @@ static void test_temporal_mix(pl_gpu gpu, const struct pl_filter_config *filter,
         REQUIRE(result == PL_RENDERER_PREPARE_OK);
         REQUIRE(owner->executions == executions);
         describing = false;
-        result = pl_render_image_mix_prepared(preparation, &mix, &target);
+        result = step == 1 || step == 4
+            ? pl_render_image_mix_prepared_capture(capture, preparation, &mix, &target)
+            : pl_render_image_mix_prepared(preparation, &mix, &target);
         if (result != PL_RENDERER_PREPARE_OK)
             fprintf(stderr, "temporal execute step %d: %d %s\n", step, result,
                     pl_renderer_prepare_error(preparation));
@@ -1316,6 +1337,7 @@ static void test_temporal_mix(pl_gpu gpu, const struct pl_filter_config *filter,
             REQUIRE(pl_renderer_prepare_poll(preparation) == PL_PASS_PREPARE_READY);
         }
     }
+    pl_renderer_prepare_destroy(&capture);
     pl_renderer_prepare_destroy(&preparation);
     REQUIRE(owner->refs == 1);
     pl_dispatch_destroy(&owner->auxiliary);
@@ -1763,7 +1785,7 @@ static void test_native_color(pl_gpu gpu, struct pl_frame image, int peak)
     struct pl_renderer_snapshot snapshot = {
         .params = &owner->params, .owner = owner, .retain = retain, .release = release,
     };
-    pl_renderer_preparation preparation = NULL;
+    pl_renderer_preparation preparation = NULL, capture = NULL;
     describing = true;
     enum pl_renderer_prepare_result result = pl_renderer_describe_image(
         renderer, &image, &target, &snapshot, &preparation);
@@ -1772,6 +1794,8 @@ static void test_native_color(pl_gpu gpu, struct pl_frame image, int peak)
         fprintf(stderr, "native describe: %s\n", pl_renderer_prepare_error(preparation));
     REQUIRE(result == PL_RENDERER_PREPARE_OK);
     wait_prepared(preparation);
+    REQUIRE(pl_renderer_describe_image_capture(renderer, &image, &target, &snapshot, PL_HOOK_PRE_OUTPUT, &capture) == PL_RENDERER_PREPARE_OK);
+    wait_prepared(capture);
     pl_renderer without_contrast = peak >= 3 ? pl_renderer_create(gpu->log, gpu) : NULL;
     bool contrast_changed_pixels = false;
     for (int i = 0; i < 8; i++) {
@@ -1797,17 +1821,24 @@ static void test_native_color(pl_gpu gpu, struct pl_frame image, int peak)
         if (result != PL_RENDERER_PREPARE_OK)
             fprintf(stderr, "native preflight %d: %s\n", i, pl_renderer_prepare_error(preparation));
         REQUIRE(result == PL_RENDERER_PREPARE_OK);
-        result = pl_render_image_prepared(preparation, &image, &target);
+        result = i == 4
+            ? pl_render_image_prepared_capture(capture, preparation, &image, &target)
+            : pl_render_image_prepared(preparation, &image, &target);
         forbid_compile = false;
         if (result != PL_RENDERER_PREPARE_OK)
-            fprintf(stderr, "native execute %d: %s\n", i, pl_renderer_prepare_error(preparation));
+            fprintf(stderr, "native execute peak=%d step=%d result=%d: %s\n", peak, i, result, pl_renderer_prepare_error(capture));
         REQUIRE(result == PL_RENDERER_PREPARE_OK);
         REQUIRE(pl_render_image(ordinary, &image, &reference_target, &owner->params));
         uint8_t actual[64], expected[64];
         REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
         REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = reference, .ptr = expected)));
-        if (!detect.allow_delayed || i > 0)
+        if (i == 4) {
+            // One additional float materialization may round one output code.
+            for (int j = 0; j < 64; j++)
+                REQUIRE(abs((int) actual[j] - expected[j]) <= 1);
+        } else if (!detect.allow_delayed || i > 0) {
             REQUIRE_MEMEQ(actual, expected, sizeof(actual));
+        }
         if (without_contrast) {
             struct pl_color_map_params disabled_map = map;
             disabled_map.contrast_recovery = 0.0f;
@@ -1822,6 +1853,7 @@ static void test_native_color(pl_gpu gpu, struct pl_frame image, int peak)
     if (without_contrast)
         REQUIRE(contrast_changed_pixels);
     pl_renderer_destroy(&without_contrast);
+    pl_renderer_prepare_destroy(&capture);
     pl_renderer_prepare_destroy(&preparation);
     free(owner);
     pl_renderer_destroy(&renderer);

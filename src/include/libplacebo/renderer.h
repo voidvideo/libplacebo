@@ -1018,6 +1018,27 @@ PL_API enum pl_renderer_prepare_result pl_renderer_describe_image_mix_capture(
     const struct pl_renderer_snapshot *snapshot, enum pl_hook_stage stages,
     pl_renderer_preparation *out);
 
+// Execute observation in place of an active prepared render, preserving its
+// native peak-detection history, shader frame sequence and source caches.
+// Both preparations must retain the identical snapshot.params pointer and have
+// matching source/cache shapes. Neither handle may be used concurrently.
+// Existing cached source frames are reused: source stages not executed on this
+// frame have no observation. Call again on a fresh source frame if needed.
+// Observation storage still belongs to `capture`; complete its readback before
+// executing it again. Subsequent ordinary rendering may use `active` immediately.
+PL_API enum pl_renderer_prepare_result pl_render_image_prepared_capture(
+    pl_renderer_preparation capture, pl_renderer_preparation active,
+    const struct pl_frame *image, const struct pl_frame *target);
+PL_API enum pl_renderer_prepare_result pl_render_image_mix_prepared_capture(
+    pl_renderer_preparation capture, pl_renderer_preparation active,
+    const struct pl_frame_mix *images, const struct pl_frame *target);
+
+// Number of described observations at this stage, including all source slots.
+// Zero means the stage is inapplicable. Available observations on a particular
+// execution can be fewer due to frame-cache reuse or temporal weights.
+PL_API int pl_renderer_capture_count(pl_renderer_preparation preparation,
+    enum pl_hook_stage stage);
+
 // A stage observation from the last successful prepared execution. Values are
 // raw shader components, not an RGB preview; repr/color/rect describe them.
 // Textures are float RGBA, host-readable, owned by the preparation. They remain
