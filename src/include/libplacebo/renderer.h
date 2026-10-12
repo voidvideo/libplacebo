@@ -1002,6 +1002,38 @@ PL_API enum pl_renderer_prepare_result pl_render_image_prepared(
     pl_renderer_preparation preparation, const struct pl_frame *image,
     const struct pl_frame *target);
 
+// Describe an ASYNC graph with diagnostic observation at ordinary image hook
+// stages. Zero preserves the normal graph. Requested stages are materialized
+// into preparation-owned float textures; rendering never downloads them.
+// These use the same submit/poll/preflight/render lifecycle as normal handles.
+// Capturing inhibits fusion at the requested boundaries and adds GPU work.
+// Intermediate float32 storage can change final quantization by rounding.
+// disable_fbos is incompatible and returns UNSUPPORTED.
+PL_API enum pl_renderer_prepare_result pl_renderer_describe_image_capture(
+    pl_renderer renderer, const struct pl_frame *image, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, enum pl_hook_stage stages,
+    pl_renderer_preparation *out);
+PL_API enum pl_renderer_prepare_result pl_renderer_describe_image_mix_capture(
+    pl_renderer renderer, const struct pl_frame_mix *images, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, enum pl_hook_stage stages,
+    pl_renderer_preparation *out);
+
+// A stage observation from the last successful prepared execution. Values are
+// raw shader components, not an RGB preview; repr/color/rect describe them.
+// Textures are float RGBA, host-readable, owned by the preparation. They remain
+// valid until its next execution or destruction. The caller must complete GPU
+// readback before either operation. Missing/inapplicable stages return false.
+struct pl_renderer_capture {
+    enum pl_hook_stage stage;
+    pl_tex texture;
+    struct pl_color_repr repr;
+    struct pl_color_space color;
+    pl_rect2df rect;
+    int components;
+};
+PL_API bool pl_renderer_get_capture(pl_renderer_preparation preparation,
+    enum pl_hook_stage stage, int index, struct pl_renderer_capture *out);
+
 // Prepared equivalent of pl_render_image_mix. Disabled mixing selects the
 // nearest frame. Enabled mixing describes source caches and output variants
 // for up to 16 simultaneous contributors. The supplied source window may be

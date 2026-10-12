@@ -123,6 +123,11 @@ struct prepared_mix_variant {
     int pass_start, pass_end, texture_start, texture_end;
 };
 
+struct prepared_capture {
+    const struct pl_hook_texture *texture;
+    struct pl_renderer_capture image;
+};
+
 struct pl_renderer_preparation_t {
     pl_renderer rr;
     struct pl_renderer_snapshot snapshot;
@@ -137,6 +142,9 @@ struct pl_renderer_preparation_t {
     bool executing;
     bool checking;
     int pass_index, texture_index;
+    PL_ARRAY(struct prepared_capture) captures;
+    bool captures_valid;
+    enum pl_hook_stage capture_stages;
     uint8_t shader_id, frame_index;
     struct pass_state *current;
     struct prepared_frame_shape image_shape[PL_MAX_PLANES], target_shape[PL_MAX_PLANES];
@@ -145,6 +153,7 @@ struct pl_renderer_preparation_t {
     int num_sources;
     pl_renderer_preparation *sources;
     bool *source_used;
+    int capture_sources[MAX_MIX_FRAMES], num_capture_sources;
     struct prepared_mix_variant variants[MAX_MIX_FRAMES];
     uint64_t mix_signature;
     struct cached_frame mix_frame, preview_frame;
@@ -1588,8 +1597,8 @@ static bool pass_hook_prepared(struct pass_state *pass, struct img *img,
             w = res.tex.params.w;
             h = res.tex.params.h;
         } else if (res.output == PL_HOOK_SIG_COLOR && res.sh) {
-            w = res.sh->output_w;
-            h = res.sh->output_h;
+            w = PL_DEF(res.sh->output_w, img->w);
+            h = PL_DEF(res.sh->output_h, img->h);
         } else {
             prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "hook returned invalid output signature");
             break;
@@ -1735,8 +1744,8 @@ static bool pass_hook_list(struct pass_state *pass, struct img *img,
 
         case PL_HOOK_SIG_COLOR:
             if (!resizable) {
-                if (res.sh->output_w != img->w ||
-                    res.sh->output_h != img->h ||
+                if ((res.sh->output_w && res.sh->output_w != img->w) ||
+                    (res.sh->output_h && res.sh->output_h != img->h) ||
                     !pl_rect2d_eq(res.rect, img->rect))
                 {
                     PL_ERR(rr, "User hook tried resizing non-resizable stage!");
@@ -1750,8 +1759,8 @@ static bool pass_hook_list(struct pass_state *pass, struct img *img,
                 .color    = res.color,
                 .comps    = res.components,
                 .rect     = res.rect,
-                .w        = res.sh->output_w,
-                .h        = res.sh->output_h,
+                .w        = PL_DEF(res.sh->output_w, img->w),
+                .h        = PL_DEF(res.sh->output_h, img->h),
                 .unique   = img->unique,
                 .err_enum = PL_RENDER_ERR_HOOKS,
                 .err_msg  = "Failed applying user hook",
@@ -1780,11 +1789,70 @@ hook_error:
     return ret;
 }
 
+// Diagnostic copies follow normal stage hooks, using the same prepared
+// dispatch route. Materialization changes only an explicitly requested graph.
+static void capture_stage(struct pass_state *pass, struct img *img,
+                          enum pl_hook_stage stage)
+{
+    pl_renderer_preparation p = pass->preparation;
+    if (!p || !(p->capture_stages & stage) ||
+        p->result != PL_RENDERER_PREPARE_OK)
+        return;
+    pl_fmt fmt = pl_find_fmt(pass->rr->gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_HOST_READABLE);
+    if (!fmt) {
+        prepare_fail(p, PL_RENDERER_PREPARE_UNSUPPORTED, "stage capture requires readable RGBA float");
+        return;
+    }
+    // Shader intermediates are float32 computations. Do not insert an extra
+    // float16 rounding step into playback merely to observe one stage.
+    if (img->sh)
+        img->fmt = fmt;
+    struct pl_sample_src src = {0};
+    if (!img_source(pass, img, &src))
+        return;
+    const struct pl_hook_texture *tex = prepared_texture(pass, img->w, img->h, fmt, 4);
+    if (!tex)
+        return;
+    // Description owns this entry; submission later creates the actual image.
+    if (!p->checking && !p->executing)
+        ((struct pl_hook_texture *) tex)->params.host_readable = true;
+    pl_shader sh = pass_shader(pass, false);
+    if (!pl_shader_sample_direct(sh, &src)) {
+        pl_dispatch_abort(pass->rr->dp, &sh);
+        prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "stage capture sampling failed");
+        return;
+    }
+    if (prepared_finish(p, pass->rr->dp, pl_dispatch_params(
+            .shader = &sh, .target = p->executing ? tex->texture : NULL),
+            &tex->params) != PL_DISPATCH_OK)
+        return;
+    struct pl_renderer_capture capture = {
+        .stage = stage, .texture = p->executing ? tex->texture : NULL,
+        .repr = img->repr, .color = img->color,
+        .rect = img->rect, .components = img->comps,
+    };
+    if (!p->checking && !p->executing) {
+        PL_ARRAY_APPEND(p, p->captures, ((struct prepared_capture) {tex, capture}));
+    } else {
+        for (int i = 0; i < p->captures.num; i++) {
+            if (p->captures.elem[i].texture == tex) {
+                if (p->executing)
+                    p->captures.elem[i].image = capture;
+                return;
+            }
+        }
+        prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "stage capture graph changed");
+    }
+}
+
 static bool pass_hook(struct pass_state *pass, struct img *img,
                       enum pl_hook_stage stage)
 {
-    return pass_hook_list(pass, img, stage, pass->params->hooks,
-                          pass->params->num_hooks, NULL);
+    bool applied = pass_hook_list(pass, img, stage, pass->params->hooks,
+                                 pass->params->num_hooks, NULL);
+    capture_stage(pass, img, stage);
+    return applied;
 }
 
 static void hdr_update_peak(struct pass_state *pass)
@@ -3739,6 +3807,8 @@ static bool pass_output_target(struct pass_state *pass)
 
     pass_hook(pass, img, PL_HOOK_OUTPUT);
     sh = NULL;
+    if (pass->preparation && pass->preparation->result != PL_RENDERER_PREPARE_OK)
+        return false;
 
     bool flipped_x = dst_rect.x1 < dst_rect.x0,
          flipped_y = dst_rect.y1 < dst_rect.y0;
@@ -5451,6 +5521,7 @@ check_graph:;
         (p->pass_index != p->passes.num || p->texture_index != p->textures.num))
         prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "selected graph lost a required pass or resource");
     if (p->executing && p->result == PL_RENDERER_PREPARE_OK) {
+        p->captures_valid = true;
         p->frame_index = p->shader_frame_index;
         if (cached) {
             p->mix_frame = mixed;
@@ -5472,7 +5543,7 @@ done:
 static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
     const struct pl_frame *image, const struct pl_frame *target,
     const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out,
-    bool mix, uint64_t signature, bool source_only)
+    bool mix, uint64_t signature, bool source_only, enum pl_hook_stage stages)
 {
     if (out)
         *out = NULL;
@@ -5487,6 +5558,7 @@ static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
     p->rr = source_only ? renderer : pl_renderer_create(renderer->log, renderer->gpu);
     p->mix = mix;
     p->source_only = source_only;
+    p->capture_stages = stages;
     enum pl_renderer_prepare_result result = preparation_traverse(p, image, target, signature);
     if (result != PL_RENDERER_PREPARE_OK) {
         pl_renderer_prepare_destroy(&p);
@@ -5530,7 +5602,7 @@ enum pl_renderer_prepare_result pl_renderer_describe_image(pl_renderer renderer,
     if (snapshot->mode == PL_RENDERER_PREPARE_SYNC)
         return describe_synchronous(renderer, target, snapshot, out, false);
     enum pl_renderer_prepare_result result =
-        describe_image(renderer, image, target, snapshot, out, false, 0, false);
+        describe_image(renderer, image, target, snapshot, out, false, 0, false, 0);
     if (result == PL_RENDERER_PREPARE_UNSUPPORTED && snapshot->mode == PL_RENDERER_PREPARE_AUTO)
         return describe_synchronous(renderer, target, snapshot, out, false);
     return result;
@@ -5624,7 +5696,7 @@ done:
 
 static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer renderer,
     const struct pl_frame_mix *images, const struct pl_frame *target,
-    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out)
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out, enum pl_hook_stage stages)
 {
     if (!renderer || !target || !out || !snapshot || !snapshot->params ||
         !snapshot->retain || !snapshot->release)
@@ -5634,6 +5706,7 @@ static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer rendere
     snapshot->retain(snapshot->owner);
     p->rr = pl_renderer_create(renderer->log, renderer->gpu);
     p->mix = true;
+    p->capture_stages = stages;
     // Match the ordinary mix entry point before describing source caches.
     // Empty destinations and unavailable intermediate formats use the nearest
     // image path; neither requires synchronous rendering.
@@ -5660,7 +5733,7 @@ static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer rendere
         }
         pl_renderer_prepare_destroy(&p);
         return describe_image(renderer, reference, target, snapshot, out,
-                              true, signature, false);
+                              true, signature, false, stages);
     }
     p->sources = pl_zalloc(p, images->num_frames * sizeof(*p->sources));
     p->source_used = pl_zalloc(p, images->num_frames * sizeof(*p->source_used));
@@ -5669,7 +5742,7 @@ static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer rendere
     enum pl_renderer_prepare_result result;
     for (int i = 0; i < images->num_frames; i++) {
         result = describe_image(p->rr, images->frames[i], target, snapshot,
-                                &p->sources[i], true, images->signatures[i], true);
+                                &p->sources[i], true, images->signatures[i], true, stages);
         if (result != PL_RENDERER_PREPARE_OK)
             goto error;
         p->num_sources++;
@@ -5713,16 +5786,48 @@ enum pl_renderer_prepare_result pl_renderer_describe_image_mix(pl_renderer rende
     if (snapshot->mode == PL_RENDERER_PREPARE_SYNC)
         return describe_synchronous(renderer, target, snapshot, out, true);
     if (images && images->num_frames == 0)
-        result = describe_image(renderer, NULL, target, snapshot, out, true, 0, false);
+        result = describe_image(renderer, NULL, target, snapshot, out, true, 0, false, 0);
     else if (result == PL_RENDERER_PREPARE_OK) {
         if (snapshot->params->frame_mixer && !snapshot->params->disable_fbos)
-            result = describe_temporal_mix(renderer, images, target, snapshot, out);
+            result = describe_temporal_mix(renderer, images, target, snapshot, out, 0);
         else
-            result = describe_image(renderer, image, target, snapshot, out, true, signature, false);
+            result = describe_image(renderer, image, target, snapshot, out, true, signature, false, 0);
     }
     if (result == PL_RENDERER_PREPARE_UNSUPPORTED && snapshot->mode == PL_RENDERER_PREPARE_AUTO)
         return describe_synchronous(renderer, target, snapshot, out, true);
     return result;
+}
+
+enum pl_renderer_prepare_result pl_renderer_describe_image_capture(pl_renderer renderer,
+    const struct pl_frame *image, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, enum pl_hook_stage stages,
+    pl_renderer_preparation *out)
+{
+    if (out) *out = NULL;
+    if (!preparation_snapshot_valid(snapshot) || snapshot->mode != PL_RENDERER_PREPARE_ASYNC)
+        return PL_RENDERER_PREPARE_INVALID;
+    if (stages && snapshot->params->disable_fbos)
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
+    return describe_image(renderer, image, target, snapshot, out, false, 0, false, stages);
+}
+
+enum pl_renderer_prepare_result pl_renderer_describe_image_mix_capture(pl_renderer renderer,
+    const struct pl_frame_mix *images, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, enum pl_hook_stage stages,
+    pl_renderer_preparation *out)
+{
+    if (out) *out = NULL;
+    if (!preparation_snapshot_valid(snapshot) || snapshot->mode != PL_RENDERER_PREPARE_ASYNC)
+        return PL_RENDERER_PREPARE_INVALID;
+    if (stages && snapshot->params->disable_fbos)
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
+    const struct pl_frame *image;
+    uint64_t signature;
+    enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
+    if (result != PL_RENDERER_PREPARE_OK) return result;
+    if (snapshot->params->frame_mixer && !snapshot->params->disable_fbos)
+        return describe_temporal_mix(renderer, images, target, snapshot, out, stages);
+    return describe_image(renderer, image, target, snapshot, out, true, signature, false, stages);
 }
 
 enum pl_renderer_prepare_result pl_renderer_prepare_submit(pl_renderer_preparation p)
@@ -5898,6 +6003,7 @@ static enum pl_renderer_prepare_result render_image_prepared(pl_renderer_prepara
     result = preflight_image(p, image ? &access.image : NULL, &access.target, signature);
     if (result == PL_RENDERER_PREPARE_OK) {
         p->executing = true;
+        p->captures_valid = false;
         result = preparation_traverse(p, image ? &access.image : NULL, &access.target, signature);
         p->executing = false;
     }
@@ -6017,6 +6123,7 @@ retry:
     if (result != PL_RENDERER_PREPARE_OK || !execute)
         return result;
     // All sources and the final output have now passed preflight.
+    p->captures_valid = false;
     for (int i = 0; i < count; i++) {
         pl_renderer_preparation source = p->sources[slots[i]];
         source->frame_index = p->frame_index;
@@ -6044,7 +6151,14 @@ retry:
         source->mix_valid &= retain;
     }
     p->executing = true;
+    p->captures_valid = false;
+    for (int i = 0; i < p->captures.num; i++)
+        p->captures.elem[i].image.texture = NULL;
     result = temporal_output(p, reference, target, frames, weights, count, sum);
+    p->captures_valid = result == PL_RENDERER_PREPARE_OK;
+    p->num_capture_sources = p->captures_valid ? count : 0;
+    if (p->captures_valid)
+        memcpy(p->capture_sources, slots, count * sizeof(*slots));
     p->executing = false;
     return result;
 }
@@ -6114,4 +6228,32 @@ enum pl_renderer_prepare_result pl_render_image_mix_prepared(pl_renderer_prepara
     uint64_t signature;
     enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
     return result == PL_RENDERER_PREPARE_OK ? render_image_prepared(p, image, target, signature) : result;
+}
+
+static bool get_capture(pl_renderer_preparation p, enum pl_hook_stage stage,
+                        int *index, struct pl_renderer_capture *out)
+{
+    if (p->captures_valid) {
+        for (int i = 0; i < p->captures.num; i++) {
+            const struct pl_renderer_capture *capture = &p->captures.elem[i].image;
+            if (capture->stage == stage && capture->texture && (*index)-- == 0) {
+                *out = *capture;
+                return true;
+            }
+        }
+    }
+    for (int i = 0; p->captures_valid && i < p->num_capture_sources; i++) {
+        if (get_capture(p->sources[p->capture_sources[i]], stage, index, out))
+            return true;
+    }
+    return false;
+}
+
+bool pl_renderer_get_capture(pl_renderer_preparation p, enum pl_hook_stage stage,
+                             int index, struct pl_renderer_capture *out)
+{
+    if (!p || !out || index < 0)
+        return false;
+    *out = (struct pl_renderer_capture) {0};
+    return get_capture(p, stage, &index, out);
 }

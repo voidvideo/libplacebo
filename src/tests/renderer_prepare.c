@@ -271,7 +271,7 @@ static enum pl_dispatch_result sample_extended(void *priv, pl_shader sh,
     return pl_shader_sample_direct(sh, &intermediate) ? PL_DISPATCH_OK : PL_DISPATCH_FAILED;
 }
 
-static void test_renderer_sampler(pl_gpu gpu, struct pl_frame image, int width, bool hook, int ewa, int sampler_mode)
+static void test_renderer_sampler_capture(pl_gpu gpu, struct pl_frame image, int width, bool hook, int ewa, int sampler_mode, bool capture)
 {
     const int test_mode = sampler_mode;
     const int sampler_passes = sampler_mode == 36 || sampler_mode == 38 ? 1 : sampler_mode == 37 ? 2 : 0;
@@ -401,8 +401,19 @@ static void test_renderer_sampler(pl_gpu gpu, struct pl_frame image, int width, 
     // Both renderers must generate the same blue-noise LUT for exact pixels.
     srand(1234);
     describing = true;
-    enum pl_renderer_prepare_result described = pl_renderer_describe_image(
-        renderer, &image, &target, &snapshot, &preparation);
+    enum pl_renderer_prepare_result described = pl_renderer_describe_image_capture(
+        renderer, &image, &target, &snapshot, capture ? PL_HOOK_RGB_INPUT | PL_HOOK_NATIVE | PL_HOOK_RGB | PL_HOOK_OUTPUT | PL_HOOK_LUMA_INPUT | PL_HOOK_CHROMA_INPUT | PL_HOOK_LINEAR | PL_HOOK_PRE_KERNEL | PL_HOOK_POST_KERNEL | PL_HOOK_SCALED | PL_HOOK_PRE_OUTPUT : 0, &preparation);
+    if (capture && test_mode == 33) {
+        describing = false;
+        REQUIRE(described == PL_RENDERER_PREPARE_UNSUPPORTED);
+        REQUIRE(!preparation && owner->refs == 1);
+        free(owner);
+        pl_tex_destroy(gpu, &reference);
+        pl_tex_destroy(gpu, &output);
+        pl_renderer_destroy(&reference_renderer);
+        pl_renderer_destroy(&renderer);
+        return;
+    }
     if (sampler_mode == 3) {
         describing = false;
         REQUIRE(described == PL_RENDERER_PREPARE_FAILED);
@@ -491,7 +502,15 @@ static void test_renderer_sampler(pl_gpu gpu, struct pl_frame image, int width, 
     }
     if (memcmp(expected, actual, width * width * 4))
         fprintf(stderr, "renderer mismatch mode=%d planes=%d\n", test_mode, image.num_planes);
-    REQUIRE_MEMEQ(expected, actual, width * width * 4);
+    if (capture) {
+        // Observing a fused shader requires a float32 texture boundary. Keep
+        // the original exact comparison below for normal rendering; capture
+        // may round at an 8-bit quantization boundary, but not beyond one output code (four storage codes for 6-bit diffusion).
+        for (int i = 0; i < width * width * 4; i++)
+            REQUIRE(abs((int) expected[i] - actual[i]) <= (test_mode == 10 ? 5 : 1));
+    } else {
+        REQUIRE_MEMEQ(expected, actual, width * width * 4);
+    }
     if (image.enhancement_layer) {
         struct pl_frame base_only = image;
         base_only.enhancement_layer = NULL;
@@ -518,7 +537,12 @@ static void test_renderer_sampler(pl_gpu gpu, struct pl_frame image, int width, 
             REQUIRE(pl_render_image(reference_renderer, &image, &reference_target, &reference_params));
             REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = reference, .ptr = expected)));
             REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
-            REQUIRE_MEMEQ(expected, actual, width * width * 4);
+            if (capture) {
+                for (int i = 0; i < width * width * 4; i++)
+                    REQUIRE(abs((int) expected[i] - actual[i]) <= 1);
+            } else {
+                REQUIRE_MEMEQ(expected, actual, width * width * 4);
+            }
         }
     }
 
@@ -586,6 +610,12 @@ static void test_renderer_sampler(pl_gpu gpu, struct pl_frame image, int width, 
     pl_renderer_destroy(&reference_renderer);
     pl_renderer_destroy(&renderer);
     pl_icc_close(&icc);
+}
+
+static void test_renderer_sampler(pl_gpu gpu, struct pl_frame image, int width, bool hook, int ewa, int sampler_mode)
+{
+    test_renderer_sampler_capture(gpu, image, width, hook, ewa, sampler_mode, false);
+    test_renderer_sampler_capture(gpu, image, width, hook, ewa, sampler_mode, true);
 }
 
 static void test_renderer(pl_gpu gpu, struct pl_frame image, int width, bool hook, bool ewa)
@@ -1217,7 +1247,8 @@ static void test_temporal_mix(pl_gpu gpu, const struct pl_filter_config *filter,
     };
     pl_renderer_preparation preparation = NULL;
     describing = true;
-    REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot,
+    REQUIRE(pl_renderer_describe_image_mix_capture(renderer, &mix, &target, &snapshot,
+        PL_HOOK_RGB_INPUT | PL_HOOK_NATIVE | PL_HOOK_RGB | PL_HOOK_OUTPUT | PL_HOOK_LUMA_INPUT | PL_HOOK_CHROMA_INPUT | PL_HOOK_LINEAR | PL_HOOK_PRE_KERNEL | PL_HOOK_POST_KERNEL | PL_HOOK_SCALED | PL_HOOK_PRE_OUTPUT,
                                            &preparation) == PL_RENDERER_PREPARE_OK);
     describing = false;
     forbid_compile = true;
@@ -1578,7 +1609,6 @@ static struct pl_hook_res identity_color_hook(void *priv, const struct pl_hook_p
     REQUIRE(pl_shader_custom(p->sh, &(struct pl_custom_shader) {
         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
         .body = "color.rgb += vec3(0.0);",
-        .output_w = pl_rect_w(p->rect), .output_h = pl_rect_h(p->rect),
     }));
     return (struct pl_hook_res) {
         .output = PL_HOOK_SIG_COLOR, .sh = p->sh, .repr = p->repr,
@@ -1592,7 +1622,6 @@ static struct pl_hook_prepare_result identity_color_prepared(void *priv,
     REQUIRE(pl_shader_custom(p->sh, &(struct pl_custom_shader) {
         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
         .body = "color.rgb += vec3(0.0);",
-        .output_w = pl_rect_w(p->rect), .output_h = pl_rect_h(p->rect),
     }));
     return (struct pl_hook_prepare_result) {
         .status = PL_DISPATCH_OK,
@@ -1864,6 +1893,50 @@ static void test_multiplane_target(pl_gpu gpu, struct pl_frame image)
     }
 }
 
+static void test_stage_capture(pl_gpu gpu, struct pl_frame image, const uint8_t *pixels)
+{
+    struct snapshot_owner *owner = new_snapshot(gpu, false);
+    owner->params.dither_params = NULL;
+    struct pl_renderer_snapshot snapshot = {
+        .params = &owner->params, .owner = owner, .retain = retain, .release = release,
+    };
+    pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
+    pl_tex output = pl_tex_create(gpu, pl_tex_params(
+        .w = 4, .h = 4, .format = pl_find_named_fmt(gpu, "rgba8"),
+        .renderable = true, .host_readable = true));
+    REQUIRE(output);
+    struct pl_frame target = frame(output);
+    pl_renderer_preparation preparation = NULL;
+    describing = true;
+    REQUIRE(pl_renderer_describe_image_capture(renderer, &image, &target, &snapshot, PL_HOOK_RGB_INPUT | PL_HOOK_NATIVE | PL_HOOK_RGB | PL_HOOK_OUTPUT | PL_HOOK_LUMA_INPUT | PL_HOOK_CHROMA_INPUT | PL_HOOK_LINEAR | PL_HOOK_PRE_KERNEL | PL_HOOK_POST_KERNEL | PL_HOOK_SCALED | PL_HOOK_PRE_OUTPUT, &preparation) == PL_RENDERER_PREPARE_OK);
+    describing = false;
+    wait_prepared(preparation);
+    struct pl_renderer_capture capture;
+    REQUIRE(!pl_renderer_get_capture(preparation, PL_HOOK_RGB, 0, &capture));
+    for (int repeat = 0; repeat < 2; repeat++) {
+        forbid_compile = true;
+        REQUIRE(pl_render_image_prepared(preparation, &image, &target) == PL_RENDERER_PREPARE_OK);
+        forbid_compile = false;
+        REQUIRE(pl_renderer_get_capture(preparation, PL_HOOK_NATIVE, 0, &capture));
+        REQUIRE(capture.texture->params.host_readable);
+        REQUIRE(capture.components == 4);
+        float actual[64];
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = capture.texture, .ptr = actual)));
+        for (int i = 0; i < 64; i++) {
+            if (i % 4 != 3)
+                REQUIRE(fabsf(actual[i] - pixels[i] / 255.0f) < 0.001f);
+        }
+        REQUIRE(pl_renderer_get_capture(preparation, PL_HOOK_OUTPUT, 0, &capture));
+        REQUIRE(!pl_renderer_get_capture(preparation, PL_HOOK_RGB, 1, &capture));
+        REQUIRE(!pl_renderer_get_capture(preparation, PL_HOOK_CHROMA_INPUT, 0, &capture));
+    }
+    pl_renderer_prepare_destroy(&preparation);
+    REQUIRE(owner->refs == 1);
+    free(owner);
+    pl_renderer_destroy(&renderer);
+    pl_tex_destroy(gpu, &output);
+}
+
 int main(void)
 {
     pl_log log = pl_test_logger();
@@ -1894,6 +1967,7 @@ int main(void)
         .sampleable = true, .initial_data = pixels,
     ));
     REQUIRE(source);
+    test_stage_capture(gpu, frame(source), pixels);
     for (int location = 0; location < 3; location++) {
         for (int type = PL_LUT_NATIVE; type <= PL_LUT_CONVERSION; type++) {
             for (int injected = 0; injected < 2; injected++)
