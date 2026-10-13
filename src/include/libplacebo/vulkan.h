@@ -453,6 +453,19 @@ PL_API VkResult pl_vulkan_swapchain_set_exclusive_target(pl_swapchain sw,
 // snapshot; the caller must keep sw alive for the duration of this call.
 PL_API VkResult pl_vulkan_swapchain_exclusive_status(pl_swapchain sw, bool *acquired);
 
+// Optional synchronous diagnostic boundaries. No timestamp conversion or logging
+// is performed by libplacebo: the caller timestamps each boundary in its clock.
+// The callback must not block, allocate, or call back into the swapchain. Configure
+// only between swapchain calls on the owning thread. NULL disables tracing.
+// `name` is a static string; token is the last submit token; present_id is zero
+// until assigned. result is meaningful on end boundaries (VkResult for VK calls,
+// 0/1 for bool operations). This does not change presentation behavior.
+typedef void (*pl_vulkan_present_trace_cb)(void *priv, const char *name,
+    bool begin, uint64_t token, uint64_t present_id, int result);
+PL_API void pl_vulkan_swapchain_set_present_trace(pl_swapchain sw,
+    pl_vulkan_present_trace_cb callback, void *priv);
+
+
 
 // Vulkan interop API, for sharing a single VkDevice (and associated vulkan
 // resources) directly with the API user. The use of this API is a bit sketchy

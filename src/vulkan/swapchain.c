@@ -41,6 +41,9 @@ struct priv {
     struct pl_sw_fns impl;
 
     pl_mutex lock;
+    pl_vulkan_present_trace_cb trace_callback;
+    void *trace_priv;
+    uint64_t trace_token, trace_present_id;
     struct vk_ctx *vk;
     VkSurfaceKHR surf;
     PL_ARRAY(VkSurfaceFormatKHR) formats;
@@ -81,6 +84,22 @@ struct priv {
 };
 
 static const struct pl_sw_fns vulkan_swapchain;
+
+static void present_trace(struct priv *p, const char *name, bool begin, int result)
+{
+    if (p->trace_callback)
+        p->trace_callback(p->trace_priv, name, begin, p->trace_token,
+                          p->trace_present_id, result);
+}
+
+void pl_vulkan_swapchain_set_present_trace(pl_swapchain sw,
+    pl_vulkan_present_trace_cb callback, void *priv)
+{
+    struct priv *p = PL_PRIV(sw);
+    p->trace_callback = callback;
+    p->trace_priv = priv;
+}
+
 
 static struct pl_swapchain_present_clock_correlation
 calibrate_present_clock(struct priv *p, VkTimeDomainKHR time_domain,
@@ -1333,6 +1352,9 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     VkSemaphore sem_out = current->sems_out.elem[idx];
     current->last_imgidx = -1;
 
+    p->trace_token = params ? params->token : 0;
+    p->trace_present_id = 0;
+    present_trace(p, "hold_image", true, 0);
     pl_clock_t t0 = vk->trace_present ? pl_clock_now() : 0;
     bool held = pl_vulkan_hold_ex(gpu, pl_vulkan_hold_params(
         .tex        = current->images.elem[idx],
@@ -1340,6 +1362,7 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         .qf         = VK_QUEUE_FAMILY_IGNORED,
         .semaphore  = { sem_out },
     ));
+    present_trace(p, "hold_image", false, held);
     if (!held) {
         PL_ERR(gpu, "Failed holding swapchain image for presentation");
         pl_mutex_unlock(&p->lock);
@@ -1347,7 +1370,9 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     }
 
     pl_clock_t t1 = vk->trace_present ? pl_clock_now() : 0;
+    present_trace(p, "command_begin", true, 0);
     struct vk_cmd *cmd = CMD_BEGIN(GRAPHICS);
+    present_trace(p, "command_begin", false, cmd != NULL);
     pl_clock_t t2 = vk->trace_present ? pl_clock_now() : 0;
     if (!cmd) {
         pl_mutex_unlock(&p->lock);
@@ -1357,7 +1382,10 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     pl_rc_ref(&p->frames_in_flight);
     vk_cmd_callback(cmd, VK_CB_FUNC(present_cb), p, NULL);
     int qidx = cmd->qindex;
-    if (!CMD_SUBMIT(&cmd)) {
+    present_trace(p, "command_submit", true, 0);
+    bool submitted = CMD_SUBMIT(&cmd);
+    present_trace(p, "command_submit", false, submitted);
+    if (!submitted) {
         pl_mutex_unlock(&p->lock);
         return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
@@ -1365,9 +1393,15 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     struct vk_cmdpool *pool = vk->pool_graphics;
     VkQueue queue = pool->queues[qidx];
 
+    present_trace(p, "rotate_queues", true, 0);
     vk_rotate_queues(p->vk);
+    present_trace(p, "rotate_queues", false, 0);
+    present_trace(p, "allocator_gc", true, 0);
     vk_malloc_garbage_collect(vk->ma);
+    present_trace(p, "allocator_gc", false, 0);
+    present_trace(p, "retired_swapchains", true, 0);
     cleanup_retired_swapchains(sw, 0);
+    present_trace(p, "retired_swapchains", false, 0);
 
     pl_clock_t t4 = vk->trace_present ? pl_clock_now() : 0;
     VkSwapchainPresentFenceInfoKHR fenceInfo = {
@@ -1423,6 +1457,7 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     } else if (wait_present) {
         present_id = vk_present_feedback_next_id(&p->feedback);
     }
+    p->trace_present_id = present_id;
     if (present_id)
         vk_link_struct(&pinfo, &present_id_info);
     if (tracked)
@@ -1430,9 +1465,13 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
 
     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
     pl_clock_t t5 = vk->trace_present ? pl_clock_now() : 0;
+    present_trace(p, "queue_lock", true, 0);
     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
+    present_trace(p, "queue_lock", false, 0);
     pl_clock_t t6 = vk->trace_present ? pl_clock_now() : 0;
+    present_trace(p, "vkQueuePresentKHR", true, 0);
     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
+    present_trace(p, "vkQueuePresentKHR", false, res);
     if (res == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT && tracked) {
         vk_present_feedback_discard(&p->feedback, present_id);
         tracked = false;
@@ -1440,10 +1479,14 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         fenceInfo.pNext = NULL;
         if (wait_present)
             vk_link_struct(&pinfo, &present_id_info);
+        present_trace(p, "vkQueuePresentKHR_retry", true, 0);
         res = vk->QueuePresentKHR(queue, &pinfo);
+        present_trace(p, "vkQueuePresentKHR_retry", false, res);
     }
     pl_clock_t t7 = vk->trace_present ? pl_clock_now() : 0;
+    present_trace(p, "queue_unlock", true, 0);
     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
+    present_trace(p, "queue_unlock", false, 0);
     if (vk->trace_present) {
         PL_INFO(vk, "[PresentTrace] present start=%"PRIu64" image=%u size=%dx%d mode=%d "
                 "hold_ms=%.3f cmd_begin_ms=%.3f cmd_submit_ms=%.3f maintenance_ms=%.3f "
@@ -1617,10 +1660,14 @@ static void vk_sw_swap_buffers(pl_swapchain sw)
 {
     struct priv *p = PL_PRIV(sw);
 
+    present_trace(p, "swap_lock", true, 0);
     pl_mutex_lock(&p->lock);
+    present_trace(p, "swap_lock", false, 0);
     while (pl_rc_count(&p->frames_in_flight) >= p->swapchain_depth) {
         pl_mutex_unlock(&p->lock); // don't hold mutex while blocking
+        present_trace(p, "poll_commands", true, 0);
         vk_poll_commands(p->vk, UINT64_MAX);
+        present_trace(p, "poll_commands", false, 0);
         pl_mutex_lock(&p->lock);
     }
 #ifdef VK_KHR_present_wait2
@@ -1633,7 +1680,9 @@ static void vk_sw_swap_buffers(pl_swapchain sw)
             .presentId = present_id,
             .timeout = UINT64_MAX,
         };
+        present_trace(p, "vkWaitForPresent2KHR", true, 0);
         VkResult res = p->vk->WaitForPresent2KHR(p->vk->dev, p->current->swapchain, &wait);
+        present_trace(p, "vkWaitForPresent2KHR", false, res);
         p->current->last_present_id = 0;
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
             PL_WARN(p->vk, "Disabling native present wait after failure: %s", vk_res_str(res));
