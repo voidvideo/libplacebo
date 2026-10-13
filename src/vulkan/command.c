@@ -511,6 +511,26 @@ static VkResult vk_queue_submit2(struct vk_ctx *vk, VkQueue queue,
     return res;
 }
 
+static void trace_command(struct vk_cmd *cmd,
+                          enum pl_vulkan_command_trace_phase phase, VkResult result)
+{
+    struct vk_ctx *vk = cmd->pool->vk;
+    if (!vk->command_trace)
+        return;
+    const bool begin = phase == PL_VULKAN_COMMAND_SUBMIT_BEGIN;
+    struct pl_vulkan_command_trace event = {
+        .phase = phase, .submission_id = cmd->submission_id,
+        .device = vk->dev, .queue = cmd->queue,
+        .queue_family = cmd->pool->qf, .queue_index = cmd->qindex,
+        .command_buffer = cmd->buf, .fence = cmd->fence, .result = result,
+        .num_waits = begin ? cmd->deps.num : 0,
+        .num_signals = begin ? cmd->sigs.num : 0,
+        .waits = begin ? cmd->deps.elem : NULL,
+        .signals = begin ? cmd->sigs.elem : NULL,
+    };
+    vk->command_trace(vk->command_trace_priv, &event);
+}
+
 bool vk_cmd_submit(struct vk_cmd **pcmd)
 {
     struct vk_cmd *cmd = *pcmd;
@@ -522,6 +542,9 @@ bool vk_cmd_submit(struct vk_cmd **pcmd)
     struct vk_ctx *vk = pool->vk;
 
     VK(vk->EndCommandBuffer(cmd->buf));
+
+    if (vk->command_trace)
+        cmd->submission_id = atomic_fetch_add_explicit(&vk->next_submission_id, 1, memory_order_relaxed) + 1;
 
     VkSubmitInfo2 sinfo = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -555,7 +578,9 @@ bool vk_cmd_submit(struct vk_cmd **pcmd)
     pl_clock_t trace_start = vk->trace_present ? pl_clock_now() : 0;
     vk->lock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
     pl_clock_t trace_locked = vk->trace_present ? pl_clock_now() : 0;
+    trace_command(cmd, PL_VULKAN_COMMAND_SUBMIT_BEGIN, VK_NOT_READY);
     VkResult res = vk_queue_submit2(vk, cmd->queue, &sinfo, cmd->fence);
+    trace_command(cmd, PL_VULKAN_COMMAND_SUBMIT_END, res);
     pl_clock_t trace_submitted = vk->trace_present ? pl_clock_now() : 0;
     vk->unlock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
     if (vk->trace_present) {
@@ -603,6 +628,7 @@ bool vk_poll_commands(struct vk_ctx *vk, uint64_t timeout)
 
         PL_TRACE(vk, "VkSemaphore signalled: 0x%"PRIx64" = %"PRIu64,
                  (uint64_t) cmd->sync.sem, cmd->sync.value);
+        trace_command(cmd, PL_VULKAN_COMMAND_COMPLETE, res);
         PL_ARRAY_REMOVE_AT(vk->cmds_pending, 0); // remove before callbacks
         vk_cmd_reset(cmd);
         PL_ARRAY_APPEND(pool, pool->cmds, cmd);

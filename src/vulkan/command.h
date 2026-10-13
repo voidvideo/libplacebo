@@ -51,6 +51,7 @@ struct vk_cmd {
     int qindex;              // the index of `queue` in `pool`
     VkCommandBuffer buf;     // the command buffer itself
     VkFence fence;           // Only used on MoltenVK
+    uint64_t submission_id;  // diagnostic identity; renewed on every submit
     // Command dependencies and signals. Not owned by the vk_cmd.
     PL_ARRAY(VkSemaphoreSubmitInfo) deps;
     PL_ARRAY(VkSemaphoreSubmitInfo) sigs;

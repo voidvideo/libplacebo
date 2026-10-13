@@ -180,6 +180,39 @@ struct pl_vulkan_t {
     PL_DEPRECATED_IN(v6.271) int num_queues;
 };
 
+// Optional command diagnostics, emitted by the existing submission and polling
+// paths. No additional GPU queries, waits, allocation or logging are performed.
+// Callbacks may run concurrently, including during device creation/destruction;
+// they must not block, allocate or re-enter libplacebo. Copy borrowed arrays
+// synchronously if needed. The caller supplies its own timestamp.
+// Completion means CPU-observed completion, not a GPU execution timestamp.
+enum pl_vulkan_command_trace_phase {
+    PL_VULKAN_COMMAND_SUBMIT_BEGIN,
+    PL_VULKAN_COMMAND_SUBMIT_END,
+    PL_VULKAN_COMMAND_COMPLETE,
+};
+
+struct pl_vulkan_command_trace {
+    enum pl_vulkan_command_trace_phase phase;
+    uint64_t submission_id; // unique within this pl_vulkan lifetime
+    VkDevice device;
+    VkQueue queue;
+    uint32_t queue_family, queue_index;
+    VkCommandBuffer command_buffer;
+    VkFence fence;
+    VkResult result; // valid for END and COMPLETE
+    uint32_t num_waits, num_signals;
+    const VkSemaphoreSubmitInfo *waits, *signals; // borrowed; BEGIN only
+};
+typedef void (*pl_vulkan_command_trace_cb)(void *priv,
+    const struct pl_vulkan_command_trace *event);
+
+// Configure only while no libplacebo calls or command callbacks are in flight.
+// The callback and private data must remain alive through pl_vulkan_destroy.
+// NULL disables tracing. This does not change queue or polling behavior.
+PL_API void pl_vulkan_set_command_trace(pl_vulkan vk,
+    pl_vulkan_command_trace_cb callback, void *priv);
+
 struct pl_vulkan_params {
     // The vulkan instance. Optional, if NULL then libplacebo will internally
     // create a VkInstance with the settings from `instance_params`.
@@ -284,6 +317,7 @@ struct pl_vulkan_params {
     // for testing purposes
     int max_glsl_version;       // limit the maximum GLSL version
     uint32_t max_api_version;   // limit the maximum vulkan API version
+
 };
 
 // Default/recommended parameters. Should generally be safe and efficient.
@@ -530,6 +564,7 @@ struct pl_vulkan_import_params {
     bool no_compute;
     int max_glsl_version;
     uint32_t max_api_version;
+
 };
 
 #define pl_vulkan_import_params(...) (&(struct pl_vulkan_import_params) { __VA_ARGS__ })

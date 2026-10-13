@@ -63,6 +63,9 @@ struct vk_ctx {
     pl_vk_inst internal_instance;
     pl_log log;
     bool trace_present; // opt-in CPU submission/presentation diagnostics
+    pl_vulkan_command_trace_cb command_trace;
+    void *command_trace_priv;
+    atomic_uint_fast64_t next_submission_id;
     VkInstance inst;
     VkPhysicalDevice physd;
     VkPhysicalDeviceProperties props;

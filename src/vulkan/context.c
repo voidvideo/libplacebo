@@ -1707,6 +1707,7 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
         .GetInstanceProcAddr = get_proc_addr_fallback(log, params->get_proc_addr),
     };
 
+    atomic_init(&vk->next_submission_id, 0);
     pl_mutex_init_type(&vk->lock, PL_MUTEX_RECURSIVE);
     if (!vk->GetInstanceProcAddr)
         goto error;
@@ -1838,6 +1839,7 @@ pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *par
         .queue_ctx = params->queue_ctx,
     };
 
+    atomic_init(&vk->next_submission_id, 0);
     pl_mutex_init_type(&vk->lock, PL_MUTEX_RECURSIVE);
     if (!vk->GetInstanceProcAddr)
         goto error;
@@ -1991,4 +1993,12 @@ error:
     pl_vulkan_destroy((pl_vulkan *) &pl_vk);
     pl_free(tmp);
     return NULL;
+}
+
+void pl_vulkan_set_command_trace(pl_vulkan pl_vk,
+                                 pl_vulkan_command_trace_cb callback, void *priv)
+{
+    struct vk_ctx *vk = PL_PRIV(pl_vk);
+    vk->command_trace = callback;
+    vk->command_trace_priv = priv;
 }

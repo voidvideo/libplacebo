@@ -106,3 +106,9 @@ void pl_vulkan_sem_destroy(pl_gpu gpu, VkSemaphore *semaphore)
 {
     pl_unreachable();
 }
+
+void pl_vulkan_set_command_trace(pl_vulkan vk,
+                                 pl_vulkan_command_trace_cb callback, void *priv)
+{
+    pl_unreachable();
+}
