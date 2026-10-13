@@ -575,20 +575,13 @@ bool vk_cmd_submit(struct vk_cmd **pcmd)
     }
 
     pl_assert(pool->sync[cmd->qindex].value == cmd->sync.value);
-    pl_clock_t trace_start = vk->trace_present ? pl_clock_now() : 0;
+    trace_command(cmd, PL_VULKAN_COMMAND_QUEUE_LOCK_BEGIN, VK_NOT_READY);
     vk->lock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
-    pl_clock_t trace_locked = vk->trace_present ? pl_clock_now() : 0;
+    trace_command(cmd, PL_VULKAN_COMMAND_QUEUE_LOCK_END, VK_SUCCESS);
     trace_command(cmd, PL_VULKAN_COMMAND_SUBMIT_BEGIN, VK_NOT_READY);
     VkResult res = vk_queue_submit2(vk, cmd->queue, &sinfo, cmd->fence);
     trace_command(cmd, PL_VULKAN_COMMAND_SUBMIT_END, res);
-    pl_clock_t trace_submitted = vk->trace_present ? pl_clock_now() : 0;
     vk->unlock_queue(vk->queue_ctx, pool->qf, cmd->qindex);
-    if (vk->trace_present) {
-        PL_INFO(vk, "[PresentTrace] submit start=%"PRIu64" qf=%u queue=%d lock_ms=%.3f driver_ms=%.3f result=%d",
-                (uint64_t) trace_start, pool->qf, cmd->qindex,
-                pl_clock_diff(trace_locked, trace_start) * 1e3,
-                pl_clock_diff(trace_submitted, trace_locked) * 1e3, (int) res);
-    }
     PL_VK_ASSERT(res, "vkQueueSubmit2");
 
     pl_mutex_lock(&vk->lock);

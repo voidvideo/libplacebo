@@ -1355,7 +1355,6 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     p->trace_token = params ? params->token : 0;
     p->trace_present_id = 0;
     present_trace(p, "hold_image", true, 0);
-    pl_clock_t t0 = vk->trace_present ? pl_clock_now() : 0;
     bool held = pl_vulkan_hold_ex(gpu, pl_vulkan_hold_params(
         .tex        = current->images.elem[idx],
         .layout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -1369,11 +1368,9 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
 
-    pl_clock_t t1 = vk->trace_present ? pl_clock_now() : 0;
     present_trace(p, "command_begin", true, 0);
     struct vk_cmd *cmd = CMD_BEGIN(GRAPHICS);
     present_trace(p, "command_begin", false, cmd != NULL);
-    pl_clock_t t2 = vk->trace_present ? pl_clock_now() : 0;
     if (!cmd) {
         pl_mutex_unlock(&p->lock);
         return PL_SWAPCHAIN_SUBMIT_FAILED;
@@ -1389,7 +1386,6 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         pl_mutex_unlock(&p->lock);
         return PL_SWAPCHAIN_SUBMIT_FAILED;
     }
-    pl_clock_t t3 = vk->trace_present ? pl_clock_now() : 0;
     struct vk_cmdpool *pool = vk->pool_graphics;
     VkQueue queue = pool->queues[qidx];
 
@@ -1403,7 +1399,6 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     cleanup_retired_swapchains(sw, 0);
     present_trace(p, "retired_swapchains", false, 0);
 
-    pl_clock_t t4 = vk->trace_present ? pl_clock_now() : 0;
     VkSwapchainPresentFenceInfoKHR fenceInfo = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
         .swapchainCount = 1,
@@ -1464,11 +1459,9 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         vk_link_struct(&pinfo, &timings_info);
 
     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
-    pl_clock_t t5 = vk->trace_present ? pl_clock_now() : 0;
     present_trace(p, "queue_lock", true, 0);
     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
     present_trace(p, "queue_lock", false, 0);
-    pl_clock_t t6 = vk->trace_present ? pl_clock_now() : 0;
     present_trace(p, "vkQueuePresentKHR", true, 0);
     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
     present_trace(p, "vkQueuePresentKHR", false, res);
@@ -1483,20 +1476,9 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
         res = vk->QueuePresentKHR(queue, &pinfo);
         present_trace(p, "vkQueuePresentKHR_retry", false, res);
     }
-    pl_clock_t t7 = vk->trace_present ? pl_clock_now() : 0;
     present_trace(p, "queue_unlock", true, 0);
     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
     present_trace(p, "queue_unlock", false, 0);
-    if (vk->trace_present) {
-        PL_INFO(vk, "[PresentTrace] present start=%"PRIu64" image=%u size=%dx%d mode=%d "
-                "hold_ms=%.3f cmd_begin_ms=%.3f cmd_submit_ms=%.3f maintenance_ms=%.3f "
-                "setup_ms=%.3f lock_ms=%.3f driver_ms=%.3f total_ms=%.3f result=%d",
-                (uint64_t) t0, idx, p->cur_width, p->cur_height, (int) p->protoInfo.presentMode,
-                pl_clock_diff(t1, t0) * 1e3, pl_clock_diff(t2, t1) * 1e3,
-                pl_clock_diff(t3, t2) * 1e3, pl_clock_diff(t4, t3) * 1e3,
-                pl_clock_diff(t5, t4) * 1e3, pl_clock_diff(t6, t5) * 1e3,
-                pl_clock_diff(t7, t6) * 1e3, pl_clock_diff(t7, t0) * 1e3, (int) res);
-    }
 #ifdef PL_HAVE_WIN32
     if (res == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
         if (tracked)

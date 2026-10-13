@@ -190,6 +190,9 @@ enum pl_vulkan_command_trace_phase {
     PL_VULKAN_COMMAND_SUBMIT_BEGIN,
     PL_VULKAN_COMMAND_SUBMIT_END,
     PL_VULKAN_COMMAND_COMPLETE,
+    // CPU queue-lock acquisition, preceding SUBMIT_BEGIN.
+    PL_VULKAN_COMMAND_QUEUE_LOCK_BEGIN,
+    PL_VULKAN_COMMAND_QUEUE_LOCK_END,
 };
 
 struct pl_vulkan_command_trace {

@@ -1702,7 +1702,6 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
         .vulkan = pl_vk,
         .alloc = pl_vk,
         .log = log,
-        .trace_present = getenv("PL_VK_PRESENT_TRACE") != NULL,
         .inst = params->instance,
         .GetInstanceProcAddr = get_proc_addr_fallback(log, params->get_proc_addr),
     };
@@ -1828,7 +1827,6 @@ pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *par
         .vulkan = pl_vk,
         .alloc = pl_vk,
         .log = log,
-        .trace_present = getenv("PL_VK_PRESENT_TRACE") != NULL,
         .imported = true,
         .inst = params->instance,
         .physd = params->phys_device,
