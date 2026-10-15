@@ -782,7 +782,10 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
     pl_unreachable();
 
 scale_out:
-    if (csp_max != 1 || csp_min != 0) {
+    if (csp->transfer == PL_COLOR_TRC_SRGB && SH_PARAMS(sh).dynamic_constants) {
+        GLSL("color.rgb = "$" * color.rgb + vec3("$"); \n",
+             SH_FLOAT(csp_max - csp_min), SH_FLOAT(csp_min));
+    } else if (csp_max != 1 || csp_min != 0) {
         color_scale(sh, csp_max - csp_min, csp_min);
     }
 }
@@ -813,7 +816,8 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
     GLSL("// pl_shader_delinearize \n");
     if (pl_color_space_is_black_scaled(csp) &&
         csp->transfer != PL_COLOR_TRC_HLG &&
-        (csp_max != 1 || csp_min != 0))
+        (csp_max != 1 || csp_min != 0 ||
+         (csp->transfer == PL_COLOR_TRC_SRGB && SH_PARAMS(sh).dynamic_constants)))
     {
         GLSL("color.rgb = "$" * color.rgb + vec3("$"); \n",
              SH_FLOAT(1 / (csp_max - csp_min)),
@@ -1876,6 +1880,17 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
                           const struct pl_color_domain *dst,
                           const pl_matrix3x3 *linear_transform);
 
+// sRGB reference edits can cross an exact identity without changing the
+// conversion program. Dynamic callers need that identity represented by a
+// uniform, rather than by removing the conversion from the shader.
+static bool dynamic_srgb_conversion(pl_shader sh, const struct pl_color_space *src,
+                                    const struct pl_color_space *dst)
+{
+    return SH_PARAMS(sh).dynamic_constants &&
+           src->transfer == PL_COLOR_TRC_SRGB && dst->transfer == PL_COLOR_TRC_SRGB &&
+           src->primaries == dst->primaries;
+}
+
 void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
                             const struct pl_color_map_args *args)
 {
@@ -1911,7 +1926,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         (struct pl_color_domain) {.color = dst};
     if (!args->input && args->prelinearized)
         input.color.transfer = PL_COLOR_TRC_LINEAR;
-    if (pl_color_space_equal(&src, &dst)) {
+    if (pl_color_space_equal(&src, &dst) && !dynamic_srgb_conversion(sh, &src, &dst)) {
         pl_shader_color_convert_ex(sh, &input, &output);
         return;
     }
@@ -2556,7 +2571,9 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
         same_units |= source.transfer != PL_COLOR_TRC_LINEAR;
     else if (src->working_space != PL_COLOR_WORKING_LMS)
         same_units = true;
-    if (!linear_transform && src->working_space == dst->working_space &&
+    const bool dynamic_srgb = !linear_transform && native_in && native_out &&
+        pl_color_repr_equal(&input, &output) && dynamic_srgb_conversion(sh, &source, &target);
+    if (!dynamic_srgb && !linear_transform && src->working_space == dst->working_space &&
         input.alpha == output.alpha && same_units &&
         (!native_in || (pl_color_repr_equal(&input, &output) &&
                         pl_color_space_equal(&source, &target))))
@@ -2569,6 +2586,9 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
         pl_shader_set_alpha(sh, &input, output.alpha);
         return;
     }
+
+    if (dynamic_srgb)
+        GLSL("if ("$" == 0) { \n", SH_INT(pl_color_space_equal(&source, &target)));
 
     static const char *const names[] = {"native", "IPT", "JzAzBz", "LMS"};
     if (src->working_space != dst->working_space) {
@@ -2680,6 +2700,8 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
         struct pl_color_repr independent = {.alpha = PL_ALPHA_INDEPENDENT};
         pl_shader_set_alpha(sh, &independent, output.alpha);
     }
+    if (dynamic_srgb)
+        GLSL("} \n");
 }
 
 void pl_shader_color_convert_ex(pl_shader sh, const struct pl_color_domain *src,
