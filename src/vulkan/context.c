@@ -1308,7 +1308,36 @@ static const struct vk_fun *promote_vk_fun(void *parent, const struct vk_fun *f)
     return f;
 }
 
-static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params)
+static bool extension_enabled(const char *const *extensions, int count, const char *name)
+{
+    for (int i = 0; i < count; i++)
+        if (strcmp(extensions[i], name) == 0)
+            return true;
+    return false;
+}
+
+static bool maintenance_dependency_enabled(const char *extension,
+                                          const char *const *instance_extensions,
+                                          int num_instance_extensions)
+{
+    // The legacy entry point cannot inspect an externally created instance.
+    if (num_instance_extensions < 0)
+        return true;
+    const char *dependency = NULL;
+    if (strcmp(extension, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) == 0)
+        dependency = VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
+    if (strcmp(extension, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) == 0)
+        dependency = VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME;
+    return !dependency ||
+        (extension_enabled(instance_extensions, num_instance_extensions, dependency) &&
+         extension_enabled(instance_extensions, num_instance_extensions,
+                           VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+         extension_enabled(instance_extensions, num_instance_extensions,
+                           VK_KHR_SURFACE_EXTENSION_NAME));
+}
+
+static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params,
+                        const char *const *instance_extensions, int num_instance_extensions)
 {
     pl_assert(vk->physd);
     void *tmp = pl_tmp(NULL);
@@ -1383,6 +1412,10 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
     // Add all optional device-level extensions extensions
     for (int i = 0; i < PL_ARRAY_SIZE(vk_device_extensions); i++) {
         const struct vk_ext *ext = &vk_device_extensions[i];
+        if (!maintenance_dependency_enabled(ext->name, instance_extensions, num_instance_extensions)) {
+            PL_INFO(vk, "Skipping %s: instance dependencies are not enabled", ext->name);
+            continue;
+        }
         uint32_t core_ver = vk_ext_promoted_ver(ext->name);
         if (core_ver && vk->api_ver >= core_ver) {
             // Layer is already implicitly enabled by the API version
@@ -1402,12 +1435,19 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
     }
 
     // Add extra user extensions
-    for (int i = 0; i < params->num_extensions; i++)
+    for (int i = 0; i < params->num_extensions; i++) {
+        if (!maintenance_dependency_enabled(params->extensions[i], instance_extensions, num_instance_extensions)) {
+            PL_ERR(vk, "Required %s has disabled instance dependencies", params->extensions[i]);
+            goto error;
+        }
         PL_ARRAY_APPEND(vk->alloc, vk->exts, params->extensions[i]);
+    }
 
     // Add optional extra user extensions
     for (int i = 0; i < params->num_opt_extensions; i++) {
         const char *ext = params->opt_extensions[i];
+        if (!maintenance_dependency_enabled(ext, instance_extensions, num_instance_extensions))
+            continue;
         for (int n = 0; n < num_exts_avail; n++) {
             if (strcmp(ext, exts_avail[n].extensionName) == 0) {
                 PL_ARRAY_APPEND(vk->alloc, vk->exts, ext);
@@ -1443,6 +1483,16 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         const size_t size = vk_struct_size(f->sType) - sizeof(VkBaseOutStructure);
         for (int i = 0; i < size / sizeof(VkBool32); i++)
             flags[i] &= flags_sup[i];
+    }
+
+    // This feature is shared by the KHR and EXT aliases. Driver support alone
+    // does not make it legal to enable when both extensions were omitted.
+    if (!extension_enabled(vk->exts.elem, vk->exts.num, VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) &&
+        !extension_enabled(vk->exts.elem, vk->exts.num, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *maintenance =
+            (void *) vk_find_struct(&features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR);
+        if (maintenance)
+            maintenance->swapchainMaintenance1 = false;
     }
 
     // Construct normalized output chain
@@ -1693,7 +1743,8 @@ static bool finalize_context(struct pl_vulkan_t *pl_vk, int max_glsl_version,
     return true;
 }
 
-pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
+static pl_vulkan vulkan_create(pl_log log, const struct pl_vulkan_params *params,
+                                const char *const *instance_extensions, int num_instance_extensions)
 {
     params = PL_DEF(params, &pl_vulkan_default_params);
     struct pl_vulkan_t *pl_vk = pl_zalloc_obj(NULL, pl_vk, struct vk_ctx);
@@ -1724,6 +1775,8 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
         if (!vk->internal_instance)
             goto error;
         vk->inst = vk->internal_instance->instance;
+        instance_extensions = vk->internal_instance->extensions;
+        num_instance_extensions = vk->internal_instance->num_extensions;
     }
 
     // Directly load all mandatory instance-level function pointers, since
@@ -1803,7 +1856,7 @@ pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
     }
 
     // Finally, initialize the logical device and the rest of the vk_ctx
-    if (!device_init(vk, params))
+    if (!device_init(vk, params, instance_extensions, num_instance_extensions))
         goto error;
 
     if (!finalize_context(pl_vk, params->max_glsl_version, params->no_compute))
@@ -1815,6 +1868,18 @@ error:
     PL_FATAL(vk, "Failed initializing vulkan device");
     pl_vulkan_destroy((pl_vulkan *) &pl_vk);
     return NULL;
+}
+
+pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params)
+{
+    return vulkan_create(log, params, NULL, -1);
+}
+
+pl_vulkan pl_vulkan_create_with_instance_extensions(pl_log log,
+    const struct pl_vulkan_params *params, const char *const *extensions, int num_extensions)
+{
+    pl_assert(num_extensions >= 0 && (!num_extensions || extensions));
+    return vulkan_create(log, params, extensions, num_extensions);
 }
 
 pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *params)

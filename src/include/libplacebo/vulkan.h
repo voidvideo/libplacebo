@@ -340,6 +340,16 @@ PL_API extern const struct pl_vulkan_params pl_vulkan_default_params;
 // Thread-safety: Safe
 PL_API pl_vulkan pl_vulkan_create(pl_log log, const struct pl_vulkan_params *params);
 
+// Like pl_vulkan_create, with the exact enabled extensions of params->instance.
+// The list is borrowed for this call only. Optional KHR/EXT swapchain maintenance
+// is enabled only when its instance dependencies are enabled; explicitly
+// required maintenance extensions with missing dependencies fail creation.
+// If an instance is created internally, its enabled list is used instead.
+// num_extensions must be nonnegative. This preserves pl_vulkan_params ABI.
+PL_API pl_vulkan pl_vulkan_create_with_instance_extensions(pl_log log,
+    const struct pl_vulkan_params *params, const char *const *extensions, int num_extensions);
+
+
 // Destroys the vulkan device and all associated objects, except for the
 // VkInstance provided by the user.
 //
