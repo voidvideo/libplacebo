@@ -746,6 +746,10 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
     p->feedback_surface_supported = false;
     info->flags &= ~(VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT |
                      VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR);
+#ifdef VK_KHR_present_wait2
+    p->present_wait2_surface_supported = false;
+    info->flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+#endif
     if (!vk->GetPhysicalDeviceSurfaceCapabilities2KHR) {
         VK(vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physd, p->surf, &caps));
         goto caps_ready;
@@ -845,6 +849,8 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
 #ifdef VK_KHR_present_wait2
     p->present_wait2_surface_supported = p->present_wait2_device_supported &&
         present_id_support.presentId2Supported && present_wait2_support.presentWait2Supported;
+    if (p->present_wait2_surface_supported)
+        info->flags |= VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
 #endif
     if (p->feedback_surface_supported)
         info->flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
