@@ -22,6 +22,7 @@
 #include "gpu.h"
 #include "present_feedback.h"
 #include "swapchain.h"
+#include "swapchain_internal.h"
 #include "pl_thread.h"
 
 struct vk_swapchain {
@@ -616,6 +617,16 @@ error:
     return NULL;
 }
 
+void vk_swapchain_wait_idle(struct vk_ctx *vk)
+{
+    for (int i = 0; i < vk->pool_graphics->num_queues; i++) {
+        // Use the same queue lock as submit/present, including custom locks.
+        vk->lock_queue(vk->queue_ctx, vk->pool_graphics->qf, i);
+        vk->QueueWaitIdle(vk->pool_graphics->queues[i]);
+        vk->unlock_queue(vk->queue_ctx, vk->pool_graphics->qf, i);
+    }
+}
+
 static bool swapchain_destroy(pl_swapchain sw, struct vk_swapchain **ptr,
                                 uint64_t timeout)
 {
@@ -639,8 +650,7 @@ static bool swapchain_destroy(pl_swapchain sw, struct vk_swapchain **ptr,
         // leading to undefined behavior when destroying resources tied to the
         // swapchain. Use an extra `vkQueueWaitIdle` on all of the queues we may
         // have oustanding presentation calls on, to mitigate this risk.
-        for (int i = 0; i < vk->pool_graphics->num_queues; i++)
-            vk->QueueWaitIdle(vk->pool_graphics->queues[i]);
+        vk_swapchain_wait_idle(vk);
     }
 
     for (int i = 0; i < vk_sw->images.num; i++)
@@ -1031,6 +1041,32 @@ error:
     return false;
 }
 
+// A window can resize while the full capability query and swapchain setup
+// run. Refresh only the extent at the final creation boundary; do not reuse the
+// size sampled before format queries, logging, and allocation.
+bool vk_swapchain_refresh_extent(struct vk_ctx *vk, VkSurfaceKHR surface,
+                                 VkSwapchainCreateInfoKHR *info)
+{
+    VkSurfaceCapabilitiesKHR caps;
+    VkResult res = vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(
+        vk->physd, surface, &caps);
+    if (res != VK_SUCCESS) {
+        PL_ERR(vk, "Failed refreshing swapchain extent: %s", vk_res_str(res));
+        return false;
+    }
+    VkExtent2D extent = info->imageExtent;
+    if (caps.currentExtent.width != UINT32_MAX)
+        extent.width = caps.currentExtent.width;
+    if (caps.currentExtent.height != UINT32_MAX)
+        extent.height = caps.currentExtent.height;
+    extent.width = PL_CLAMP(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+    extent.height = PL_CLAMP(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    if (!extent.width || !extent.height)
+        return false; // A minimized surface cannot have a swapchain image.
+    info->imageExtent = extent;
+    return true;
+}
+
 static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
 {
     struct priv *p = PL_PRIV(sw);
@@ -1085,14 +1121,20 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
 #endif
 #endif
 
-    p->suboptimal = false;
-    p->needs_recreate = false;
-    p->cur_width = sinfo.imageExtent.width;
-    p->cur_height = sinfo.imageExtent.height;
 
     PL_DEBUG(sw, "(Re)creating swapchain of size %dx%d",
              sinfo.imageExtent.width,
              sinfo.imageExtent.height);
+
+#ifdef PL_HAVE_WIN32
+    if (!vk_swapchain_refresh_extent(vk, p->surf, &sinfo))
+        return false;
+    p->protoInfo.imageExtent = sinfo.imageExtent;
+#endif
+    p->suboptimal = false;
+    p->needs_recreate = false;
+    p->cur_width = sinfo.imageExtent.width;
+    p->cur_height = sinfo.imageExtent.height;
 
     // Calling `vkCreateSwapchainKHR` puts sinfo.oldSwapchain into a retired
     // state whether the call succeeds or not, so we always need to garbage
