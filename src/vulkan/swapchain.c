@@ -63,6 +63,8 @@ struct priv {
     uint32_t queue_families[3];
     int cur_width, cur_height;
     int swapchain_depth;
+    uint64_t present_wait_timeout;
+    VkResult present_wait_result;
     pl_rc_t frames_in_flight;       // number of frames currently queued
     bool suboptimal;                // true once VK_SUBOPTIMAL_KHR is returned
     bool needs_recreate;            // swapchain needs to be recreated
@@ -1644,6 +1646,18 @@ done:
     return written;
 }
 
+void pl_vulkan_swapchain_set_present_wait_timeout(pl_swapchain sw, uint64_t timeout_ns)
+{
+    struct priv *p = PL_PRIV(sw);
+    p->present_wait_timeout = timeout_ns;
+}
+
+VkResult pl_vulkan_swapchain_present_wait_status(pl_swapchain sw)
+{
+    struct priv *p = PL_PRIV(sw);
+    return p->present_wait_result;
+}
+
 static void vk_sw_swap_buffers(pl_swapchain sw)
 {
     struct priv *p = PL_PRIV(sw);
@@ -1666,15 +1680,16 @@ static void vk_sw_swap_buffers(pl_swapchain sw)
         VkPresentWait2InfoKHR wait = {
             .sType = VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR,
             .presentId = present_id,
-            .timeout = UINT64_MAX,
+            .timeout = p->present_wait_timeout ? p->present_wait_timeout : UINT64_MAX,
         };
         present_trace(p, "vkWaitForPresent2KHR", true, 0);
         VkResult res = p->vk->WaitForPresent2KHR(p->vk->dev, p->current->swapchain, &wait);
         present_trace(p, "vkWaitForPresent2KHR", false, res);
-        p->current->last_present_id = 0;
+        p->present_wait_result = res;
+        if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)
+            p->current->last_present_id = 0;
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
-            PL_WARN(p->vk, "Disabling native present wait after failure: %s", vk_res_str(res));
-            p->present_wait2_surface_supported = false;
+            PL_ERR(p->vk, "Native present wait failed: %s", vk_res_str(res));
         }
     }
 #endif

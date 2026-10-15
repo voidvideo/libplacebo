@@ -500,6 +500,16 @@ PL_API VkResult pl_vulkan_swapchain_set_exclusive_target(pl_swapchain sw,
 // snapshot; the caller must keep sw alive for the duration of this call.
 PL_API VkResult pl_vulkan_swapchain_exclusive_status(pl_swapchain sw, bool *acquired);
 
+// Bound native present waiting in swap_buffers, in nanoseconds. Zero keeps
+// the default unlimited wait. Configure between calls on the owning thread.
+// Does not bound GPU command completion waits.
+PL_API void pl_vulkan_swapchain_set_present_wait_timeout(pl_swapchain sw, uint64_t timeout_ns);
+
+// Result of the most recent native presentation wait (initially VK_SUCCESS).
+// VK_TIMEOUT means presentation remains pending, not successful. Call on the
+// owning thread after swap_buffers. Failure never disables native waiting.
+PL_API VkResult pl_vulkan_swapchain_present_wait_status(pl_swapchain sw);
+
 // Optional synchronous diagnostic boundaries. No timestamp conversion or logging
 // is performed by libplacebo: the caller timestamps each boundary in its clock.
 // The callback must not block, allocate, or call back into the swapchain. Configure
