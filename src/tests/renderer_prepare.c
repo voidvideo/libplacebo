@@ -1969,6 +1969,68 @@ static void test_stage_capture(pl_gpu gpu, struct pl_frame image, const uint8_t 
     pl_tex_destroy(gpu, &output);
 }
 
+// Reuse one prepared mix across the exact one-frame mastering-metadata loss
+// observed on the HTPC, including the cached-source graph used with hooks.
+static void test_bt1886_metadata_loss(pl_gpu gpu, struct pl_frame image, bool direct, bool present)
+{
+    image.color = pl_color_space_bt709;
+    const struct pl_raw_primaries mastering = {
+        .red = {0.68f, 0.32f}, .green = {0.265f, 0.69f},
+        .blue = {0.15f, 0.06f}, .white = {0.3127f, 0.329f},
+    };
+    if (present) image.color.hdr.prim = mastering;
+    struct snapshot_owner *owner = new_snapshot(gpu, true);
+    owner->params.dynamic_constants = true;
+    owner->params.skip_caching_single_frame = direct;
+    owner->params.dither_params = NULL;
+    pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
+    pl_renderer ordinary = pl_renderer_create(gpu->log, gpu);
+    pl_tex output = pl_tex_create(gpu, pl_tex_params(
+        .w = 4, .h = 4, .format = pl_find_named_fmt(gpu, "rgba8"),
+        .renderable = true, .host_readable = true));
+    pl_tex reference = pl_tex_create(gpu, &output->params);
+    REQUIRE(output && reference);
+    struct pl_frame target = frame(output), reference_target = frame(reference);
+    target.color = reference_target.color = pl_color_space_bt709;
+    const struct pl_frame *frames[] = {&image};
+    uint64_t signature = 1;
+    float timestamp = 0;
+    struct pl_frame_mix mix = {.num_frames = 1, .frames = frames,
+        .signatures = &signature, .timestamps = &timestamp, .vsync_duration = 1};
+    struct pl_renderer_snapshot snapshot = {.params = &owner->params, .owner = owner,
+        .retain = retain, .release = release};
+    pl_renderer_preparation preparation = NULL;
+    describing = true;
+    REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot,
+                                           &preparation) == PL_RENDERER_PREPARE_OK);
+    describing = false;
+    wait_prepared(preparation);
+    for (int step = 0; step < 3; step++) {
+        image.color.hdr.prim = (present != (step == 1))
+            ? mastering : (struct pl_raw_primaries) {0};
+        signature++;
+        describing = forbid_compile = true;
+        REQUIRE(pl_renderer_preflight_image_mix(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        describing = false;
+        REQUIRE(pl_render_image_mix_prepared(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        forbid_compile = false;
+        REQUIRE(pl_render_image_mix(ordinary, &mix, &reference_target, &owner->params));
+        uint8_t expected[64], actual[64];
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = reference, .ptr = expected)));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
+        for (int i = 0; i < 64; i++) REQUIRE(abs((int) expected[i] - actual[i]) <= 1);
+    }
+    pl_renderer_prepare_destroy(&preparation);
+    REQUIRE(owner->refs == 1);
+    pl_buf_destroy(gpu, &owner->output);
+    pl_dispatch_destroy(&owner->auxiliary);
+    free(owner);
+    pl_renderer_destroy(&renderer);
+    pl_renderer_destroy(&ordinary);
+    pl_tex_destroy(gpu, &output);
+    pl_tex_destroy(gpu, &reference);
+}
+
 int main(void)
 {
     pl_log log = pl_test_logger();
@@ -2030,6 +2092,9 @@ int main(void)
     pl_tex_destroy(gpu, &previous);
     pl_tex_destroy(gpu, &next);
     test_multiplane_target(gpu, frame(source));
+    for (int direct = 0; direct < 2; direct++)
+        for (int present = 0; present < 2; present++)
+            test_bt1886_metadata_loss(gpu, frame(source), direct, present);
     test_native_color(gpu, frame(source), false);
     test_native_color(gpu, frame(source), 1);
     test_native_color(gpu, frame(source), 2);
