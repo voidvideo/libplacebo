@@ -322,6 +322,9 @@ PL_API void pl_dispatch_prepared_destroy(pl_dispatch_prepared *prepared);
 // Read-only exact identity check for manifest preflight. Both handles must
 // belong to the same destination dispatch. Does not consume either handle,
 // compile, allocate GPU resources, update uniforms or submit GPU work.
+// A rejected comparison logs its first differing normalized field and the
+// actual/expected values at warning level. Shader text reports a bounded excerpt
+// at the first differing byte. Successful comparisons emit no diagnostic.
 PL_API bool pl_dispatch_prepared_matches(pl_dispatch_description description,
                                          pl_dispatch_prepared prepared);
 

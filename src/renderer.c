@@ -570,8 +570,13 @@ static enum pl_dispatch_result prepared_dispatch(pl_renderer_preparation p,
         return PL_DISPATCH_FAILED;
     }
     int index = p->pass_index++;
+    const char *failure = "prepared dispatch execution rejected";
     if (p->executing) {
         if (index >= p->passes.num || p->passes.elem[index].destination != dp) {
+            PL_WARN(p->rr, "Prepared renderer rejection: phase=execute pass=%d prepared_passes=%d "
+                    "owner_matches=%d frame_index=%u", index, p->passes.num,
+                    index < p->passes.num && p->passes.elem[index].destination == dp,
+                    (unsigned) p->shader_frame_index);
             prepare_fail(p, PL_RENDERER_PREPARE_NOT_READY, "dispatch graph changed");
             pl_dispatch_abort(dp, finish ? finish->shader : compute ? compute->shader : vertex->shader);
             return PL_DISPATCH_NOT_READY;
@@ -581,14 +586,22 @@ static enum pl_dispatch_result prepared_dispatch(pl_renderer_preparation p,
                                   : pl_dispatch_vertex_prepared(dp, p->passes.elem[index].ready, vertex);
     } else {
         pl_dispatch_description desc = NULL;
+        failure = "dispatch description rejected";
         result = finish ? pl_dispatch_describe_finish(dp, finish, target, &desc)
                         : compute ? pl_dispatch_describe_compute(dp, compute, &desc)
                                   : pl_dispatch_describe_vertex(dp, vertex, target, &desc);
         if (result == PL_DISPATCH_OK) {
             if (p->checking) {
-                if (index >= p->passes.num || p->passes.elem[index].destination != dp ||
-                    !pl_dispatch_prepared_matches(desc, p->passes.elem[index].ready))
+                if (index >= p->passes.num) {
+                    failure = "dispatch pass count increased";
                     result = PL_DISPATCH_NOT_READY;
+                } else if (p->passes.elem[index].destination != dp) {
+                    failure = "dispatch owner changed";
+                    result = PL_DISPATCH_NOT_READY;
+                } else if (!pl_dispatch_prepared_matches(desc, p->passes.elem[index].ready)) {
+                    failure = "dispatch description differs from compiled pass";
+                    result = PL_DISPATCH_NOT_READY;
+                }
                 pl_dispatch_description_destroy(&desc);
             } else {
                 PL_ARRAY_APPEND(p, p->passes, (struct prepared_render_pass) {
@@ -597,10 +610,15 @@ static enum pl_dispatch_result prepared_dispatch(pl_renderer_preparation p,
             }
         }
     }
-    if (result != PL_DISPATCH_OK)
+    if (result != PL_DISPATCH_OK) {
+        PL_WARN(p->rr, "Prepared renderer rejection: reason=%s phase=%s pass=%d prepared_passes=%d "
+                "kind=%s result=%d frame_index=%u", failure,
+                p->executing ? "execute" : p->checking ? "preflight" : "describe",
+                index, p->passes.num, finish ? "raster" : compute ? "compute" : "vertex",
+                result, (unsigned) p->shader_frame_index);
         prepare_fail(p, result == PL_DISPATCH_NOT_READY ? PL_RENDERER_PREPARE_NOT_READY
-                                                       : PL_RENDERER_PREPARE_FAILED,
-                     "required dispatch failed or was not prepared");
+                                                       : PL_RENDERER_PREPARE_FAILED, failure);
+    }
     return result;
 }
 

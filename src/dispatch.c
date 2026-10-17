@@ -857,64 +857,127 @@ static void garbage_collect_passes(pl_dispatch dp)
     }
 }
 
+// Report only rejected comparisons; successful per-frame checks stay silent.
+static bool mismatch_number(pl_dispatch dp, const char *section, const char *field, int index,
+                            uint64_t actual, uint64_t expected)
+{
+    PL_WARN(dp, "Prepared dispatch mismatch: section=%s field=%s index=%d actual=%llu expected=%llu",
+            section, field, index, (unsigned long long) actual, (unsigned long long) expected);
+    return false;
+}
+
+static bool match_text(pl_dispatch dp, const char *section, const char *field, int index,
+                       const char *actual, const char *expected)
+{
+    if (!strcmp(actual, expected))
+        return true;
+    size_t offset = 0;
+    while (actual[offset] == expected[offset])
+        offset++;
+    PL_WARN(dp, "Prepared dispatch mismatch: section=%s field=%s index=%d byte=%zu "
+            "actual=%.96s expected=%.96s", section, field, index, offset,
+            actual + offset, expected + offset);
+    return false;
+}
+
 // Compare normalized fields, never caller pointer values or struct padding.
-static bool pass_matches(const struct pass *a, const struct pass *b)
+static bool pass_matches(pl_dispatch dp, const struct pass *a, const struct pass *b)
 {
     const struct pl_pass_params *x = &a->params, *y = &b->params;
-    if (a->num_vars != b->num_vars ||
-        a->ubo_size != b->ubo_size || a->quad != b->quad ||
-        x->type != y->type || x->push_constants_size != y->push_constants_size ||
-        x->num_variables != y->num_variables ||
-        x->num_descriptors != y->num_descriptors ||
-        x->num_constants != y->num_constants ||
-        strcmp(x->glsl_shader, y->glsl_shader))
-        return false;
+    int index = -1;
+    const char *section = "pass";
+#define MATCH_FIELD(actual, expected) do { \
+    if ((actual) != (expected)) \
+        return mismatch_number(dp, section, #actual, index, (actual), (expected)); \
+} while (0)
+#define MATCH_TEXT(actual, expected) do { \
+    if (!match_text(dp, section, #actual, index, (actual), (expected))) return false; \
+} while (0)
+    MATCH_FIELD(a->num_vars, b->num_vars);
+    MATCH_FIELD(a->ubo_size, b->ubo_size);
+    MATCH_FIELD(a->quad, b->quad);
+    MATCH_FIELD(x->type, y->type);
+    MATCH_FIELD(x->push_constants_size, y->push_constants_size);
+    MATCH_FIELD(x->num_variables, y->num_variables);
+    MATCH_FIELD(x->num_descriptors, y->num_descriptors);
+    MATCH_FIELD(x->num_constants, y->num_constants);
+    MATCH_TEXT(x->glsl_shader, y->glsl_shader);
+    section = "uniform-layout";
     for (int i = 0; i < a->num_vars; i++) {
+        index = i;
         const struct pass_var *v = &a->vars[i], *w = &b->vars[i];
-        if (v->type != w->type || v->index != w->index ||
-            v->layout.offset != w->layout.offset ||
-            v->layout.stride != w->layout.stride || v->layout.size != w->layout.size)
-            return false;
+        MATCH_FIELD(v->type, w->type);
+        MATCH_FIELD(v->index, w->index);
+        MATCH_FIELD(v->layout.offset, w->layout.offset);
+        MATCH_FIELD(v->layout.stride, w->layout.stride);
+        MATCH_FIELD(v->layout.size, w->layout.size);
     }
+    section = "uniform";
     for (int i = 0; i < x->num_variables; i++) {
+        index = i;
         const struct pl_var *v = &x->variables[i], *w = &y->variables[i];
-        if (v->type != w->type || v->dim_v != w->dim_v ||
-            v->dim_m != w->dim_m || v->dim_a != w->dim_a || strcmp(v->name, w->name))
-            return false;
+        MATCH_FIELD(v->type, w->type);
+        MATCH_FIELD(v->dim_v, w->dim_v);
+        MATCH_FIELD(v->dim_m, w->dim_m);
+        MATCH_FIELD(v->dim_a, w->dim_a);
+        MATCH_TEXT(v->name, w->name);
     }
+    section = "descriptor";
     for (int i = 0; i < x->num_descriptors; i++) {
+        index = i;
         const struct pl_desc *v = &x->descriptors[i], *w = &y->descriptors[i];
-        if (v->type != w->type || v->access != w->access ||
-            v->binding != w->binding || strcmp(v->name, w->name))
-            return false;
+        MATCH_FIELD(v->type, w->type);
+        MATCH_FIELD(v->access, w->access);
+        MATCH_FIELD(v->binding, w->binding);
+        MATCH_TEXT(v->name, w->name);
     }
+    section = "specialization";
     for (int i = 0; i < x->num_constants; i++) {
+        index = i;
         const struct pl_constant *v = &x->constants[i], *w = &y->constants[i];
-        if (v->type != w->type || v->id != w->id || v->offset != w->offset ||
-            memcmp((const uint8_t *) x->constant_data + v->offset,
-                   (const uint8_t *) y->constant_data + w->offset,
-                   pl_var_type_size(v->type)))
-            return false;
+        MATCH_FIELD(v->type, w->type);
+        MATCH_FIELD(v->id, w->id);
+        MATCH_FIELD(v->offset, w->offset);
+        const uint8_t *actual = (const uint8_t *) x->constant_data + v->offset;
+        const uint8_t *expected = (const uint8_t *) y->constant_data + w->offset;
+        if (!memcmp(actual, expected, pl_var_type_size(v->type)))
+            continue;
+        for (size_t byte = 0; byte < pl_var_type_size(v->type); byte++) {
+            if (actual[byte] != expected[byte]) {
+                PL_WARN(dp, "Prepared dispatch mismatch: field=constant_data index=%d byte=%zu "
+                        "actual=0x%02x expected=0x%02x", i, byte, actual[byte], expected[byte]);
+                return false;
+            }
+        }
     }
     if (x->type != PL_PASS_RASTER)
         return true;
-    if (x->vertex_type != y->vertex_type || x->vertex_stride != y->vertex_stride ||
-        x->num_vertex_attribs != y->num_vertex_attribs || x->load_target != y->load_target ||
-        x->target_format->signature != y->target_format->signature ||
-        strcmp(x->vertex_shader, y->vertex_shader) ||
-        !!x->blend_params != !!y->blend_params)
-        return false;
-    if (x->blend_params && (x->blend_params->src_rgb != y->blend_params->src_rgb ||
-        x->blend_params->dst_rgb != y->blend_params->dst_rgb ||
-        x->blend_params->src_alpha != y->blend_params->src_alpha ||
-        x->blend_params->dst_alpha != y->blend_params->dst_alpha))
-        return false;
-    for (int i = 0; i < x->num_vertex_attribs; i++) {
-        const struct pl_vertex_attrib *v = &x->vertex_attribs[i], *w = &y->vertex_attribs[i];
-        if (v->fmt->signature != w->fmt->signature || v->offset != w->offset ||
-            v->location != w->location || strcmp(v->name, w->name))
-            return false;
+    index = -1;
+    section = "raster";
+    MATCH_FIELD(x->vertex_type, y->vertex_type);
+    MATCH_FIELD(x->vertex_stride, y->vertex_stride);
+    MATCH_FIELD(x->num_vertex_attribs, y->num_vertex_attribs);
+    MATCH_FIELD(x->load_target, y->load_target);
+    MATCH_FIELD(x->target_format->signature, y->target_format->signature);
+    MATCH_TEXT(x->vertex_shader, y->vertex_shader);
+    MATCH_FIELD(!!x->blend_params, !!y->blend_params);
+    if (x->blend_params) {
+        MATCH_FIELD(x->blend_params->src_rgb, y->blend_params->src_rgb);
+        MATCH_FIELD(x->blend_params->dst_rgb, y->blend_params->dst_rgb);
+        MATCH_FIELD(x->blend_params->src_alpha, y->blend_params->src_alpha);
+        MATCH_FIELD(x->blend_params->dst_alpha, y->blend_params->dst_alpha);
     }
+    section = "vertex-attribute";
+    for (int i = 0; i < x->num_vertex_attribs; i++) {
+        index = i;
+        const struct pl_vertex_attrib *v = &x->vertex_attribs[i], *w = &y->vertex_attribs[i];
+        MATCH_FIELD(v->fmt->signature, w->fmt->signature);
+        MATCH_FIELD(v->offset, w->offset);
+        MATCH_FIELD(v->location, w->location);
+        MATCH_TEXT(v->name, w->name);
+    }
+#undef MATCH_FIELD
+#undef MATCH_TEXT
     return true;
 }
 
@@ -1253,7 +1316,7 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
 
     if (build->mode == DISPATCH_PREPARED) {
         struct pass *ready = build->prepared->entry;
-        if (!pass_matches(pass, ready)) {
+        if (!pass_matches(dp, pass, ready)) {
             build->result = PL_DISPATCH_NOT_READY;
             goto error;
         }
@@ -2188,8 +2251,15 @@ enum pl_pass_prepare_state pl_dispatch_prepare_take(
 bool pl_dispatch_prepared_matches(pl_dispatch_description description,
                                   pl_dispatch_prepared prepared)
 {
-    return description && prepared && description->owner == prepared->owner &&
-           pass_matches(description->entry, prepared->entry);
+    if (!description || !prepared || description->owner != prepared->owner) {
+        pl_dispatch dp = description ? description->owner : prepared ? prepared->owner : NULL;
+        if (dp)
+            PL_WARN(dp, "Prepared dispatch mismatch: description_present=%d prepared_present=%d owner_matches=%d",
+                    !!description, !!prepared,
+                    description && prepared && description->owner == prepared->owner);
+        return false;
+    }
+    return pass_matches(description->owner, description->entry, prepared->entry);
 }
 
 void pl_dispatch_prepared_destroy(pl_dispatch_prepared *ptr)
