@@ -12,6 +12,15 @@ static PFN_vkCreateGraphicsPipelines original_graphics;
 static atomic_int translations, pipelines, runs, destroys, live_buffers, live_timers;
 static struct prepare_latch compile_latch;
 static bool fail_run;
+static atomic_bool mismatch_logged;
+static void diagnostic_log(void *priv, enum pl_log_level level, const char *msg)
+{
+    if (strstr(msg, "Prepared dispatch mismatch:") && strstr(msg, "field=") &&
+        strstr(msg, "actual=") && strstr(msg, "expected="))
+        atomic_store(&mismatch_logged, true);
+    pl_log_timestamp(priv, level, msg);
+}
+
 
 static pl_str observe_compile(pl_spirv spirv, void *alloc,
     struct pl_glsl_version version, enum glsl_shader_stage stage, const char *source)
@@ -331,15 +340,18 @@ static void test_compute(pl_gpu gpu, pl_dispatch dp)
     latch_release(&compile_latch);
     pass = take(&request);
     int before_compile = atomic_load(&translations), before_pipeline = atomic_load(&pipelines);
+    atomic_store(&mismatch_logged, false);
     for (uint32_t runtime = 5; runtime <= 9; runtime += 4) {
         REQUIRE(run_compute(dp, pass, output, runtime, 7) == PL_DISPATCH_OK);
         uint32_t value = 0;
         REQUIRE(pl_buf_read(gpu, output, 0, &value, sizeof(value)));
         REQUIRE(value == runtime + 9);
     }
+    REQUIRE(!atomic_load(&mismatch_logged));
     before_runs = atomic_load(&runs);
     describe_only = true; // mismatches must not even upload uniforms
     REQUIRE(run_compute(dp, pass, output, 5, 8) == PL_DISPATCH_NOT_READY);
+    REQUIRE(atomic_load(&mismatch_logged));
     REQUIRE(atomic_load(&runs) == before_runs);
     describe_only = false;
     pl_dispatch other = pl_dispatch_create(gpu->log, gpu);
@@ -633,6 +645,7 @@ int main(void)
 {
     latch_init(&compile_latch);
     pl_log log = pl_test_logger();
+    pl_log_update(log, pl_log_params(.log_cb = diagnostic_log, .log_level = PL_LOG_DEBUG));
     pl_vulkan vk = pl_vulkan_create(log, pl_vulkan_params(.allow_software = true));
     if (!vk)
         return SKIP;

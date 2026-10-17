@@ -1880,14 +1880,15 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
                           const struct pl_color_domain *dst,
                           const pl_matrix3x3 *linear_transform);
 
-// sRGB reference edits can cross an exact identity without changing the
-// conversion program. Dynamic callers need that identity represented by a
-// uniform, rather than by removing the conversion from the shader.
-static bool dynamic_srgb_conversion(pl_shader sh, const struct pl_color_space *src,
+// SDR reference edits and transient mastering metadata can cross an exact
+// identity without changing the conversion program. Dynamic sRGB/BT.1886
+// callers retain that identity as a uniform instead of changing shader layout.
+static bool dynamic_sdr_conversion(pl_shader sh, const struct pl_color_space *src,
                                     const struct pl_color_space *dst)
 {
     return SH_PARAMS(sh).dynamic_constants &&
-           src->transfer == PL_COLOR_TRC_SRGB && dst->transfer == PL_COLOR_TRC_SRGB &&
+           (src->transfer == PL_COLOR_TRC_SRGB || src->transfer == PL_COLOR_TRC_BT_1886) &&
+           src->transfer == dst->transfer &&
            src->primaries == dst->primaries;
 }
 
@@ -1926,7 +1927,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         (struct pl_color_domain) {.color = dst};
     if (!args->input && args->prelinearized)
         input.color.transfer = PL_COLOR_TRC_LINEAR;
-    if (pl_color_space_equal(&src, &dst) && !dynamic_srgb_conversion(sh, &src, &dst)) {
+    if (pl_color_space_equal(&src, &dst) && !dynamic_sdr_conversion(sh, &src, &dst)) {
         pl_shader_color_convert_ex(sh, &input, &output);
         return;
     }
@@ -2571,9 +2572,9 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
         same_units |= source.transfer != PL_COLOR_TRC_LINEAR;
     else if (src->working_space != PL_COLOR_WORKING_LMS)
         same_units = true;
-    const bool dynamic_srgb = !linear_transform && native_in && native_out &&
-        pl_color_repr_equal(&input, &output) && dynamic_srgb_conversion(sh, &source, &target);
-    if (!dynamic_srgb && !linear_transform && src->working_space == dst->working_space &&
+    const bool dynamic_sdr = !linear_transform && native_in && native_out &&
+        pl_color_repr_equal(&input, &output) && dynamic_sdr_conversion(sh, &source, &target);
+    if (!dynamic_sdr && !linear_transform && src->working_space == dst->working_space &&
         input.alpha == output.alpha && same_units &&
         (!native_in || (pl_color_repr_equal(&input, &output) &&
                         pl_color_space_equal(&source, &target))))
@@ -2587,7 +2588,7 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
         return;
     }
 
-    if (dynamic_srgb)
+    if (dynamic_sdr)
         GLSL("if ("$" == 0) { \n", SH_INT(pl_color_space_equal(&source, &target)));
 
     static const char *const names[] = {"native", "IPT", "JzAzBz", "LMS"};
@@ -2700,7 +2701,7 @@ static void color_convert(pl_shader sh, const struct pl_color_domain *src,
         struct pl_color_repr independent = {.alpha = PL_ALPHA_INDEPENDENT};
         pl_shader_set_alpha(sh, &independent, output.alpha);
     }
-    if (dynamic_srgb)
+    if (dynamic_sdr)
         GLSL("} \n");
 }
 

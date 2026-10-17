@@ -6,13 +6,13 @@
 #include <libplacebo/shaders/sampling.h>
 
 static pl_shader shader(pl_dispatch dp, pl_gpu gpu, pl_tex source,
-                        struct pl_color_space target, bool dynamic)
+                        struct pl_color_space input, struct pl_color_space target, bool dynamic)
 {
     pl_shader sh = pl_dispatch_begin(dp);
     pl_shader_reset(sh, pl_shader_params(.gpu = gpu, .dynamic_constants = dynamic));
     REQUIRE(pl_shader_sample_nearest(sh, pl_sample_src(.tex = source)));
     pl_shader_color_map(sh, pl_color_map_params(.gamut_mapping = &pl_gamut_map_clip),
-                        pl_color_space_srgb, target, NULL, false);
+                        input, target, NULL, false);
     return sh;
 }
 
@@ -58,7 +58,7 @@ int main(void)
             struct pl_color_space target = pl_color_space_srgb;
             target.hdr.max_luma = whites[w];
             target.hdr.min_luma = blacks[b];
-            pl_shader sh = shader(dp, gpu, source, target, true);
+            pl_shader sh = shader(dp, gpu, source, pl_color_space_srgb, target, true);
             pl_dispatch_description desc = NULL;
             REQUIRE(pl_dispatch_describe_finish(dp, pl_dispatch_params(.shader = &sh),
                                                 &params, &desc) == PL_DISPATCH_OK);
@@ -67,9 +67,45 @@ int main(void)
                 REQUIRE(pl_dispatch_prepared_matches(desc, prepared));
                 pl_dispatch_description_destroy(&desc);
             }
-            sh = shader(dp, gpu, source, target, false);
+            sh = shader(dp, gpu, source, pl_color_space_srgb, target, false);
             REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = reference)));
-            sh = shader(dp, gpu, source, target, true);
+            sh = shader(dp, gpu, source, pl_color_space_srgb, target, true);
+            REQUIRE(pl_dispatch_finish_prepared(dp, prepared,
+                pl_dispatch_params(.shader = &sh, .target = output)) == PL_DISPATCH_OK);
+            float expected[PL_ARRAY_SIZE(pixels)][4], actual[PL_ARRAY_SIZE(pixels)][4];
+            REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = reference, .ptr = expected)));
+            REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
+            for (int i = 0; i < PL_ARRAY_SIZE(pixels); i++)
+                for (int c = 0; c < 4; c++)
+                    REQUIRE(fabsf(expected[i][c] - actual[i][c]) < 2e-5f);
+        }
+        pl_dispatch_prepared_destroy(&prepared);
+    }
+    // HTPC regression: BT.709/BT.1886 with P3 mastering metadata loses that
+    // metadata for one frame, then regains it. Both preparation directions must
+    // keep the same dispatch and match ordinary rendering of each current frame.
+    for (int initial = 0; initial < 2; initial++) {
+        pl_dispatch_prepared prepared = NULL;
+        for (int step = 0; step < 3; step++) {
+            struct pl_color_space input = pl_color_space_bt709;
+            struct pl_color_space target = pl_color_space_bt709;
+            if ((initial + step) % 2)
+                input.hdr.prim = (struct pl_raw_primaries) {
+                    .red = {0.68f, 0.32f}, .green = {0.265f, 0.69f},
+                    .blue = {0.15f, 0.06f}, .white = {0.3127f, 0.329f},
+                };
+            pl_shader sh = shader(dp, gpu, source, input, target, true);
+            pl_dispatch_description desc = NULL;
+            REQUIRE(pl_dispatch_describe_finish(dp, pl_dispatch_params(.shader = &sh),
+                                                &params, &desc) == PL_DISPATCH_OK);
+            if (!prepared) prepared = prepare(&desc);
+            else {
+                REQUIRE(pl_dispatch_prepared_matches(desc, prepared));
+                pl_dispatch_description_destroy(&desc);
+            }
+            sh = shader(dp, gpu, source, input, target, false);
+            REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = reference)));
+            sh = shader(dp, gpu, source, input, target, true);
             REQUIRE(pl_dispatch_finish_prepared(dp, prepared,
                 pl_dispatch_params(.shader = &sh, .target = output)) == PL_DISPATCH_OK);
             float expected[PL_ARRAY_SIZE(pixels)][4], actual[PL_ARRAY_SIZE(pixels)][4];
