@@ -236,6 +236,8 @@ enum pl_queue_plan_mode {
     PL_QUEUE_PLAN_NEAREST,
     PL_QUEUE_PLAN_OVERSAMPLE,
     PL_QUEUE_PLAN_TEMPORAL,
+    PL_QUEUE_PLAN_LAST_DUE,
+    PL_QUEUE_PLAN_PREFIX,
 };
 
 struct pl_queue_plan_info {
@@ -279,9 +281,21 @@ PL_API const struct pl_queue_plan_info *pl_queue_plan_get_info(pl_queue_plan pla
 // sources source_duration is the interval between internal fields, not physical
 // frames. The caller converts the intended host output interval using its
 // selected source-clock rate before providing output_duration.
+enum pl_queue_plan_intent {
+    PL_QUEUE_PLAN_INTENT_DEFAULT = 0, // existing kernel/threshold selection
+    PL_QUEUE_PLAN_INTENT_SINGLE,      // one nearest sample, no interpolation
+    PL_QUEUE_PLAN_INTENT_LAST_DUE,    // one last sample at or before the target
+    PL_QUEUE_PLAN_INTENT_PREFIX,      // available prefix starting at last-due
+};
+
 struct pl_queue_plan_cadence {
     float source_duration;
     float output_duration;
+    enum pl_queue_plan_intent intent;
+    // PREFIX maximum exposure, not a required minimum. The actual nonempty
+    // membership is frozen on the first bound observation; later publication
+    // may complete its references but does not add exposed samples.
+    int max_entries;
 };
 
 // Opt-in preparation for a caller which already owns cadence. Uses the existing
@@ -291,7 +305,10 @@ struct pl_queue_plan_cadence {
 // Settings pts/vsync_duration/timeout/get_frame/priv are not used. The caller's
 // target is authoritative: drift_compensation must be zero. Missing cadence
 // (NULL or zero duration) returns BOOTSTRAP with no plan; invalid facts return
-// ERROR. On PREPARED, mode, normalization and support_radius are frozen even
+// ERROR. SINGLE explicitly permits output_duration=0 for unpaced image steps;
+// it uses the existing single-frame mix normalization, not a display cadence.
+// Non-default intents do not evaluate or commit interpolation hysteresis.
+// On PREPARED, mode, normalization and support_radius are frozen even
 // with an empty queue. Publication readiness is assessed only after binding T.
 PL_API enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue queue,
     const struct pl_queue_params *settings, const struct pl_queue_plan_cadence *cadence,

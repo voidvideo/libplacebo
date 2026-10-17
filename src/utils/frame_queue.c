@@ -1186,6 +1186,9 @@ struct pl_queue_plan_t {
     struct pl_queue_plan_info info;
     struct selection_timing timing;
     int next_threshold;
+    enum pl_queue_plan_intent intent;
+    int max_entries;
+    PL_ARRAY(uint64_t) members;
     bool consumed;
     int first_index, last_index;
     PL_ARRAY(struct pl_queue_plan_sample) samples;
@@ -1221,7 +1224,22 @@ static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
 
     int last = first;
     bool complete = true;
-    if (info->mode == PL_QUEUE_PLAN_TEMPORAL) {
+    if (info->mode == PL_QUEUE_PLAN_LAST_DUE || info->mode == PL_QUEUE_PLAN_PREFIX) {
+        if (!plan->members.num) {
+            last = info->mode == PL_QUEUE_PLAN_PREFIX ?
+                first + PL_MIN(plan->max_entries, p->queue.num - first) - 1 : first;
+            for (int i = first; i <= last; i++)
+                PL_ARRAY_APPEND(plan, plan->members, p->queue.elem[i]->signature);
+        } else {
+            last = first + plan->members.num - 1;
+            if (last >= p->queue.num)
+                return PL_QUEUE_PLAN_STALE;
+            for (int i = first; i <= last; i++) {
+                if (p->queue.elem[i]->signature != plan->members.elem[i - first])
+                    return PL_QUEUE_PLAN_STALE;
+            }
+        }
+    } else if (info->mode == PL_QUEUE_PLAN_TEMPORAL) {
         while (last + 1 < p->queue.num && p->queue.elem[last + 1]->pts <= info->max_pts)
             last++;
         complete = p->queue.elem[p->queue.num - 1]->pts >= info->max_pts;
@@ -1345,15 +1363,30 @@ enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue p,
     if (!isfinite(cadence->source_duration) || cadence->source_duration < 0 ||
         !isfinite(cadence->output_duration) || cadence->output_duration < 0)
         return PL_QUEUE_PLAN_ERROR;
-    if (!cadence->source_duration || !cadence->output_duration)
+    if (cadence->intent < PL_QUEUE_PLAN_INTENT_DEFAULT || cadence->intent > PL_QUEUE_PLAN_INTENT_PREFIX ||
+        (cadence->intent == PL_QUEUE_PLAN_INTENT_PREFIX && cadence->max_entries <= 0))
+        return PL_QUEUE_PLAN_ERROR;
+    if (!cadence->source_duration ||
+        (!cadence->output_duration && cadence->intent != PL_QUEUE_PLAN_INTENT_SINGLE))
         return PL_QUEUE_PLAN_BOOTSTRAP;
 
     pl_mutex_lock(&p->lock_strong);
     pl_mutex_lock(&p->lock_weak);
     pl_queue_plan plan = pl_zalloc_ptr(NULL, plan);
     plan->queue = p;
-    enum pl_queue_plan_mode mode = selection_mode(cadence->source_duration,
-        cadence->output_duration, p->threshold_frames, settings, &plan->next_threshold);
+    plan->intent = cadence->intent;
+    plan->max_entries = cadence->max_entries;
+    plan->next_threshold = p->threshold_frames;
+    enum pl_queue_plan_mode mode = PL_QUEUE_PLAN_NEAREST;
+    switch (cadence->intent) {
+    case PL_QUEUE_PLAN_INTENT_DEFAULT:
+        mode = selection_mode(cadence->source_duration, cadence->output_duration,
+            p->threshold_frames, settings, &plan->next_threshold);
+        break;
+    case PL_QUEUE_PLAN_INTENT_SINGLE: break;
+    case PL_QUEUE_PLAN_INTENT_LAST_DUE: mode = PL_QUEUE_PLAN_LAST_DUE; break;
+    case PL_QUEUE_PLAN_INTENT_PREFIX: mode = PL_QUEUE_PLAN_PREFIX; break;
+    }
     float normalized_radius = settings->radius *
         fmaxf(1.0f, cadence->output_duration / cadence->source_duration);
     double radius = mode == PL_QUEUE_PLAN_TEMPORAL ?
@@ -1472,7 +1505,8 @@ enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_fr
         }
         PL_ARRAY_APPEND(p, p->tmp_sig, entry->signature);
         PL_ARRAY_APPEND(p, p->tmp_frame, &entry->frame);
-        float ts = plan->info.mode == PL_QUEUE_PLAN_NEAREST ? 0.0f :
+        float ts = (plan->info.mode == PL_QUEUE_PLAN_NEAREST ||
+                    plan->info.mode == PL_QUEUE_PLAN_LAST_DUE) ? 0.0f :
             (entry->pts - plan->info.pts) / plan->info.frame_duration;
         PL_ARRAY_APPEND(p, p->tmp_ts, ts);
     }
@@ -1481,7 +1515,8 @@ enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_fr
         p->pts_offset = plan->timing.pts_offset;
     }
     p->prev_pts = plan->info.requested_pts;
-    p->threshold_frames = plan->next_threshold;
+    if (plan->intent == PL_QUEUE_PLAN_INTENT_DEFAULT)
+        p->threshold_frames = plan->next_threshold;
     // Nearest can select the future bracket: preserve the preceding entry as
     // ordinary advance does, so the following target has identical ownership.
     double start = plan->info.mode == PL_QUEUE_PLAN_TEMPORAL ? plan->info.min_pts : plan->info.pts;

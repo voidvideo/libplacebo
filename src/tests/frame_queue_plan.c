@@ -440,8 +440,97 @@ static void declared_invalid_and_threshold(void)
     pl_queue_destroy(&queue);
 }
 
+static void caller_selection_intents(void)
+{
+    const struct pl_gpu_t gpu = {0};
+    pl_queue queue = pl_queue_create(&gpu);
+    struct sample samples[8] = {0};
+    struct pl_queue_params settings = {0};
+    struct pl_queue_plan_cadence cadence = {
+        .source_duration = .04, .output_duration = 1.0f / 60,
+    };
+    push(queue, &samples[0], 1, .04, PL_FIELD_NONE);
+    push(queue, &samples[1], 1.04, .04, PL_FIELD_NONE);
+    pl_queue_plan plan;
+    struct pl_frame_mix mix;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_get_info(plan)->mode == PL_QUEUE_PLAN_OVERSAMPLE);
+    pl_queue_plan_destroy(&plan);
+    cadence.intent = PL_QUEUE_PLAN_INTENT_SINGLE;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_get_info(plan)->mode == PL_QUEUE_PLAN_NEAREST);
+    assert(pl_queue_plan_set_target(plan, 1.03) == PL_QUEUE_PLAN_READY);
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+    assert(mix.num_frames == 1 && mix.frames[0]->user_data == &samples[1]);
+    pl_queue_plan_destroy(&plan);
+    // Explicit image steps declare no physical host refresh interval.
+    cadence.output_duration = 0;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_get_info(plan)->vsync_duration == 0);
+    assert(pl_queue_plan_set_target(plan, 1.04) == PL_QUEUE_PLAN_READY);
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY && mix.num_frames == 1);
+    pl_queue_plan_destroy(&plan);
+    cadence.output_duration = 1.0f / 60;
+    cadence.intent = PL_QUEUE_PLAN_INTENT_LAST_DUE;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_set_target(plan, 9) == PL_QUEUE_PLAN_READY); // no new age gate
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+    assert(mix.num_frames == 1 && mix.frames[0]->user_data == &samples[1]);
+    pl_queue_plan_destroy(&plan);
+    pl_queue_reset(queue);
+    memset(samples, 0, sizeof(samples));
+    // Freeze the actual prefix, not a mandatory maximum-depth requirement.
+    cadence.intent = PL_QUEUE_PLAN_INTENT_PREFIX;
+    cadence.max_entries = 8;
+    push(queue, &samples[0], 1, .04, PL_FIELD_NONE);
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_set_target(plan, 1) == PL_QUEUE_PLAN_READY);
+    push(queue, &samples[1], 1.04, .04, PL_FIELD_NONE);
+    assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_READY);
+    int count;
+    pl_queue_plan_get_samples(plan, &count);
+    assert(count == 1 && samples[0].mapped == 0);
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY && mix.num_frames == 1);
+    pl_queue_plan_destroy(&plan);
+    // A failure in any frozen member returns no partial mix or queue advance.
+    samples[1].fail = true;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_set_target(plan, 1) == PL_QUEUE_PLAN_READY);
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_ERROR && mix.num_frames == 0);
+    assert(pl_queue_num_frames(queue) == 2);
+    pl_queue_plan_destroy(&plan);
+    pl_queue_reset(queue);
+    memset(samples, 0, sizeof(samples));
+    // Internal field identities and future deinterlacing references come from
+    // the same complete-support resolver used by ordinary prepared plans.
+    cadence.source_duration = .02;
+    push(queue, &samples[0], 1, .04, PL_FIELD_TOP);
+    push(queue, &samples[1], 1.04, .04, PL_FIELD_TOP);
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_set_target(plan, 1.01) == PL_QUEUE_PLAN_PENDING);
+    const struct pl_queue_plan_sample *members = pl_queue_plan_get_samples(plan, &count);
+    assert(count == 4 && members[0].field == PL_FIELD_TOP && members[1].field == PL_FIELD_BOTTOM);
+    assert(fabs(members[1].pts - 1.02) < 1e-7);
+    assert(members[0].signature != members[1].signature);
+    assert(members[0].primary_signature == members[1].primary_signature);
+    uint64_t expected[4];
+    for (int i = 0; i < 4; i++) expected[i] = members[i].signature;
+    assert(!members[3].complete && samples[0].mapped == 0);
+    push(queue, &samples[2], 1.08, .04, PL_FIELD_TOP);
+    assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_READY);
+    members = pl_queue_plan_get_samples(plan, &count);
+    assert(count == 4 && members[3].complete && members[3].has_next);
+    for (int i = 0; i < 4; i++) assert(members[i].signature == expected[i]);
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY && mix.num_frames == 4);
+    for (int i = 0; i < 4; i++) assert(mix.signatures[i] == expected[i]);
+    assert(mix.frames[3]->next && mix.frames[3]->next->user_data == &samples[2]);
+    pl_queue_plan_destroy(&plan);
+    pl_queue_destroy(&queue);
+}
+
 int main(void)
 {
+    caller_selection_intents();
     declared_cadence();
     declared_invalid_and_threshold();
     explicit_publication_demand();
