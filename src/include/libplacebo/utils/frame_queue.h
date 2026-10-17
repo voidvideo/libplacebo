@@ -216,6 +216,89 @@ struct pl_queue_params {
 PL_API enum pl_queue_status pl_queue_update(pl_queue queue, struct pl_frame_mix *out_mix,
                                             const struct pl_queue_params *params);
 
+// Frozen, side-effect-free selection policy. The queue must outlive its plans.
+// Plan calls on one handle must be serialized by the caller. Publication may
+// proceed concurrently; returned metadata contains no borrowed frame pointers.
+typedef struct pl_queue_plan_t *pl_queue_plan;
+
+enum pl_queue_plan_status {
+    PL_QUEUE_PLAN_READY,
+    PL_QUEUE_PLAN_PENDING,
+    PL_QUEUE_PLAN_EMPTY,     // no published samples; no plan created
+    PL_QUEUE_PLAN_BOOTSTRAP, // duration/normalization unavailable; no plan created
+    PL_QUEUE_PLAN_EOF,       // required support cannot arrive after source EOF
+    PL_QUEUE_PLAN_STALE,     // reset, competing selection, or incompatible push
+    PL_QUEUE_PLAN_ERROR = -1,
+};
+
+enum pl_queue_plan_mode {
+    PL_QUEUE_PLAN_NEAREST,
+    PL_QUEUE_PLAN_OVERSAMPLE,
+    PL_QUEUE_PLAN_TEMPORAL,
+};
+
+struct pl_queue_plan_info {
+    uint64_t epoch, policy_revision;
+    enum pl_queue_plan_mode mode;
+    double requested_pts;
+    // Existing drift compensation may adjust the requested target. Callers
+    // must explicitly accept this value before constructing their output plan,
+    // or disable drift_compensation. It does not change during check/consume.
+    double pts;
+    float frame_duration, vsync_duration;
+    // Temporal interval; nearest/oversample instead use the bracket about pts.
+    // Temporal selection includes the last sample <= min_pts for ZOH semantics.
+    double min_pts, max_pts;
+};
+
+struct pl_queue_plan_sample {
+    uint64_t signature;
+    double pts; // internal field PTS, not necessarily pl_source_frame.pts
+    enum pl_field field;
+    uint64_t primary_signature;
+    bool has_prev, has_next;
+    uint64_t prev_signature, next_signature;
+    bool complete; // source references available; not GPU completion
+};
+
+// Does not pull, map, cull, update estimates/hysteresis, or change queue target.
+// Params are copied; timeout/get_frame/priv are not used. On EMPTY/BOOTSTRAP/ERROR,
+// *out_plan is NULL. A pending plan freezes the support rule, not its current
+// available members. Re-inspection does not commit any selection transition.
+PL_API enum pl_queue_plan_status pl_queue_plan_inspect(pl_queue queue,
+    const struct pl_queue_params *params, pl_queue_plan *out_plan);
+PL_API const struct pl_queue_plan_info *pl_queue_plan_get_info(pl_queue_plan plan);
+
+// Re-observe publication without re-evaluating policy. Sample metadata remains
+// valid until the next check/consume/destroy on this plan. No frame is borrowed.
+// In-order pushes may fill support; changed estimates affect only later plans.
+// Nearest at exact sample PTS needs only that complete sample. Otherwise it
+// resolves the nearest bracket; at EOF it holds the terminal selected sample
+// for its ordinary ZOH lifetime (PTS 0 single-image content remains indefinite).
+// Oversample and temporal support are never reduced after source termination.
+PL_API enum pl_queue_plan_status pl_queue_plan_check(pl_queue_plan plan);
+// Explicitly admit one producer publication through existing push_block
+// backpressure, only while this plan is pending. Does not pull, map or commit
+// policy. Re-request after each publication if support is still incomplete.
+// Destroying/invalidating the plan cancels any unconsumed admission request.
+PL_API enum pl_queue_plan_status pl_queue_plan_request(pl_queue_plan plan);
+PL_API const struct pl_queue_plan_sample *pl_queue_plan_get_samples(
+    pl_queue_plan plan, int *count);
+
+// Rechecks the frozen rule under the queue locks, maps exactly its complete
+// selected members, then commits the planned policy transition once. No pulls
+// or partial mix are permitted. Pending/EOF do not commit. A mapping failure
+// is terminal and invalidates this plan and competing plans. On READY, mix
+// signatures equal the sample identities returned by get_samples().
+//
+// Mix storage/frames remain queue-owned. As with update/peek_mapped, the caller
+// must prevent update/advance/reset/destroy/consume and other mapping calls
+// until rendering is finished. Queue locks protect the call, not later use.
+PL_API enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan,
+    struct pl_frame_mix *out_mix);
+// Discarding an expired/unconsumed plan never advances selection policy.
+PL_API void pl_queue_plan_destroy(pl_queue_plan *plan);
+
 // Returns a pl_queue's internal estimates for FPS and VPS (vsyncs per second).
 // Returns 0.0 if no estimate is available.
 PL_API float pl_queue_estimate_fps(pl_queue queue);

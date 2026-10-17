@@ -89,8 +89,10 @@ struct pl_queue_t {
     // Frame queue and state
     PL_ARRAY(struct entry *) queue;
     uint64_t signature;
+    uint64_t plan_epoch, policy_revision;
     int threshold_frames;
     bool want_frame;
+    pl_queue_plan demand_plan;
     bool eof;
 
     // Average vsync/frame fps estimation state
@@ -108,6 +110,14 @@ struct pl_queue_t {
     // Queue of GPU objects to reuse
     PL_ARRAY(struct cache_entry) cache;
 };
+
+static void clear_plan_demand(pl_queue p)
+{
+    if (p->demand_plan) {
+        p->demand_plan = NULL;
+        p->want_frame = false;
+    }
+}
 
 pl_queue pl_queue_create(pl_gpu gpu)
 {
@@ -219,6 +229,9 @@ void pl_queue_reset(pl_queue p)
         .gpu = p->gpu,
         .log = p->log,
 
+        .plan_epoch = p->plan_epoch + 1,
+        .policy_revision = p->policy_revision + 1,
+
         // Reuse lock objects
         .lock_strong = p->lock_strong,
         .lock_weak = p->lock_weak,
@@ -291,6 +304,7 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
         PL_TRACE(p, "Received EOF, draining frame queue...");
         p->eof = true;
         p->want_frame = false;
+        p->demand_plan = NULL;
 
         const struct entry *last = p->queue.num ? p->queue.elem[p->queue.num - 1] : NULL;
         if (last && last->defer_second_field) {
@@ -299,6 +313,15 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
                     last->pts);
         }
         return;
+    }
+
+    // Waiting plans permit ordinary publication, but not a contradictory source
+    // order/layout. Native image formats are opaque here; owners reset on change.
+    if (p->queue.num) {
+        const struct entry *last = p->queue.elem[p->queue.num - 1];
+        const struct entry *primary = PL_DEF(last->primary, last);
+        if (src->first_field != primary->src.first_field)
+            p->plan_epoch++;
     }
 
     // Update FPS estimates if possible/reasonable
@@ -310,8 +333,10 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
         if (src->first_field != PL_FIELD_NONE && last->defer_second_field)
             delta /= 2;
         if (delta <= 0.0f) {
+            p->plan_epoch++;
             PL_DEBUG(p, "Non monotonically increasing PTS %f -> %f", last_pts, src->pts);
         } else if (p->fps.estimate && delta > 10.0 * p->fps.estimate) {
+            p->plan_epoch++;
             PL_DEBUG(p, "Discontinuous source PTS jump %f -> %f", last_pts, src->pts);
         } else {
             update_estimate(&p->fps, delta);
@@ -428,6 +453,7 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
     }
 
     p->want_frame = false;
+    p->demand_plan = NULL;
 }
 
 void pl_queue_push(pl_queue p, const struct pl_source_frame *frame)
@@ -799,42 +825,47 @@ static enum pl_queue_status oversample(pl_queue p, struct pl_frame_mix *mix,
     return ret;
 }
 
+// Shared effective-mode transition. Inspection runs this on copied state;
+// ordinary update and plan consumption commit exactly one transition.
+static enum pl_queue_plan_mode selection_mode(float fps, float vps, int threshold,
+    const struct pl_queue_params *params, int *next_threshold)
+{
+    *next_threshold = threshold;
+    if (!fps)
+        return PL_QUEUE_PLAN_NEAREST;
+    float ratio = fabs(fps / vps - 1.0);
+    if (ratio <= params->interpolation_threshold) {
+        *next_threshold = THRESHOLD_FRAMES + 1;
+        return PL_QUEUE_PLAN_NEAREST;
+    } else if (ratio < THRESHOLD_MAX_RATIO && threshold > 1) {
+        *next_threshold = threshold - 1;
+        return PL_QUEUE_PLAN_NEAREST;
+    }
+    *next_threshold = 0;
+    return params->radius ? PL_QUEUE_PLAN_TEMPORAL : PL_QUEUE_PLAN_OVERSAMPLE;
+}
+
 // Present a mixture of frames, relative to the vsync ratio
 static enum pl_queue_status interpolate(pl_queue p, struct pl_frame_mix *mix,
                                         const struct pl_queue_params *params)
 {
-    // No FPS estimate available, possibly source contains only a single frame,
-    // or this is the first frame to be rendered. Fall back to point sampling.
-    if (!p->fps.estimate)
-        return nearest(p, mix, params);
-
-    // Silently disable interpolation if the ratio dips lower than the
-    // configured threshold
-    float ratio = fabs(p->fps.estimate / p->vps.estimate - 1.0);
-    if (ratio <= params->interpolation_threshold) {
-        if (!p->threshold_frames) {
+    int next_threshold;
+    enum pl_queue_plan_mode mode = selection_mode(p->fps.estimate, p->vps.estimate,
+        p->threshold_frames, params, &next_threshold);
+    if (p->fps.estimate) {
+        float ratio = fabs(p->fps.estimate / p->vps.estimate - 1.0);
+        if (ratio <= params->interpolation_threshold && !p->threshold_frames) {
             PL_INFO(p, "Detected fps ratio %.4f below threshold %.4f, "
-                    "disabling interpolation",
-                    ratio, params->interpolation_threshold);
-        }
-
-        p->threshold_frames = THRESHOLD_FRAMES + 1;
-        return nearest(p, mix, params);
-    } else if (ratio < THRESHOLD_MAX_RATIO && p->threshold_frames > 1) {
-        p->threshold_frames--;
-        return nearest(p, mix, params);
-    } else {
-        if (p->threshold_frames) {
+                    "disabling interpolation", ratio, params->interpolation_threshold);
+        } else if (!next_threshold && p->threshold_frames) {
             PL_INFO(p, "Detected fps ratio %.4f exceeds threshold %.4f, "
-                    "re-enabling interpolation",
-                    ratio, params->interpolation_threshold);
+                    "re-enabling interpolation", ratio, params->interpolation_threshold);
         }
-        p->threshold_frames = 0;
     }
-
-    // No radius information, special case in which we only need the previous
-    // and next frames.
-    if (!params->radius)
+    p->threshold_frames = next_threshold;
+    if (mode == PL_QUEUE_PLAN_NEAREST)
+        return nearest(p, mix, params);
+    if (mode == PL_QUEUE_PLAN_OVERSAMPLE)
         return oversample(p, mix, params);
 
     pl_assert(p->fps.estimate && p->vps.estimate);
@@ -965,63 +996,68 @@ static bool prefill(pl_queue p, const struct pl_queue_params *params)
     return true;
 }
 
+struct selection_timing {
+    struct pool vps;
+    double pts, pts_offset;
+};
+
+// Compute the existing target/vsync transition without changing the queue.
+static bool selection_timing(pl_queue p, const struct pl_queue_params *params,
+                             struct selection_timing *out)
+{
+    *out = (struct selection_timing) {
+        .vps = p->vps, .pts = params->pts, .pts_offset = p->pts_offset,
+    };
+    default_estimate(&out->vps, params->vsync_duration);
+    float delta = params->pts - p->prev_pts;
+    if (delta < 0.0f) {
+        if (p->queue.num && p->queue.elem[0]->pts > params->pts)
+            return false;
+    } else if (delta > 1.0f) {
+        out->pts_offset = 0.0;
+    } else if (delta > 0) {
+        update_estimate(&out->vps, params->pts - p->prev_pts);
+    }
+    if (params->drift_compensation > 0.0f) {
+        out->pts += out->pts_offset;
+        for (int i = 0; i < p->queue.num; i++) {
+            if (fabs(p->queue.elem[i]->pts - out->pts) < params->drift_compensation) {
+                out->pts_offset = p->queue.elem[i]->pts - params->pts;
+                out->pts = p->queue.elem[i]->pts;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
 enum pl_queue_status pl_queue_update(pl_queue p, struct pl_frame_mix *out_mix,
                                      const struct pl_queue_params *params)
 {
     struct pl_queue_params fixed;
     pl_mutex_lock(&p->lock_strong);
     pl_mutex_lock(&p->lock_weak);
-    default_estimate(&p->vps, params->vsync_duration);
-
-    float delta = params->pts - p->prev_pts;
-    if (delta < 0.0f) {
-
-        // This is a backwards PTS jump. This is something we can handle
-        // semi-gracefully, but only if we haven't culled past the current
-        // frame yet.
-        if (p->queue.num && p->queue.elem[0]->pts > params->pts) {
-            PL_ERR(p, "Requested PTS %f is lower than the oldest frame "
-                   "PTS %f. This is not supported, PTS must be monotonically "
-                   "increasing! Please use `pl_queue_reset` to reset the frame "
-                   "queue on discontinuous PTS jumps.",
-                   params->pts, p->queue.elem[0]->pts);
-            pl_mutex_unlock(&p->lock_weak);
-            pl_mutex_unlock(&p->lock_strong);
-            return PL_QUEUE_ERR;
-        }
-
-    } else if (delta > 1.0f) {
-
-        // A jump of more than a second is probably the result of a
-        // discontinuous jump after a suspend. To prevent this from exploding
-        // the FPS estimate, treat this as a new frame.
+    p->policy_revision++;
+    clear_plan_demand(p);
+    struct selection_timing timing;
+    if (!selection_timing(p, params, &timing)) {
+        PL_ERR(p, "Requested PTS %f is lower than the oldest frame "
+               "PTS %f. This is not supported, PTS must be monotonically "
+               "increasing! Please use `pl_queue_reset` to reset the frame "
+               "queue on discontinuous PTS jumps.", params->pts, p->queue.elem[0]->pts);
+        pl_mutex_unlock(&p->lock_weak);
+        pl_mutex_unlock(&p->lock_strong);
+        return PL_QUEUE_ERR;
+    }
+    if (params->pts - p->prev_pts > 1.0)
         PL_TRACE(p, "Discontinuous target PTS jump %f -> %f, ignoring...",
                  p->prev_pts, params->pts);
-        p->pts_offset = 0.0;
-
-    } else if (delta > 0) {
-
-        update_estimate(&p->vps, params->pts - p->prev_pts);
-
-    }
-
+    p->vps = timing.vps;
     p->prev_pts = params->pts;
-
-    if (params->drift_compensation > 0.0f) {
-        // Adjust PTS offset if PTS is near-match for existing frame
-        double pts = params->pts + p->pts_offset;
-        for (int i = 0; i < p->queue.num; i++) {
-            if (fabs(p->queue.elem[i]->pts - pts) < params->drift_compensation) {
-                p->pts_offset = p->queue.elem[i]->pts - params->pts;
-                pts = p->queue.elem[i]->pts;
-                break;
-            }
-        }
-
-        fixed = *params;
-        fixed.pts = pts;
-        params = &fixed;
-    }
+    p->pts_offset = timing.pts_offset;
+    fixed = *params;
+    fixed.pts = timing.pts;
+    params = &fixed;
 
     // As a special case, prefill the queue if this is the first frame
     if (!params->pts && !p->queue.num) {
@@ -1101,6 +1137,8 @@ bool pl_queue_peek_mapped(pl_queue p, int idx, struct pl_frame *out)
 {
     pl_mutex_lock(&p->lock_strong);
     pl_mutex_lock(&p->lock_weak);
+    p->policy_revision++;
+    clear_plan_demand(p);
 
     bool ok = false;
     if (idx >= 0 && idx < p->queue.num) {
@@ -1120,6 +1158,8 @@ void pl_queue_advance(pl_queue p, double pts)
 {
     pl_mutex_lock(&p->lock_strong);
     pl_mutex_lock(&p->lock_weak);
+    p->policy_revision++;
+    clear_plan_demand(p);
 
     int culled = 0;
     for (int i = 1; i < p->queue.num; i++) {
@@ -1139,4 +1179,265 @@ void pl_queue_advance(pl_queue p, double pts)
 
     pl_mutex_unlock(&p->lock_weak);
     pl_mutex_unlock(&p->lock_strong);
+}
+
+struct pl_queue_plan_t {
+    pl_queue queue;
+    struct pl_queue_plan_info info;
+    struct selection_timing timing;
+    int next_threshold;
+    bool consumed;
+    int first_index, last_index;
+    PL_ARRAY(struct pl_queue_plan_sample) samples;
+};
+
+static enum pl_queue_plan_status plan_missing(pl_queue p)
+{
+    return p->eof ? PL_QUEUE_PLAN_EOF : PL_QUEUE_PLAN_PENDING;
+}
+
+// Both check and consume use this exact resolver while holding the queue locks.
+// It never evaluates timing/mode policy, changes a target, maps, or retires data.
+static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
+{
+    pl_queue p = plan->queue;
+    const struct pl_queue_plan_info *info = &plan->info;
+    plan->samples.num = 0;
+    if (plan->consumed || info->epoch != p->plan_epoch ||
+        info->policy_revision != p->policy_revision)
+        return PL_QUEUE_PLAN_STALE;
+    if (!p->queue.num)
+        return plan_missing(p);
+
+    double start = info->mode == PL_QUEUE_PLAN_TEMPORAL ? info->min_pts : info->pts;
+    int first = 0;
+    while (first + 1 < p->queue.num && p->queue.elem[first + 1]->pts <= start)
+        first++;
+    // Preserve initial visibility. A future first sample cannot be presented.
+    if (p->queue.elem[first]->pts > info->pts)
+        return plan_missing(p);
+
+    int last = first;
+    bool complete = true;
+    if (info->mode == PL_QUEUE_PLAN_TEMPORAL) {
+        while (last + 1 < p->queue.num && p->queue.elem[last + 1]->pts <= info->max_pts)
+            last++;
+        complete = p->queue.elem[p->queue.num - 1]->pts >= info->max_pts;
+    } else if (info->mode == PL_QUEUE_PLAN_OVERSAMPLE) {
+        if (last + 1 < p->queue.num)
+            last++;
+        else
+            complete = false;
+    } else {
+        if (first + 1 < p->queue.num) {
+            if (fabs(p->queue.elem[first + 1]->pts - info->pts) <
+                fabs(p->queue.elem[first]->pts - info->pts))
+                first++;
+            last = first;
+        } else {
+            // Nearest's terminal hold selects the actual last sample. It is
+            // valid only for the existing ZOH lifetime, not an added frame.
+            complete = p->queue.elem[first]->pts == info->pts ||
+                (p->eof && (p->queue.elem[first]->pts == 0.0 ||
+                 info->pts < p->queue.elem[first]->pts + info->frame_duration));
+        }
+    }
+
+    plan->first_index = first;
+    plan->last_index = last;
+    for (int i = first; i <= last; i++) {
+        const struct entry *entry = p->queue.elem[i];
+        struct pl_queue_plan_sample sample = {
+            .signature = entry->signature,
+            .pts = entry->pts,
+            .field = entry->field,
+            .primary_signature = PL_DEF(entry->primary, entry)->signature,
+            .has_prev = !!entry->prev,
+            .has_next = !!entry->next,
+            .prev_signature = entry->prev ? entry->prev->signature : 0,
+            .next_signature = entry->next ? entry->next->signature : 0,
+            .complete = entry_complete(p, p->queue.elem[i]),
+        };
+        complete &= sample.complete;
+        PL_ARRAY_APPEND(plan, plan->samples, sample);
+    }
+    return complete ? PL_QUEUE_PLAN_READY : plan_missing(p);
+}
+
+enum pl_queue_plan_status pl_queue_plan_inspect(pl_queue p,
+    const struct pl_queue_params *params, pl_queue_plan *out_plan)
+{
+    if (!out_plan)
+        return PL_QUEUE_PLAN_ERROR;
+    *out_plan = NULL;
+    if (!p || !params || !isfinite(params->pts) || !isfinite(params->radius) ||
+        params->radius < 0 || !isfinite(params->vsync_duration) || params->vsync_duration < 0 ||
+        !isfinite(params->drift_compensation) || params->drift_compensation < 0 ||
+        !isfinite(params->interpolation_threshold) || params->interpolation_threshold < 0)
+        return PL_QUEUE_PLAN_ERROR;
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+    enum pl_queue_plan_status status;
+    struct selection_timing timing;
+    if (!p->queue.num) {
+        status = p->eof ? PL_QUEUE_PLAN_EOF : PL_QUEUE_PLAN_EMPTY;
+        goto done;
+    }
+    if (!selection_timing(p, params, &timing)) {
+        status = PL_QUEUE_PLAN_ERROR;
+        goto done;
+    }
+    // Pushes provide FPS evidence; explicit vsync duration supplies initial VPS.
+    // No ordinary update or successful render is required for bootstrapping.
+    if (!isnormal(p->fps.estimate) || p->fps.estimate <= 0 ||
+        !isnormal(timing.vps.estimate) || timing.vps.estimate <= 0) {
+        status = p->eof ? PL_QUEUE_PLAN_EOF : PL_QUEUE_PLAN_BOOTSTRAP;
+        goto done;
+    }
+    pl_queue_plan plan = pl_zalloc_ptr(NULL, plan);
+    plan->queue = p;
+    plan->timing = timing;
+    plan->next_threshold = p->threshold_frames;
+    bool estimation_ok = timing.vps.estimate > 1.0f / MAX_FPS &&
+                         timing.vps.estimate < 1.0f / MIN_FPS;
+    enum pl_queue_plan_mode mode = PL_QUEUE_PLAN_NEAREST;
+    if (estimation_ok || params->vsync_duration > 0)
+        mode = selection_mode(p->fps.estimate, timing.vps.estimate,
+                              p->threshold_frames, params, &plan->next_threshold);
+    float radius = params->radius * fmaxf(1.0f, timing.vps.estimate / p->fps.estimate);
+    plan->info = (struct pl_queue_plan_info) {
+        .epoch = p->plan_epoch, .policy_revision = p->policy_revision,
+        .mode = mode, .requested_pts = params->pts, .pts = timing.pts,
+        .frame_duration = p->fps.estimate, .vsync_duration = timing.vps.estimate,
+        .min_pts = timing.pts - radius * p->fps.estimate,
+        .max_pts = timing.pts + radius * p->fps.estimate,
+    };
+    if (!isfinite(plan->info.min_pts) || !isfinite(plan->info.max_pts)) {
+        pl_free(plan);
+        status = PL_QUEUE_PLAN_ERROR;
+        goto done;
+    }
+    status = plan_check_locked(plan);
+    *out_plan = plan;
+done:
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return status;
+}
+
+const struct pl_queue_plan_info *pl_queue_plan_get_info(pl_queue_plan plan)
+{
+    return plan ? &plan->info : NULL;
+}
+
+enum pl_queue_plan_status pl_queue_plan_check(pl_queue_plan plan)
+{
+    if (!plan)
+        return PL_QUEUE_PLAN_ERROR;
+    pl_queue p = plan->queue;
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+    enum pl_queue_plan_status status = plan_check_locked(plan);
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return status;
+}
+
+enum pl_queue_plan_status pl_queue_plan_request(pl_queue_plan plan)
+{
+    if (!plan)
+        return PL_QUEUE_PLAN_ERROR;
+    pl_queue p = plan->queue;
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+    enum pl_queue_plan_status status = plan_check_locked(plan);
+    if (status == PL_QUEUE_PLAN_PENDING) {
+        p->demand_plan = plan;
+        p->want_frame = true;
+        pl_cond_signal(&p->wakeup);
+    } else if (p->demand_plan == plan) {
+        clear_plan_demand(p);
+    }
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return status;
+}
+
+const struct pl_queue_plan_sample *pl_queue_plan_get_samples(pl_queue_plan plan, int *count)
+{
+    *count = plan ? plan->samples.num : 0;
+    return plan ? plan->samples.elem : NULL;
+}
+
+enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_frame_mix *mix)
+{
+    if (!plan || !mix)
+        return PL_QUEUE_PLAN_ERROR;
+    *mix = (struct pl_frame_mix) {0};
+    pl_queue p = plan->queue;
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+    enum pl_queue_plan_status status = plan_check_locked(plan);
+    if (status != PL_QUEUE_PLAN_READY)
+        goto done;
+
+    // From here this is a single terminal selection attempt, including failure.
+    plan->consumed = true;
+    p->policy_revision++;
+    clear_plan_demand(p);
+    p->tmp_sig.num = p->tmp_ts.num = p->tmp_frame.num = 0;
+    for (int i = plan->first_index; i <= plan->last_index; i++) {
+        struct entry *entry = p->queue.elem[i];
+        if (!map_entry(p, entry)) {
+            status = PL_QUEUE_PLAN_ERROR;
+            goto done;
+        }
+        PL_ARRAY_APPEND(p, p->tmp_sig, entry->signature);
+        PL_ARRAY_APPEND(p, p->tmp_frame, &entry->frame);
+        float ts = plan->info.mode == PL_QUEUE_PLAN_NEAREST ? 0.0f :
+            (entry->pts - plan->info.pts) / plan->info.frame_duration;
+        PL_ARRAY_APPEND(p, p->tmp_ts, ts);
+    }
+    p->vps = plan->timing.vps;
+    p->prev_pts = plan->info.requested_pts;
+    p->pts_offset = plan->timing.pts_offset;
+    p->threshold_frames = plan->next_threshold;
+    // Nearest can select the future bracket: preserve the preceding entry as
+    // ordinary advance does, so the following target has identical ownership.
+    double start = plan->info.mode == PL_QUEUE_PLAN_TEMPORAL ? plan->info.min_pts : plan->info.pts;
+    int culled = 0;
+    while (culled + 1 < p->queue.num && p->queue.elem[culled + 1]->pts <= start) {
+        entry_cull(p, p->queue.elem[culled], true);
+        culled++;
+    }
+    PL_ARRAY_REMOVE_RANGE(p->queue, 0, culled);
+    *mix = (struct pl_frame_mix) {
+        .num_frames = p->tmp_frame.num,
+        .frames = p->tmp_frame.elem,
+        .signatures = p->tmp_sig.elem,
+        .timestamps = p->tmp_ts.elem,
+        .vsync_duration = plan->info.mode == PL_QUEUE_PLAN_NEAREST ? 1.0f :
+            plan->info.vsync_duration / plan->info.frame_duration,
+    };
+    report_estimates(p);
+done:
+    pl_cond_signal(&p->wakeup);
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return status;
+}
+
+void pl_queue_plan_destroy(pl_queue_plan *plan)
+{
+    if (plan && *plan) {
+        pl_queue p = (*plan)->queue;
+        pl_mutex_lock(&p->lock_strong);
+        pl_mutex_lock(&p->lock_weak);
+        if (p->demand_plan == *plan)
+            clear_plan_demand(p);
+        pl_mutex_unlock(&p->lock_weak);
+        pl_mutex_unlock(&p->lock_strong);
+        pl_free(*plan);
+        *plan = NULL;
+    }
 }
