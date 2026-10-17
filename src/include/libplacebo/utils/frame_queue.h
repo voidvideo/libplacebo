@@ -228,6 +228,7 @@ enum pl_queue_plan_status {
     PL_QUEUE_PLAN_BOOTSTRAP, // duration/normalization unavailable; no plan created
     PL_QUEUE_PLAN_EOF,       // required support cannot arrive after source EOF
     PL_QUEUE_PLAN_STALE,     // reset, competing selection, or incompatible push
+    PL_QUEUE_PLAN_PREPARED,  // declared policy frozen; target not bound yet
     PL_QUEUE_PLAN_ERROR = -1,
 };
 
@@ -249,6 +250,11 @@ struct pl_queue_plan_info {
     // Temporal interval; nearest/oversample instead use the bracket about pts.
     // Temporal selection includes the last sample <= min_pts for ZOH semantics.
     double min_pts, max_pts;
+    // Prepared plans expose policy/support before a target is bound once.
+    bool target_set;
+    // True when durations came from explicit caller facts, not queue estimates.
+    bool declared_cadence;
+    double support_radius; // temporal support on each side, in source seconds
 };
 
 struct pl_queue_plan_sample {
@@ -268,6 +274,33 @@ struct pl_queue_plan_sample {
 PL_API enum pl_queue_plan_status pl_queue_plan_inspect(pl_queue queue,
     const struct pl_queue_params *params, pl_queue_plan *out_plan);
 PL_API const struct pl_queue_plan_info *pl_queue_plan_get_info(pl_queue_plan plan);
+
+// Authoritative selection cadence, in source-timeline seconds. For interlaced
+// sources source_duration is the interval between internal fields, not physical
+// frames. The caller converts the intended host output interval using its
+// selected source-clock rate before providing output_duration.
+struct pl_queue_plan_cadence {
+    float source_duration;
+    float output_duration;
+};
+
+// Opt-in preparation for a caller which already owns cadence. Uses the existing
+// kernel/threshold transition with these durations, never estimates output rate
+// from latency-adjusted target deltas. Does not modify queue FPS/VPS estimators.
+//
+// Settings pts/vsync_duration/timeout/get_frame/priv are not used. The caller's
+// target is authoritative: drift_compensation must be zero. Missing cadence
+// (NULL or zero duration) returns BOOTSTRAP with no plan; invalid facts return
+// ERROR. On PREPARED, mode, normalization and support_radius are frozen even
+// with an empty queue. Publication readiness is assessed only after binding T.
+PL_API enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue queue,
+    const struct pl_queue_params *settings, const struct pl_queue_plan_cadence *cadence,
+    pl_queue_plan *out_plan);
+// Bind the target exactly once, after calculating it from the prepared policy.
+// No mode/cadence reevaluation occurs. Rebinding returns ERROR without changing
+// the bound plan. Source/selection invalidation returns STALE. Before binding,
+// check/request/consume return PREPARED and cannot map or request publication.
+PL_API enum pl_queue_plan_status pl_queue_plan_set_target(pl_queue_plan plan, double pts);
 
 // Re-observe publication without re-evaluating policy. Sample metadata remains
 // valid until the next check/consume/destroy on this plan. No frame is borrowed.

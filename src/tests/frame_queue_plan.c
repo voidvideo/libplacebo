@@ -332,8 +332,118 @@ static void interlaced_temporal_and_bootstrap(void)
     pl_queue_destroy(&queue);
 }
 
+static void declared_cadence(void)
+{
+    const struct pl_gpu_t gpu = {0};
+    pl_queue queue = pl_queue_create(&gpu);
+    struct sample samples[80] = {0};
+    struct pl_queue_params settings = {.radius = 1, .interpolation_threshold = .001};
+    struct pl_queue_plan_cadence cadence = {.source_duration = 1.0f / 24, .output_duration = 1.0f / 60};
+    pl_queue_plan plan;
+    // An empty queue does not erase known cadence or require an ordinary update.
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PREPARED);
+    struct pl_frame_mix mix;
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_PREPARED);
+    const struct pl_queue_plan_info *info = pl_queue_plan_get_info(plan);
+    assert(!info->target_set && info->declared_cadence);
+    assert(info->mode == PL_QUEUE_PLAN_TEMPORAL);
+    assert(fabs(info->support_radius - cadence.source_duration) < 1e-8);
+    assert(pl_queue_plan_set_target(plan, 2.2) == PL_QUEUE_PLAN_PENDING);
+    assert(pl_queue_plan_set_target(plan, 2.3) == PL_QUEUE_PLAN_ERROR);
+    assert(info->pts == 2.2);
+    for (int i = 0; i < 80; i++) push(queue, &samples[i], 2 + i / 24.0, 1.0f / 24, PL_FIELD_NONE);
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+    assert(fabs(mix.vsync_duration - .4) < 1e-7);
+    assert(pl_queue_estimate_vps(queue) == 0); // no target-delta cadence estimator
+    pl_queue_plan_destroy(&plan);
+    // Deliberately irregular latency-adjusted targets cannot change the supplied
+    // ratio/kernel support. These are not interpreted as display intervals.
+    const double targets[] = {2.21, 2.3, 2.301, 2.6};
+    for (int i = 0; i < PL_ARRAY_SIZE(targets); i++) {
+        assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+        info = pl_queue_plan_get_info(plan);
+        assert(info->mode == PL_QUEUE_PLAN_TEMPORAL);
+        assert(info->frame_duration == cadence.source_duration);
+        assert(info->vsync_duration == cadence.output_duration);
+        assert(pl_queue_plan_set_target(plan, targets[i]) == PL_QUEUE_PLAN_READY);
+        int count;
+        const struct pl_queue_plan_sample *members = pl_queue_plan_get_samples(plan, &count);
+        struct pl_queue_plan_sample expected[16];
+        assert(count <= PL_ARRAY_SIZE(expected));
+        memcpy(expected, members, count * sizeof(expected[0]));
+        assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+        assert(mix.num_frames == count);
+        for (int j = 0; j < count; j++) assert(mix.signatures[j] == expected[j].signature);
+        assert(pl_queue_estimate_vps(queue) == 0);
+        pl_queue_plan_destroy(&plan);
+    }
+    // 60 -> 24 and explicit source-rate conversion preserve dimensional meaning.
+    cadence.source_duration = 1.0f / 60;
+    for (int rate = 1; rate <= 2; rate++) {
+        cadence.output_duration = rate / 24.0f;
+        assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+        info = pl_queue_plan_get_info(plan);
+        assert(fabs(info->support_radius - cadence.output_duration) < 1e-8);
+        assert(info->mode == PL_QUEUE_PLAN_TEMPORAL);
+        pl_queue_plan_destroy(&plan);
+    }
+    pl_queue_destroy(&queue);
+}
+static void declared_invalid_and_threshold(void)
+{
+    const struct pl_gpu_t gpu = {0};
+    pl_queue queue = pl_queue_create(&gpu);
+    struct sample samples[30] = {0};
+    for (int i = 0; i < 30; i++) push(queue, &samples[i], 2 + i * .04, .04, PL_FIELD_NONE);
+    struct pl_queue_params settings = {.interpolation_threshold = .001};
+    struct pl_queue_plan_cadence cadence = {.source_duration = .04, .output_duration = .04};
+    pl_queue_plan plan;
+    assert(pl_queue_plan_prepare(queue, &settings, NULL, &plan) == PL_QUEUE_PLAN_BOOTSTRAP && !plan);
+    cadence.source_duration = 0;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_BOOTSTRAP && !plan);
+    cadence.source_duration = NAN;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_ERROR && !plan);
+    cadence.source_duration = .04;
+    cadence.output_duration = -1;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_ERROR && !plan);
+    cadence.output_duration = .04;
+    settings.drift_compensation = .001;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_ERROR && !plan);
+    settings.drift_compensation = 0;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_get_info(plan)->mode == PL_QUEUE_PLAN_NEAREST);
+    assert(pl_queue_plan_set_target(plan, 2) == PL_QUEUE_PLAN_READY);
+    struct pl_frame_mix mix;
+    assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+    pl_queue_plan_destroy(&plan);
+    cadence.output_duration = .044;
+    for (int i = 0; i < 6; i++) {
+        // Abandoned preparations and pending checks do not spend hysteresis.
+        for (int probe = 0; probe < 4; probe++) {
+            assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+            assert(pl_queue_plan_get_info(plan)->mode ==
+                (i < 5 ? PL_QUEUE_PLAN_NEAREST : PL_QUEUE_PLAN_OVERSAMPLE));
+            assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_PREPARED);
+            pl_queue_plan_destroy(&plan);
+        }
+        assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+        assert(pl_queue_plan_set_target(plan, 2.04 + i * .04) == PL_QUEUE_PLAN_READY);
+        assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+        pl_queue_plan_destroy(&plan);
+    }
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    pl_queue_reset(queue);
+    assert(pl_queue_plan_set_target(plan, 0) == PL_QUEUE_PLAN_STALE);
+    pl_queue_plan_destroy(&plan);
+    pl_queue_destroy(&queue);
+}
+
 int main(void)
 {
+    declared_cadence();
+    declared_invalid_and_threshold();
     explicit_publication_demand();
     bootstrap_and_adjusted_target();
     pending_publication();

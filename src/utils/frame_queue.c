@@ -1206,6 +1206,8 @@ static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
     if (plan->consumed || info->epoch != p->plan_epoch ||
         info->policy_revision != p->policy_revision)
         return PL_QUEUE_PLAN_STALE;
+    if (!info->target_set)
+        return PL_QUEUE_PLAN_PREPARED;
     if (!p->queue.num)
         return plan_missing(p);
 
@@ -1307,7 +1309,9 @@ enum pl_queue_plan_status pl_queue_plan_inspect(pl_queue p,
     float radius = params->radius * fmaxf(1.0f, timing.vps.estimate / p->fps.estimate);
     plan->info = (struct pl_queue_plan_info) {
         .epoch = p->plan_epoch, .policy_revision = p->policy_revision,
-        .mode = mode, .requested_pts = params->pts, .pts = timing.pts,
+        .mode = mode, .target_set = true,
+        .support_radius = mode == PL_QUEUE_PLAN_TEMPORAL ? radius * p->fps.estimate : 0,
+        .requested_pts = params->pts, .pts = timing.pts,
         .frame_duration = p->fps.estimate, .vsync_duration = timing.vps.estimate,
         .min_pts = timing.pts - radius * p->fps.estimate,
         .max_pts = timing.pts + radius * p->fps.estimate,
@@ -1320,6 +1324,80 @@ enum pl_queue_plan_status pl_queue_plan_inspect(pl_queue p,
     status = plan_check_locked(plan);
     *out_plan = plan;
 done:
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return status;
+}
+
+enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue p,
+    const struct pl_queue_params *settings, const struct pl_queue_plan_cadence *cadence,
+    pl_queue_plan *out_plan)
+{
+    if (!out_plan)
+        return PL_QUEUE_PLAN_ERROR;
+    *out_plan = NULL;
+    if (!p || !settings || !isfinite(settings->radius) || settings->radius < 0 ||
+        !isfinite(settings->interpolation_threshold) || settings->interpolation_threshold < 0 ||
+        settings->drift_compensation != 0)
+        return PL_QUEUE_PLAN_ERROR;
+    if (!cadence)
+        return PL_QUEUE_PLAN_BOOTSTRAP;
+    if (!isfinite(cadence->source_duration) || cadence->source_duration < 0 ||
+        !isfinite(cadence->output_duration) || cadence->output_duration < 0)
+        return PL_QUEUE_PLAN_ERROR;
+    if (!cadence->source_duration || !cadence->output_duration)
+        return PL_QUEUE_PLAN_BOOTSTRAP;
+
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+    pl_queue_plan plan = pl_zalloc_ptr(NULL, plan);
+    plan->queue = p;
+    enum pl_queue_plan_mode mode = selection_mode(cadence->source_duration,
+        cadence->output_duration, p->threshold_frames, settings, &plan->next_threshold);
+    float normalized_radius = settings->radius *
+        fmaxf(1.0f, cadence->output_duration / cadence->source_duration);
+    double radius = mode == PL_QUEUE_PLAN_TEMPORAL ?
+        normalized_radius * cadence->source_duration : 0;
+    plan->info = (struct pl_queue_plan_info) {
+        .epoch = p->plan_epoch, .policy_revision = p->policy_revision,
+        .mode = mode, .declared_cadence = true, .support_radius = radius,
+        .frame_duration = cadence->source_duration,
+        .vsync_duration = cadence->output_duration,
+    };
+    enum pl_queue_plan_status status = PL_QUEUE_PLAN_PREPARED;
+    if (!isfinite(radius)) {
+        status = PL_QUEUE_PLAN_ERROR;
+        pl_free(plan);
+    } else {
+        *out_plan = plan;
+    }
+    pl_mutex_unlock(&p->lock_weak);
+    pl_mutex_unlock(&p->lock_strong);
+    return status;
+}
+
+enum pl_queue_plan_status pl_queue_plan_set_target(pl_queue_plan plan, double pts)
+{
+    if (!plan || !isfinite(pts))
+        return PL_QUEUE_PLAN_ERROR;
+    pl_queue p = plan->queue;
+    pl_mutex_lock(&p->lock_strong);
+    pl_mutex_lock(&p->lock_weak);
+    enum pl_queue_plan_status status = PL_QUEUE_PLAN_ERROR;
+    if (plan->consumed || plan->info.epoch != p->plan_epoch ||
+        plan->info.policy_revision != p->policy_revision) {
+        status = PL_QUEUE_PLAN_STALE;
+    } else if (!plan->info.target_set) {
+        double min_pts = pts - plan->info.support_radius;
+        double max_pts = pts + plan->info.support_radius;
+        if (isfinite(min_pts) && isfinite(max_pts)) {
+            plan->info.target_set = true;
+            plan->info.requested_pts = plan->info.pts = pts;
+            plan->info.min_pts = min_pts;
+            plan->info.max_pts = max_pts;
+            status = plan_check_locked(plan);
+        }
+    }
     pl_mutex_unlock(&p->lock_weak);
     pl_mutex_unlock(&p->lock_strong);
     return status;
@@ -1398,9 +1476,11 @@ enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_fr
             (entry->pts - plan->info.pts) / plan->info.frame_duration;
         PL_ARRAY_APPEND(p, p->tmp_ts, ts);
     }
-    p->vps = plan->timing.vps;
+    if (!plan->info.declared_cadence) {
+        p->vps = plan->timing.vps;
+        p->pts_offset = plan->timing.pts_offset;
+    }
     p->prev_pts = plan->info.requested_pts;
-    p->pts_offset = plan->timing.pts_offset;
     p->threshold_frames = plan->next_threshold;
     // Nearest can select the future bracket: preserve the preceding entry as
     // ordinary advance does, so the following target has identical ownership.
