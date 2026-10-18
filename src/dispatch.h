@@ -29,3 +29,6 @@ pl_shader pl_dispatch_begin_ex(pl_dispatch dp, bool unique);
 //
 // This is a private API because it's sort of clunky/stateful.
 void pl_dispatch_mark_dynamic(pl_dispatch dp, bool dynamic);
+
+// Internal read-only description for renderer preflight diagnostics.
+const struct pl_pass_params *pl_dispatch_prepared_params(pl_dispatch_prepared prepared);

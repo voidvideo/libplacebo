@@ -101,6 +101,7 @@ struct prepared_render_pass {
     pl_dispatch_description description;
     pl_dispatch_preparation request;
     pl_dispatch_prepared ready;
+    struct pl_renderer_dispatch_inputs diagnostic_inputs;
 };
 
 struct prepared_frame_shape {
@@ -558,6 +559,24 @@ static pl_shader pass_shader(struct pass_state *pass, bool unique)
                              : pl_dispatch_begin_ex(pass->rr->dp, unique);
 }
 
+static struct pl_renderer_dispatch_inputs diagnostic_inputs(pl_renderer_preparation p)
+{
+    const struct pass_state *s = p->current;
+    if (!s)
+        return (struct pl_renderer_dispatch_inputs) {0};
+    struct pl_renderer_dispatch_inputs result = {
+        .source_color = s->image.color, .target_color = s->target.color,
+        .intermediate_color = s->img.color,
+        .source_repr = s->image.repr, .target_repr = s->target.repr,
+        .intermediate_repr = s->img.repr,
+        .source_crop = s->image.crop, .target_crop = s->target.crop,
+        .intermediate_width = s->img.w, .intermediate_height = s->img.h,
+        .shader_frame_index = p->shader_frame_index,
+    };
+    result.source_repr.dovi = result.target_repr.dovi = result.intermediate_repr.dovi = NULL;
+    return result;
+}
+
 static enum pl_dispatch_result prepared_dispatch(pl_renderer_preparation p,
     pl_dispatch dp, const struct pl_dispatch_params *finish,
     const struct pl_dispatch_compute_params *compute,
@@ -601,11 +620,23 @@ static enum pl_dispatch_result prepared_dispatch(pl_renderer_preparation p,
                 } else if (!pl_dispatch_prepared_matches(desc, p->passes.elem[index].ready)) {
                     failure = "dispatch description differs from compiled pass";
                     result = PL_DISPATCH_NOT_READY;
+                    if (p->snapshot.diagnostic) {
+                        const struct pl_renderer_prepare_diagnostic diagnostic = {
+                            .pass_index = index,
+                            .expected = pl_dispatch_prepared_params(p->passes.elem[index].ready),
+                            .actual = pl_dispatch_description_params(desc),
+                            .expected_inputs = p->passes.elem[index].diagnostic_inputs,
+                            .actual_inputs = diagnostic_inputs(p),
+                        };
+                        p->snapshot.diagnostic(p->snapshot.owner, &diagnostic);
+                    }
                 }
                 pl_dispatch_description_destroy(&desc);
             } else {
                 PL_ARRAY_APPEND(p, p->passes, (struct prepared_render_pass) {
                     .destination = dp, .description = desc,
+                    .diagnostic_inputs = p->snapshot.diagnostic ? diagnostic_inputs(p)
+                        : (struct pl_renderer_dispatch_inputs) {0},
                 });
             }
         }

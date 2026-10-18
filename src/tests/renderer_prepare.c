@@ -90,7 +90,18 @@ struct snapshot_owner {
     int sampler_mode, chroma_samples, image_samples;
     int metadata_samples, bound_samples;
     int sampler_passes;
+    int diagnostic_calls;
 };
+
+static void diagnostic(void *priv, const struct pl_renderer_prepare_diagnostic *d)
+{
+    struct snapshot_owner *owner = priv;
+    REQUIRE(d && d->expected && d->actual);
+    REQUIRE(d->expected->glsl_shader && d->actual->glsl_shader);
+    REQUIRE(!d->expected_inputs.source_repr.dovi && !d->actual_inputs.source_repr.dovi);
+    REQUIRE(d->pass_index >= 0);
+    owner->diagnostic_calls++;
+}
 
 static void retain(void *priv)
 {
@@ -396,6 +407,7 @@ static void test_renderer_sampler_capture(pl_gpu gpu, struct pl_frame image, int
     }
     struct pl_renderer_snapshot snapshot = {
         .params = &owner->params, .owner = owner, .retain = retain, .release = release,
+        .diagnostic = diagnostic,
     };
     pl_renderer_preparation preparation = NULL;
     // Both renderers must generate the same blue-noise LUT for exact pixels.
@@ -554,6 +566,7 @@ static void test_renderer_sampler_capture(pl_gpu gpu, struct pl_frame image, int
         changed_repr.repr.levels = PL_COLOR_LEVELS_LIMITED;
         const int runs = gpu_runs, buffer_writes = writes;
         const int descriptions = owner->descriptions, executions = owner->executions;
+        const int diagnostics = owner->diagnostic_calls;
         forbid_compile = true;
         enum pl_renderer_prepare_result changed_result =
             pl_render_image_prepared(preparation, &image, &changed_repr);
@@ -563,6 +576,7 @@ static void test_renderer_sampler_capture(pl_gpu gpu, struct pl_frame image, int
         REQUIRE(changed_result == PL_RENDERER_PREPARE_NOT_READY);
         forbid_compile = false;
         REQUIRE(owner->descriptions > descriptions);
+        REQUIRE(owner->diagnostic_calls > diagnostics);
         REQUIRE(owner->executions == executions);
         REQUIRE(gpu_runs == runs && writes == buffer_writes);
         REQUIRE(pl_renderer_prepare_poll(preparation) == PL_PASS_PREPARE_READY);

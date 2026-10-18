@@ -2248,6 +2248,11 @@ enum pl_pass_prepare_state pl_dispatch_prepare_take(
     return state;
 }
 
+const struct pl_pass_params *pl_dispatch_prepared_params(pl_dispatch_prepared prepared)
+{
+    return prepared ? &prepared->entry->params : NULL;
+}
+
 bool pl_dispatch_prepared_matches(pl_dispatch_description description,
                                   pl_dispatch_prepared prepared)
 {

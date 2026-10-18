@@ -945,12 +945,35 @@ enum pl_renderer_prepare_mode {
 // them. snapshot owns immutable parameters, pointed-to options, hook contexts
 // and resource-layout inputs; retain/release are required, and stack snapshots
 // without retained backing storage are invalid.
+// Scalar input state at an individual prepared dispatch. No GPU resources are
+// retained or made accessible by this diagnostic.
+struct pl_renderer_dispatch_inputs {
+    struct pl_color_space source_color, target_color, intermediate_color;
+    struct pl_color_repr source_repr, target_repr, intermediate_repr;
+    pl_rect2df source_crop, target_crop;
+    int intermediate_width, intermediate_height;
+    unsigned shader_frame_index;
+};
+
+// Borrowed only during the callback. The descriptions include complete shader
+// text, descriptors and specialization constants. They do not retain runtime
+// uniform values or plugin-owned mutable state. Inspection must not mutate them.
+struct pl_renderer_prepare_diagnostic {
+    int pass_index;
+    const struct pl_pass_params *expected, *actual;
+    struct pl_renderer_dispatch_inputs expected_inputs, actual_inputs;
+};
+
 struct pl_renderer_snapshot {
     const struct pl_render_params *params;
     void *owner;
     void (*retain)(void *owner);
     void (*release)(void *owner);
     enum pl_renderer_prepare_mode mode;
+    // Optional developer diagnostic; NULL incurs no input snapshot collection.
+    // Called on a preflight description mismatch before the description is freed.
+    // May run on whichever thread owns preflight. Must not re-enter the renderer.
+    void (*diagnostic)(void *owner, const struct pl_renderer_prepare_diagnostic *);
 };
 
 typedef struct pl_renderer_preparation_t *pl_renderer_preparation;
