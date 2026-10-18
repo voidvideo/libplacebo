@@ -1246,21 +1246,18 @@ static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
     } else if (info->mode == PL_QUEUE_PLAN_OVERSAMPLE) {
         if (last + 1 < p->queue.num)
             last++;
-        else
-            complete = false;
+        // Match ordinary oversample(): a visible single frame is usable
+        // through point sampling while the following frame is unavailable.
     } else {
         if (first + 1 < p->queue.num) {
             if (fabs(p->queue.elem[first + 1]->pts - info->pts) <
                 fabs(p->queue.elem[first]->pts - info->pts))
                 first++;
             last = first;
-        } else {
-            // Nearest's terminal hold selects the actual last sample. It is
-            // valid only for the existing ZOH lifetime, not an added frame.
-            complete = p->queue.elem[first]->pts == info->pts ||
-                (p->eof && (p->queue.elem[first]->pts == 0.0 ||
-                 info->pts < p->queue.elem[first]->pts + info->frame_duration));
         }
+        // Ordinary nearest() returns the closest visible frame even when
+        // advance() reports that more input is needed. Do not require a
+        // future bracket merely to make this single-frame selection usable.
     }
 
     plan->first_index = first;
@@ -1497,6 +1494,9 @@ enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_fr
     p->policy_revision++;
     clear_plan_demand(p);
     p->tmp_sig.num = p->tmp_ts.num = p->tmp_frame.num = 0;
+    const bool point_sample = plan->info.mode == PL_QUEUE_PLAN_NEAREST ||
+        plan->info.mode == PL_QUEUE_PLAN_LAST_DUE ||
+        (plan->info.mode == PL_QUEUE_PLAN_OVERSAMPLE && plan->first_index == plan->last_index);
     for (int i = plan->first_index; i <= plan->last_index; i++) {
         struct entry *entry = p->queue.elem[i];
         if (!map_entry(p, entry)) {
@@ -1505,8 +1505,7 @@ enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_fr
         }
         PL_ARRAY_APPEND(p, p->tmp_sig, entry->signature);
         PL_ARRAY_APPEND(p, p->tmp_frame, &entry->frame);
-        float ts = (plan->info.mode == PL_QUEUE_PLAN_NEAREST ||
-                    plan->info.mode == PL_QUEUE_PLAN_LAST_DUE) ? 0.0f :
+        float ts = point_sample ? 0.0f :
             (entry->pts - plan->info.pts) / plan->info.frame_duration;
         PL_ARRAY_APPEND(p, p->tmp_ts, ts);
     }
@@ -1531,7 +1530,8 @@ enum pl_queue_plan_status pl_queue_plan_consume(pl_queue_plan plan, struct pl_fr
         .frames = p->tmp_frame.elem,
         .signatures = p->tmp_sig.elem,
         .timestamps = p->tmp_ts.elem,
-        .vsync_duration = plan->info.mode == PL_QUEUE_PLAN_NEAREST ? 1.0f :
+        .vsync_duration = (plan->info.mode == PL_QUEUE_PLAN_NEAREST ||
+            (plan->info.mode == PL_QUEUE_PLAN_OVERSAMPLE && point_sample)) ? 1.0f :
             plan->info.vsync_duration / plan->info.frame_duration,
     };
     report_estimates(p);
