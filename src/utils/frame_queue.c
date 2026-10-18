@@ -1242,7 +1242,9 @@ static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
     } else if (info->mode == PL_QUEUE_PLAN_TEMPORAL) {
         while (last + 1 < p->queue.num && p->queue.elem[last + 1]->pts <= info->max_pts)
             last++;
-        complete = p->queue.elem[p->queue.num - 1]->pts >= info->max_pts;
+        // Match interpolate(): return the visible mix already available
+        // inside the support interval while further input is pending.
+        // Each selected entry must still satisfy entry_complete() below.
     } else if (info->mode == PL_QUEUE_PLAN_OVERSAMPLE) {
         if (last + 1 < p->queue.num)
             last++;
