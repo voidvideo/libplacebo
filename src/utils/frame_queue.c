@@ -1214,6 +1214,15 @@ static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
     if (!p->queue.num)
         return plan_missing(p);
 
+    // Ordinary nearest/oversample/interpolate expire the terminal hold at EOF.
+    // Missing future input alone does not expire a usable partial mix. Preserve
+    // the ordinary PTS-zero still-image exception and custom selection intents.
+    if (p->eof && info->mode <= PL_QUEUE_PLAN_TEMPORAL) {
+        double last_pts = p->queue.elem[p->queue.num - 1]->pts;
+        if (last_pts && info->pts >= last_pts + info->frame_duration)
+            return PL_QUEUE_PLAN_EOF;
+    }
+
     double start = info->mode == PL_QUEUE_PLAN_TEMPORAL ? info->min_pts : info->pts;
     int first = 0;
     while (first + 1 < p->queue.num && p->queue.elem[first + 1]->pts <= start)

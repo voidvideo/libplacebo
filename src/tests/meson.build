@@ -2,7 +2,7 @@ gpu_tests = [
   'vulkan.c', 'opengl_surfaceless.c', 'd3d11.c', 'dummy.c'
 ]
 
-tests += ['pass_prepare.c', 'frame_queue_plan.c']
+tests += ['pass_prepare.c', 'frame_queue_plan.c', 'frame_queue_eof.c']
 if components.get('vulkan') and components.get('vk-proc-addr')
   tests += ['pass_prepare_vulkan.c', 'dispatch_prepare.c', 'sampling_prepare.c', 'lut_prepare.c', 'renderer_prepare.c', 'color_reference.c']
 endif
