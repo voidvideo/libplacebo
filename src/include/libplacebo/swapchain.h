@@ -115,9 +115,37 @@ struct pl_swapchain_frame {
 // API)
 PL_API bool pl_swapchain_start_frame(pl_swapchain sw, struct pl_swapchain_frame *out_frame);
 
+// Whether this backend can end an acquired frame without presenting it.
+// Query before acquisition if the caller requires cancellation. Support is
+// fixed for the lifetime of the swapchain; this query does not wait for a frame.
+// Vulkan requires enabled KHR/EXT swapchainMaintenance1 support. Backends
+// without a cancellation implementation return false.
+PL_API bool pl_swapchain_can_cancel_frame(pl_swapchain sw);
+
+enum pl_swapchain_cancel_result {
+    // The acquisition ended. No image was presented. Another frame may start.
+    PL_SWAPCHAIN_CANCELLED = 0,
+    // This backend cannot cancel. No state changed, including any acquisition.
+    PL_SWAPCHAIN_CANCEL_UNSUPPORTED,
+    // No acquired frame exists. No state changed.
+    PL_SWAPCHAIN_CANCEL_NO_FRAME,
+    // Cancellation failed. The frame transaction ended and its lock was
+    // released, but native release is not guaranteed. Destroy the swapchain;
+    // do not start, submit, resize or otherwise reuse it.
+    PL_SWAPCHAIN_CANCEL_FAILED,
+};
+
+// End the current acquisition without presenting its contents. Call on the
+// acquiring thread, after all application access to the frame has ended, and
+// serialize with start/submit/cancel. May wait for GPU work to finish. Success
+// invalidates the borrowed frame and generates no presentation feedback.
+// A terminal failure also invalidates the frame. UNSUPPORTED leaves it intact.
+// Unlike submission, this operation never substitutes or displays any pixels.
+PL_API enum pl_swapchain_cancel_result pl_swapchain_cancel_frame(pl_swapchain sw);
+
 // Submits the previously started frame. Non-blocking. This must be issued in
-// lockstep with pl_swapchain_start_frame - there is no way to start multiple
-// frames and submit them out-of-order. The frames submitted this way will
+// lockstep with pl_swapchain_start_frame unless the acquisition was cancelled.
+// There is no way to start multiple frames and submit them out-of-order. The frames submitted this way will
 // generally be made visible in a first-in first-out fashion, although
 // specifics depend on the mechanism used to create the pl_swapchain. (See the
 // platform-specific APIs for more info).
@@ -128,7 +156,7 @@ PL_API bool pl_swapchain_start_frame(pl_swapchain sw, struct pl_swapchain_frame 
 //
 // Note that `start_frame` and `submit_frame` form a lock pair, i.e. trying to
 // call e.g. `pl_swapchain_resize` from another thread will block until
-// `pl_swapchain_submit_frame` is finished.
+// `pl_swapchain_submit_frame` or a supported cancellation is finished.
 PL_API bool pl_swapchain_submit_frame(pl_swapchain sw);
 
 // Presentation stages which a swapchain may be able to report after a frame

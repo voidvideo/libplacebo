@@ -230,6 +230,8 @@ struct vk_ctx {
     PL_VK_FUN(InvalidateMappedMemoryRanges);
     PL_VK_FUN(MapMemory);
     PL_VK_FUN(QueuePresentKHR);
+    PL_VK_FUN(ReleaseSwapchainImagesKHR);
+    PL_VK_FUN(ReleaseSwapchainImagesEXT);
     PL_VK_FUN(QueueSubmit);
     PL_VK_FUN(QueueSubmit2KHR);
     PL_VK_FUN(QueueWaitIdle);

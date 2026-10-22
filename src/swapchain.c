@@ -81,6 +81,20 @@ bool pl_swapchain_start_frame(pl_swapchain sw,
     return impl->start_frame(sw, out_frame);
 }
 
+bool pl_swapchain_can_cancel_frame(pl_swapchain sw)
+{
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    return impl->cancel_frame && impl->can_cancel_frame && impl->can_cancel_frame(sw);
+}
+
+enum pl_swapchain_cancel_result pl_swapchain_cancel_frame(pl_swapchain sw)
+{
+    const struct pl_sw_fns *impl = PL_PRIV(sw);
+    if (!pl_swapchain_can_cancel_frame(sw))
+        return PL_SWAPCHAIN_CANCEL_UNSUPPORTED;
+    return impl->cancel_frame(sw);
+}
+
 bool pl_swapchain_submit_frame(pl_swapchain sw)
 {
     const struct pl_sw_fns *impl = PL_PRIV(sw);

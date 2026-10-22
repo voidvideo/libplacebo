@@ -207,8 +207,16 @@ static const struct vk_ext vk_device_extensions[] = {
         },
     }, {
         .name = VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(ReleaseSwapchainImagesKHR),
+            {0}
+        },
     }, {
         .name = VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(ReleaseSwapchainImagesEXT),
+            {0}
+        },
 #ifdef VK_KHR_internally_synchronized_queues
     }, {
         .name = VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,

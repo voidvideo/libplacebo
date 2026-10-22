@@ -34,6 +34,8 @@ struct pl_sw_fns {
     SW_PFN(colorspace_hint); // optional
     SW_PFN(start_frame);
     SW_PFN(submit_frame);
+    SW_PFN(can_cancel_frame); // optional
+    SW_PFN(cancel_frame); // optional
     SW_PFN(get_present_feedback_capabilities); // optional
     SW_PFN(submit_frame_ex); // optional
     SW_PFN(poll_present_feedback); // optional

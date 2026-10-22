@@ -36,6 +36,8 @@ struct vk_swapchain {
     int last_imgidx;                // the image index last acquired (for submit)
 };
 
+enum frame_state { FRAME_IDLE, FRAME_ACQUIRED, FRAME_CANCEL_FAILED };
+
 struct priv {
     struct pl_sw_fns impl;
 
@@ -66,6 +68,8 @@ struct priv {
     bool suboptimal;                // true once VK_SUBOPTIMAL_KHR is returned
     bool needs_recreate;            // swapchain needs to be recreated
     bool has_swapchain_maintenance1;
+    // Snapshot only; start/submit/cancel remain serialized by the caller.
+    atomic_int frame_state;
     bool feedback_device_supported;
     bool feedback_surface_supported;
     bool feedback_host_clock_supported;
@@ -490,6 +494,7 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
 
     struct priv *p = PL_PRIV(sw);
     pl_mutex_init(&p->lock);
+    atomic_init(&p->frame_state, FRAME_IDLE);
     p->impl = vulkan_swapchain;
     p->params = *params;
     p->vk = vk;
@@ -1212,6 +1217,11 @@ static bool vk_sw_start_frame(pl_swapchain sw,
     struct vk_ctx *vk = p->vk;
     pl_mutex_lock(&p->lock);
 
+    if (atomic_load(&p->frame_state) == FRAME_CANCEL_FAILED) {
+        pl_mutex_unlock(&p->lock);
+        return false;
+    }
+
     bool recreate = !p->current || p->needs_recreate;
     if (p->suboptimal && !p->params.allow_suboptimal)
         recreate = true;
@@ -1248,7 +1258,9 @@ static bool vk_sw_start_frame(pl_swapchain sw,
             if (p->current->fences_out.num > 0) {
                 VkFence *pfence = &p->current->fences_out.elem[imgidx];
                 vk->WaitForFences(vk->dev, 1, pfence, VK_TRUE, UINT64_MAX);
-                vk->ResetFences(vk->dev, 1, pfence);
+                // Keep the fence signalled until a presentation is actually
+                // submitted. Cancellation must not leave an unsignalled fence
+                // that no presentation operation will ever signal.
             }
             if (!vk_sw_image_init(sw, imgidx))
                 goto error;
@@ -1264,6 +1276,7 @@ static bool vk_sw_start_frame(pl_swapchain sw,
                 .color_repr = p->color_repr,
                 .color_space = p->color_space,
             };
+            atomic_store(&p->frame_state, FRAME_ACQUIRED);
             // keep lock held
             return true;
 
@@ -1303,6 +1316,66 @@ static void present_cb(struct priv *p, void *arg)
 
 VK_CB_FUNC_DEF(present_cb);
 
+static bool vk_sw_can_cancel_frame(pl_swapchain sw)
+{
+    const struct priv *p = PL_PRIV(sw);
+    return p->has_swapchain_maintenance1 &&
+        (p->vk->ReleaseSwapchainImagesKHR || p->vk->ReleaseSwapchainImagesEXT);
+}
+
+static enum pl_swapchain_cancel_result vk_sw_cancel_frame(pl_swapchain sw)
+{
+    struct priv *p = PL_PRIV(sw);
+    struct vk_ctx *vk = p->vk;
+    const enum frame_state state = atomic_load(&p->frame_state);
+    switch (state) {
+    case FRAME_IDLE: return PL_SWAPCHAIN_CANCEL_NO_FRAME;
+    case FRAME_CANCEL_FAILED: return PL_SWAPCHAIN_CANCEL_FAILED;
+    case FRAME_ACQUIRED: break;
+    }
+
+    // The acquiring thread still owns p->lock. A dedicated semaphore avoids
+    // signalling a presentation semaphore that no QueuePresent will consume.
+    const uint32_t idx = p->current->last_imgidx;
+    VkSemaphore done = VK_NULL_HANDLE;
+    const VkSemaphoreCreateInfo seminfo = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    };
+    bool ok = vk->CreateSemaphore(vk->dev, &seminfo, PL_VK_ALLOC, &done) == VK_SUCCESS;
+    if (ok) {
+        ok = pl_vulkan_hold_ex(sw->gpu, pl_vulkan_hold_params(
+            .tex = p->current->images.elem[idx],
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+            .qf = VK_QUEUE_FAMILY_IGNORED,
+            .semaphore = {done},
+        ));
+        // The hold consumes the acquisition semaphore even if the application
+        // did not render. Native release requires all image use to have ended.
+        pl_gpu_finish(sw->gpu);
+        ok = ok && !vk->failed;
+        vk->DestroySemaphore(vk->dev, done, PL_VK_ALLOC);
+    }
+    if (ok) {
+        const VkReleaseSwapchainImagesInfoKHR release = {
+            .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
+            .swapchain = p->current->swapchain,
+            .imageIndexCount = 1,
+            .pImageIndices = &idx,
+        };
+        const VkResult result = vk->ReleaseSwapchainImagesKHR
+            ? vk->ReleaseSwapchainImagesKHR(vk->dev, &release)
+            : vk->ReleaseSwapchainImagesEXT(vk->dev, &release);
+        ok = result == VK_SUCCESS;
+    }
+    if (ok)
+        p->current->last_imgidx = -1;
+    else
+        PL_ERR(sw, "Acquired frame cancellation failed; swapchain must be destroyed");
+    atomic_store(&p->frame_state, ok ? FRAME_IDLE : FRAME_CANCEL_FAILED);
+    pl_mutex_unlock(&p->lock);
+    return ok ? PL_SWAPCHAIN_CANCELLED : PL_SWAPCHAIN_CANCEL_FAILED;
+}
+
 static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     pl_swapchain sw, const struct pl_swapchain_submit_params *params)
 {
@@ -1315,6 +1388,7 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
     uint32_t idx = current->last_imgidx;
     VkSemaphore sem_out = current->sems_out.elem[idx];
     current->last_imgidx = -1;
+    atomic_store(&p->frame_state, FRAME_IDLE);
 
     p->trace_token = params ? params->token : 0;
     p->trace_present_id = 0;
@@ -1379,6 +1453,7 @@ static enum pl_swapchain_submit_result vk_sw_submit_frame_ex(
 
     if (current->fences_out.num > 0) {
         VkFence *pfence = &current->fences_out.elem[idx];
+        vk->ResetFences(vk->dev, 1, pfence);
         fenceInfo.pFences = pfence;
         vk_link_struct(&pinfo, &fenceInfo);
     }
@@ -1747,6 +1822,8 @@ static const struct pl_sw_fns vulkan_swapchain = {
     .colorspace_hint    = vk_sw_colorspace_hint,
     .start_frame        = vk_sw_start_frame,
     .submit_frame       = vk_sw_submit_frame,
+    .can_cancel_frame   = vk_sw_can_cancel_frame,
+    .cancel_frame       = vk_sw_cancel_frame,
     .get_present_feedback_capabilities = vk_sw_get_present_feedback_capabilities,
     .submit_frame_ex    = vk_sw_submit_frame_ex,
     .poll_present_feedback = vk_sw_poll_present_feedback,

@@ -4,7 +4,7 @@ gpu_tests = [
 
 tests += ['pass_prepare.c', 'frame_queue_plan.c', 'frame_queue_eof.c']
 if components.get('vulkan') and components.get('vk-proc-addr')
-  tests += ['pass_prepare_vulkan.c', 'dispatch_prepare.c', 'sampling_prepare.c', 'lut_prepare.c', 'renderer_prepare.c', 'color_reference.c']
+  tests += ['swapchain_cancel.c', 'pass_prepare_vulkan.c', 'dispatch_prepare.c', 'sampling_prepare.c', 'lut_prepare.c', 'renderer_prepare.c', 'color_reference.c']
 endif
 
 ts = []
@@ -14,7 +14,7 @@ foreach t : tests
   if t == 'opengl_surfaceless.c'
     deps += glad_dep
   endif
-  if t == 'vulkan.c' or t == 'present_feedback.c' or t == 'pass_prepare_vulkan.c' or t == 'dispatch_prepare.c' or t == 'sampling_prepare.c' or t == 'lut_prepare.c' or t == 'renderer_prepare.c' or t == 'color_reference.c'
+  if t == 'swapchain_cancel.c' or t == 'vulkan.c' or t == 'present_feedback.c' or t == 'pass_prepare_vulkan.c' or t == 'dispatch_prepare.c' or t == 'sampling_prepare.c' or t == 'lut_prepare.c' or t == 'renderer_prepare.c' or t == 'color_reference.c'
     deps += vulkan_headers
   endif
   sources = []
@@ -25,6 +25,14 @@ foreach t : tests
           'sources': sources,
           'deps': deps }
 endforeach
+
+if components.get('vulkan') and components.get('vk-proc-addr')
+  x11_cancel_dep = dependency('x11', required: false)
+  if x11_cancel_dep.found()
+    ts += { 'test': 'swapchain_cancel_native.c',
+            'deps': [tdep_static, vulkan_headers, x11_cancel_dep] }
+  endif
+endif
 
 dav1d = dependency('dav1d', required: false)
 if dav1d.found()

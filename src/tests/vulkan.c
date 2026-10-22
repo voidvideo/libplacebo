@@ -263,6 +263,19 @@ static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
     int w = 640, h = 480;
     REQUIRE(pl_swapchain_resize(sw, &w, &h));
 
+    if (pl_swapchain_can_cancel_frame(sw)) {
+        REQUIRE(pl_swapchain_cancel_frame(sw) == PL_SWAPCHAIN_CANCEL_NO_FRAME);
+        for (int i = 0; i < 12; i++) {
+            struct pl_swapchain_frame frame;
+            REQUIRE(pl_swapchain_start_frame(sw, &frame));
+            if (i % 2 && frame.fbo->params.blit_dst)
+                pl_tex_clear(gpu, frame.fbo, (float[4]){0});
+            REQUIRE(pl_swapchain_cancel_frame(sw) == PL_SWAPCHAIN_CANCELLED);
+            REQUIRE(pl_swapchain_cancel_frame(sw) == PL_SWAPCHAIN_CANCEL_NO_FRAME);
+        }
+        REQUIRE(pl_swapchain_resize(sw, &w, &h));
+    }
+
     uint32_t feedback_caps = pl_swapchain_get_present_feedback_capabilities(sw);
     REQUIRE(!(feedback_caps & ~PL_SWAPCHAIN_PRESENT_STAGE_FIRST_PIXEL_OUT));
 
