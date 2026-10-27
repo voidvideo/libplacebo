@@ -171,8 +171,8 @@ textures, not a 4K throughput or fullscreen playback benchmark.
 
 The prepared-render numerical regression also passed with the installed Vulkan
 validation layer disabled. That is not validation-layer coverage. The queue-plan
-regression still fails at the same assertion in an earlier build; this change does
-not modify that queue implementation.
+regression now tests the agreed available-frame policy; publication
+demand tests use the explicit bracket intent. The queue implementation is unchanged.
 
 CUDA resource sharing has not been executed on hardware by these tests. Void's
 application-side admission, worker handoff, and configuration retirement still

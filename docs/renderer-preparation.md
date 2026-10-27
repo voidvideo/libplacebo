@@ -30,6 +30,31 @@ For SYNC, preflight checks readiness and basic arguments only. Execution calls t
 
 Destroy releases worker requests, prepared passes, textures, renderer state, and retained snapshot references. A candidate can be destroyed before preparation completes.
 
+## Queue readiness uses available frames
+
+The ordinary prepared queue modes follow mpv's available-frame strategy. Nearest,
+oversample, and temporal selection can be ready before the full temporal kernel
+window arrives. Temporal selection keeps the requested mode and exposes the
+available visible frames. A full window is not a prerequisite for starting output.
+The host owns presentation cadence; queue readiness does not schedule v-sync.
+
+This matches [mpv's gpu-next render path](https://github.com/mpv-player/mpv/blob/master/video/out/vo_gpu_next.c):
+when `pl_queue_update` reports `PL_QUEUE_MORE`, mpv continues to
+`pl_render_image_mix` with the available mix. The legacy queue status reports
+missing input; prepared `READY` reports that the selected available frames can
+be consumed. These statuses describe different conditions.
+
+[The plplay example](https://github.com/haasn/libplacebo/blob/master/demos/plplay.c)
+has a different underrun policy. It retries in blocking mode and records a stall
+before rendering. It is not the reference for this fork's available-frame policy.
+
+Readiness still requires a visible source and all required references of selected
+interlaced entries. The explicit `BRACKET` intent requires an exact sample or a
+surrounding pair. Its publication request remains pending while that input is
+missing. Every selected member must map successfully; a mapping error does not
+produce an incomplete result. External mixer input requirements remain explicit
+and separate from the ordinary temporal filter window.
+
 ## Temporal mixing preserves native state
 
 Enabled mixing prepares a source cache for each supplied frame and an output variant for each possible contributor count. The source window can exceed 16 frames; output variants retain the native limit of 16 simultaneous contributors. Empty destinations or unavailable intermediate formats use the same nearest-image fallback as ordinary rendering, with asynchronous preparation. Different weights and smaller contributor counts reuse prepared passes. More contributors or incompatible source layouts need a new candidate.

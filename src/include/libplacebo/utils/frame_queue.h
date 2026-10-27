@@ -323,10 +323,12 @@ PL_API enum pl_queue_plan_status pl_queue_plan_set_target(pl_queue_plan plan, do
 // Re-observe publication without re-evaluating policy. Sample metadata remains
 // valid until the next check/consume/destroy on this plan. No frame is borrowed.
 // In-order pushes may fill support; changed estimates affect only later plans.
-// Nearest at exact sample PTS needs only that complete sample. Otherwise it
-// resolves the nearest bracket; at EOF it holds the terminal selected sample
-// for its ordinary ZOH lifetime (PTS 0 single-image content remains indefinite).
-// Oversample and temporal support are never reduced after source termination.
+// Ordinary nearest, oversample and temporal modes select the visible frames
+// currently available. A full kernel window is not a readiness requirement.
+// Selected interlaced entries must still have their required references.
+// BRACKET explicitly requires an exact sample or a surrounding pair.
+// At EOF, ordinary modes expire after the terminal sample's ZOH lifetime
+// (PTS 0 single-image content remains indefinite).
 PL_API enum pl_queue_plan_status pl_queue_plan_check(pl_queue_plan plan);
 // Explicitly admit one producer publication through existing push_block
 // backpressure, only while this plan is pending. Does not pull, map or commit
@@ -338,7 +340,8 @@ PL_API const struct pl_queue_plan_sample *pl_queue_plan_get_samples(
 
 // Rechecks the frozen rule under the queue locks, maps exactly its complete
 // selected members, then commits the planned policy transition once. No pulls
-// or partial mix are permitted. Pending/EOF do not commit. A mapping failure
+// occur. An available window may be shorter than the kernel support, but every
+// selected member must map successfully. Pending/EOF do not commit. A mapping failure
 // is terminal and invalidates this plan and competing plans. On READY, mix
 // signatures equal the sample identities returned by get_samples().
 //
