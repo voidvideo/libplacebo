@@ -23,9 +23,19 @@ static pl_pass observe_prepare(pl_gpu gpu, const struct pl_pass_params *params,
     return original.pass_create_prepared(gpu, params, phase);
 }
 
+static bool count_cache_formats;
+static int float_cache_allocations, normalized_cache_allocations;
+
 static pl_tex observe_texture(pl_gpu gpu, const struct pl_tex_params *params)
 {
     REQUIRE(!describing);
+    if (count_cache_formats && params->w == 4 && params->h == 4 &&
+        params->renderable && params->sampleable) {
+        if (params->format->type == PL_FMT_FLOAT)
+            float_cache_allocations++;
+        else
+            normalized_cache_allocations++;
+    }
     return original.tex_create(gpu, params);
 }
 
@@ -90,6 +100,7 @@ struct snapshot_owner {
     int metadata_samples, bound_samples;
     int sampler_passes;
     int diagnostic_calls;
+    bool fail_color;
 };
 
 static void diagnostic(void *priv, const struct pl_renderer_prepare_diagnostic *d)
@@ -1759,6 +1770,8 @@ static struct pl_hook_res cache_domain_hook(void *priv, const struct pl_hook_par
 {
     struct snapshot_owner *owner = priv;
     owner->ordinary++;
+    if (owner->fail_color && p->stage == PL_HOOK_COLOR_CONVERT)
+        return (struct pl_hook_res) {.failed = true};
     return (struct pl_hook_res) {
         .output = PL_HOOK_SIG_COLOR, .sh = p->sh, .repr = p->repr,
         .color = p->color, .components = p->components, .rect = p->rect,
@@ -1785,9 +1798,9 @@ static struct pl_hook_prepare_result cache_domain_execute(void *priv,
     return cache_domain_describe(priv, p);
 }
 
-static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay)
+static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay, bool linear)
 {
-    printf("Linear cache reference: hdr=%d lut=%d overlay=%d\n", hdr, lut, overlay);
+    printf("Mixer cache reference: hdr=%d lut=%d overlay=%d linear=%d\n", hdr, lut, overlay, linear);
     enum { N = 4 };
     const float values[] = {hdr ? 2.0f : .25f, hdr ? 4.0f : .75f};
     const float alpha[] = {lut && !overlay ? .5f : 1.0f, 1.0f};
@@ -1845,6 +1858,10 @@ static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay)
     owner->params.frame_mixer = &pl_filter_bilinear;
     owner->params.preserve_mixing_cache = false;
     owner->params.skip_caching_single_frame = false;
+    owner->params.frame_mixer_input = linear ? PL_FRAME_MIXER_INPUT_LINEAR
+                                            : PL_FRAME_MIXER_INPUT_COMPLETED;
+    // Low-depth intermediate preference must not clip the explicit HDR cache.
+    owner->params.force_low_bit_depth_fbos = hdr && linear;
     struct pl_hook hooks[2] = {
         {.stages = PL_HOOK_RGB, .input = PL_HOOK_SIG_COLOR,
          .hook = cache_domain_hook, .describe = cache_domain_describe,
@@ -1875,15 +1892,21 @@ static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay)
         REQUIRE(pl_render_image_mix_prepared(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
         forbid_compile = false;
         REQUIRE(owner->analysis_executions == 2);
-        REQUIRE(owner->output_executions == iteration + 1);
+        REQUIRE(owner->output_executions == (linear ? iteration + 1 : 2));
         float actual[N*N*4];
         REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
-        const float a = overlay ? values[1] : values[0];
+        float a = overlay ? values[1] : values[0], b = values[1];
+        if (lut && !linear) {
+            // Completed sources already contain calibration. The existing
+            // source-overlay contract draws overlays after that calibration.
+            if (!overlay) a *= a;
+            b *= b;
+        }
         const float linear_a = hdr ? a : powf(a, 2.2f);
-        const float linear_b = hdr ? values[1] : powf(values[1], 2.2f);
+        const float linear_b = hdr ? b : powf(b, 2.2f);
         float expected = (linear_a*alpha[0] + linear_b*alpha[1]) / (alpha[0]+alpha[1]);
         if (!hdr) expected = powf(expected, 1.0f/2.2f);
-        if (lut) expected *= expected;
+        if (lut && linear) expected *= expected;
         for (int path = 0; path < 2; path++) {
             for (int j = 0; j < N*N; j++) {
                 for (int c = 0; c < 3; c++)
@@ -1902,10 +1925,10 @@ static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay)
         int calls = owner->ordinary;
         target.color.transfer = PL_COLOR_TRC_GAMMA28;
         REQUIRE(pl_render_image_mix(ordinary, &mix, &target, &owner->params));
-        REQUIRE(owner->ordinary == calls + 3);
+        REQUIRE(owner->ordinary == calls + (linear ? 3 : 4));
         calls = owner->ordinary;
         REQUIRE(pl_render_image_mix(ordinary, &mix, &target, &owner->params));
-        REQUIRE(owner->ordinary == calls + 1);
+        REQUIRE(owner->ordinary == calls + (linear ? 1 : 0));
         target.color.transfer = PL_COLOR_TRC_GAMMA22;
     }
     pl_renderer_prepare_destroy(&preparation);
@@ -1944,6 +1967,154 @@ static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay)
     REQUIRE(owner->refs == 1); free(owner);
     for (int i = 0; i < 2; i++) pl_tex_destroy(gpu, &textures[i]);
     pl_tex_destroy(gpu, &output);
+}
+
+static void test_cache_contract_switch(pl_gpu gpu)
+{
+    struct snapshot_owner *owner = new_snapshot(gpu, false);
+    owner->params.frame_mixer = &pl_filter_bilinear;
+    owner->params.preserve_mixing_cache = true;
+    owner->params.dither_params = NULL;
+    owner->params.background = PL_CLEAR_SKIP;
+    owner->params.force_low_bit_depth_fbos = true;
+    pl_fmt format = pl_find_named_fmt(gpu, "rgba32f");
+    float pixels[2][4*4*4];
+    pl_tex source[2];
+    struct pl_frame images[2];
+    const float values[] = {.25f, .75f};
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 16; j++) {
+            for (int c = 0; c < 3; c++) pixels[i][4*j+c] = values[i];
+            pixels[i][4*j+3] = 1;
+        }
+        source[i] = pl_tex_create(gpu, pl_tex_params(.w=4, .h=4, .format=format,
+            .sampleable=true, .initial_data=pixels[i]));
+        REQUIRE(source[i]);
+        images[i] = frame(source[i]);
+        images[i].color.transfer = PL_COLOR_TRC_LINEAR;
+    }
+    pl_tex output = pl_tex_create(gpu, pl_tex_params(.w=4, .h=4, .format=format,
+        .renderable=true, .host_readable=true));
+    REQUIRE(output);
+    struct pl_frame target = frame(output);
+    target.color = images[0].color;
+    float table[24];
+    for (int b=0;b<2;b++) for(int g=0;g<2;g++) for(int r=0;r<2;r++) {
+        int i=3*(4*b+2*g+r); table[i]=r*g; table[i+1]=g*b; table[i+2]=b*r;
+    }
+    struct pl_custom_lut lut = {.signature=6621, .size={2,2,2}, .data=table,
+        .interpolation=PL_LUT_LINEAR};
+    target.lut = &lut; target.lut_type = PL_LUT_NORMALIZED;
+    const struct pl_frame *frames[] = {&images[0], &images[1]};
+    uint64_t signatures[] = {401,402};
+    float timestamps[] = {-.5f,.5f};
+    struct pl_frame_mix mix = {.num_frames=2,.frames=frames,.signatures=signatures,
+        .timestamps=timestamps,.vsync_duration=1};
+    struct pl_hook hook = {.stages=PL_HOOK_COLOR_CONVERT,.input=PL_HOOK_SIG_COLOR,
+        .hook=cache_domain_hook,.describe=cache_domain_describe,
+        .execute_prepared=cache_domain_execute,.priv=owner,.signature=448,
+        .color_input={.color=target.color},.color_output={.color=target.color}};
+    const struct pl_hook *hooks[] = {&hook};
+    owner->params.hooks=hooks; owner->params.num_hooks=1;
+    pl_renderer renderer=pl_renderer_create(gpu->log,gpu);
+    float result[64];
+    // Both contracts have LINEAR color metadata in this fixture. Only explicit
+    // contract identity can prevent reusing already-calibrated cached values.
+    for(int step=0;step<4;step++) {
+        bool linear=step%2;
+        owner->params.frame_mixer_input=linear ? PL_FRAME_MIXER_INPUT_LINEAR : PL_FRAME_MIXER_INPUT_COMPLETED;
+        int calls=owner->ordinary;
+        float_cache_allocations = normalized_cache_allocations = 0;
+        count_cache_formats = true;
+        REQUIRE(pl_render_image_mix(renderer,&mix,&target,&owner->params));
+        count_cache_formats = false;
+        REQUIRE(linear ? float_cache_allocations == 2 : normalized_cache_allocations == 2);
+        REQUIRE(linear ? normalized_cache_allocations == 0 : float_cache_allocations == 0);
+        REQUIRE(owner->ordinary == calls + (linear ? 1 : 2));
+        REQUIRE(pl_tex_download(gpu,pl_tex_transfer_params(.tex=output,.ptr=result)));
+        float expected=linear ? .25f : .3125f;
+        for(int i=0;i<16;i++) for(int c=0;c<3;c++) REQUIRE(fabsf(result[4*i+c]-expected)<.002f);
+        calls=owner->ordinary;
+        REQUIRE(pl_render_image_mix(renderer,&mix,&target,&owner->params));
+        REQUIRE(owner->ordinary == calls + (linear ? 1 : 0));
+        // A new immutable prepared generation must describe/cache its own
+        // contract, including source-only preparations of a temporal mixer.
+        struct pl_renderer_snapshot snapshot={.params=&owner->params,.owner=owner,.retain=retain,.release=release};
+        pl_renderer_preparation preparation=NULL;
+        REQUIRE(pl_renderer_describe_image_mix(renderer,&mix,&target,&snapshot,&preparation)==PL_RENDERER_PREPARE_OK);
+        wait_prepared(preparation);
+        int executed=owner->output_executions;
+        REQUIRE(pl_render_image_mix_prepared(preparation,&mix,&target)==PL_RENDERER_PREPARE_OK);
+        REQUIRE(owner->output_executions==executed+(linear ? 1 : 2));
+        REQUIRE(pl_tex_download(gpu,pl_tex_transfer_params(.tex=output,.ptr=result)));
+        for(int i=0;i<16;i++) for(int c=0;c<3;c++) REQUIRE(fabsf(result[4*i+c]-expected)<.002f);
+        REQUIRE(pl_render_image_mix_prepared(preparation,&mix,&target)==PL_RENDERER_PREPARE_OK);
+        REQUIRE(owner->output_executions==executed+(linear ? 2 : 2));
+        pl_renderer_prepare_destroy(&preparation);
+    }
+    // An indivisible conversion LUT cannot fulfill the linear-source contract.
+    owner->params.lut=&lut; owner->params.lut_type=PL_LUT_CONVERSION;
+    owner->params.frame_mixer_input=PL_FRAME_MIXER_INPUT_LINEAR;
+    REQUIRE(!pl_render_image_mix(renderer,&mix,&target,&owner->params));
+    REQUIRE(!pl_render_image(renderer,&images[0],&target,&owner->params));
+    for(int mode=PL_RENDERER_PREPARE_ASYNC;mode<=PL_RENDERER_PREPARE_SYNC;mode++) {
+        struct pl_renderer_snapshot snapshot={.params=&owner->params,.owner=owner,
+            .retain=retain,.release=release,.mode=mode};
+        pl_renderer_preparation preparation=NULL;
+        REQUIRE(pl_renderer_describe_image_mix(renderer,&mix,&target,&snapshot,&preparation)==PL_RENDERER_PREPARE_INVALID);
+        REQUIRE(!preparation);
+    }
+    // Disabling FBOs cannot select a direct render for the linear cache contract.
+    owner->params.lut = NULL;
+    owner->params.disable_fbos = true;
+    REQUIRE(!pl_render_image_mix(renderer, &mix, &target, &owner->params));
+    REQUIRE(!pl_render_image(renderer, &images[0], &target, &owner->params));
+    for (int mode = PL_RENDERER_PREPARE_ASYNC; mode <= PL_RENDERER_PREPARE_SYNC; mode++) {
+        struct pl_renderer_snapshot snapshot = {.params = &owner->params, .owner = owner,
+            .retain = retain, .release = release, .mode = mode};
+        pl_renderer_preparation preparation = NULL;
+        REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot,
+                                               &preparation) == PL_RENDERER_PREPARE_INVALID);
+        REQUIRE(!preparation);
+        REQUIRE(pl_renderer_describe_image(renderer, &images[0], &target, &snapshot,
+                                           &preparation) == PL_RENDERER_PREPARE_INVALID);
+        REQUIRE(!preparation);
+    }
+    owner->params.disable_fbos = false;
+    // A failed new completed source must not leave reusable unrendered storage,
+    // even with cache preservation. A later explicit request may render again.
+    owner->params.lut = NULL;
+    owner->params.frame_mixer_input = PL_FRAME_MIXER_INPUT_COMPLETED;
+    signatures[0] += 100;
+    owner->fail_color = true;
+    REQUIRE(!pl_render_image_mix(renderer, &mix, &target, &owner->params));
+    owner->fail_color = false;
+    pl_renderer_reset_errors(renderer, NULL);
+    int calls = owner->ordinary;
+    REQUIRE(pl_render_image_mix(renderer, &mix, &target, &owner->params));
+    REQUIRE(owner->ordinary == calls + 2);
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = result)));
+    for (int i = 0; i < 16; i++) for (int c = 0; c < 3; c++)
+        REQUIRE(fabsf(result[4*i+c] - .3125f) < .002f);
+    // A post-mix color failure must not turn into a successful single-frame
+    // render after the failing hook has been disabled by the renderer.
+    owner->params.frame_mixer_input = PL_FRAME_MIXER_INPUT_LINEAR;
+    owner->fail_color = true;
+    calls = owner->ordinary;
+    REQUIRE(!pl_render_image_mix(renderer, &mix, &target, &owner->params));
+    REQUIRE(owner->ordinary == calls + 1);
+    owner->fail_color = false;
+    pl_renderer_reset_errors(renderer, NULL);
+    calls = owner->ordinary;
+    REQUIRE(pl_render_image_mix(renderer, &mix, &target, &owner->params));
+    REQUIRE(owner->ordinary == calls + 1);
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = result)));
+    for (int i = 0; i < 16; i++) for (int c = 0; c < 3; c++)
+        REQUIRE(fabsf(result[4*i+c] - .25f) < .002f);
+    REQUIRE(owner->refs==1); free(owner);
+    pl_renderer_destroy(&renderer);
+    for(int i=0;i<2;i++) pl_tex_destroy(gpu,&source[i]);
+    pl_tex_destroy(gpu,&output);
 }
 
 static void test_native_color(pl_gpu gpu, struct pl_frame image, int peak)
@@ -2300,10 +2471,13 @@ int main(void)
     for (int direct = 0; direct < 2; direct++)
         for (int present = 0; present < 2; present++)
             test_bt1886_metadata_loss(gpu, frame(source), direct, present);
-    test_linear_cache(gpu, false, false, false);
-    test_linear_cache(gpu, false, true, false);
-    test_linear_cache(gpu, false, true, true);
-    test_linear_cache(gpu, true, false, false);
+    for (int linear = 0; linear < 2; linear++) {
+        test_linear_cache(gpu, false, false, false, linear);
+        test_linear_cache(gpu, false, true, false, linear);
+        test_linear_cache(gpu, false, true, true, linear);
+        test_linear_cache(gpu, true, false, false, linear);
+    }
+    test_cache_contract_switch(gpu);
     test_native_color(gpu, frame(source), false);
     test_native_color(gpu, frame(source), 1);
     test_native_color(gpu, frame(source), 2);

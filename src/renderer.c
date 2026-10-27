@@ -31,6 +31,7 @@ struct cached_frame {
     uint64_t params_hash; // for detecting `pl_render_params` changes
     struct pl_color_space color;
     struct pl_color_space target_color; // mapping intent, including original transfer
+    enum pl_frame_mixer_input input_domain;
     struct pl_color_repr repr;
     struct pl_icc_profile profile;
     pl_rect2df crop;
@@ -755,15 +756,25 @@ static void find_fbo_format(struct pass_state *pass)
     rr->errors |= PL_RENDER_ERR_FBO;
 }
 
-// Render-level conversion LUTs are indivisible color pipelines. Retain their
-// established output-domain cache behavior; native mapping caches linear RGB.
 static bool conversion_lut(const struct pl_render_params *params)
 {
     return params->lut && params->lut_type == PL_LUT_CONVERSION;
 }
 
-static struct pl_color_space cache_color(const struct pl_frame *target,
-                                         const struct pl_render_params *params)
+static bool linear_mixer_input(const struct pl_render_params *params)
+{
+    return params->frame_mixer_input == PL_FRAME_MIXER_INPUT_LINEAR;
+}
+
+static bool mixer_input_valid(const struct pl_render_params *params)
+{
+    return params->frame_mixer_input >= PL_FRAME_MIXER_INPUT_COMPLETED &&
+           params->frame_mixer_input <= PL_FRAME_MIXER_INPUT_LINEAR &&
+           !(linear_mixer_input(params) && (conversion_lut(params) || params->disable_fbos));
+}
+
+static struct pl_color_space mapped_color(const struct pl_frame *target,
+                                          const struct pl_render_params *params)
 {
     struct pl_color_space color = target->color;
     if (!conversion_lut(params))
@@ -771,19 +782,28 @@ static struct pl_color_space cache_color(const struct pl_frame *target,
     return color;
 }
 
+static struct pl_color_space cache_color(const struct pl_frame *target,
+                                         const struct pl_render_params *params)
+{
+    return linear_mixer_input(params) ? mapped_color(target, params) : target->color;
+}
+
 static bool cache_color_equal(const struct cached_frame *frame,
                               const struct pl_frame *target,
                               const struct pl_render_params *params)
 {
     struct pl_color_space expected = cache_color(target, params);
-    return pl_color_space_equal(&frame->color, &expected) &&
+    return frame->input_domain == params->frame_mixer_input &&
+           pl_color_space_equal(&frame->color, &expected) &&
            pl_color_space_equal(&frame->target_color, &target->color);
 }
 
-// The temporal cache must preserve linear HDR values, independently of the
-// precision selected for other intermediate rendering operations.
+// Only the explicit linear contract requires floating-point source storage.
+// Completed RGB keeps the renderer's existing intermediate-format policy.
 static pl_fmt cache_format(struct pass_state *pass)
 {
+    if (!linear_mixer_input(pass->params))
+        return pass->fbofmt[4];
     return pl_find_fmt(pass->rr->gpu, PL_FMT_FLOAT, 4, 16, 0,
                       PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
                       PL_FMT_CAP_LINEAR);
@@ -1593,7 +1613,7 @@ static void draw_cached_overlays(struct pass_state *pass, pl_tex tex,
           pass->image.overlays,
           pass->image.num_overlays,
           pass->img.color,
-          pass->img.repr, conversion_lut(pass->params),
+          pass->img.repr, !linear_mixer_input(pass->params),
           &shift);
 
 }
@@ -3149,8 +3169,11 @@ static bool pass_color_stage(struct pass_state *pass, struct img *img,
     return true;
 }
 
-// Tone/gamut-map into the linear RGB cache domain.
-static void pass_convert_colors(struct pass_state *pass)
+static bool pass_finish_colors(struct pass_state *pass, const struct pl_color_domain *input,
+                               const struct pl_color_map_args *mapping);
+
+// Tone/gamut-map once, then either complete source color or retain linear RGB.
+static bool pass_prepare_colors(struct pass_state *pass)
 {
     const struct pl_render_params *params = pass->params;
     const struct pl_frame *image = &pass->image;
@@ -3250,7 +3273,7 @@ static void pass_convert_colors(struct pass_state *pass)
         if (pass->need_peak_fbo) {
             struct pl_sample_src peak_src = {0};
             if (!img_source(pass, img, &peak_src))
-                return;
+                return false;
         }
 
         // Feature extraction belongs to native tone mapping. The injected
@@ -3259,17 +3282,19 @@ static void pass_convert_colors(struct pass_state *pass)
         if (!color_hooks_valid(params)) {
             PL_ERR(rr, "Invalid replacement color hook contract");
             img_sh(pass, img)->failed = true;
-            return;
+            return false;
         }
         const struct pl_color_repr decoded_repr = img->repr;
         const struct pl_hook *tone = color_stage_first(params, PL_HOOK_TONE_MAP);
         const struct pl_hook *gamut = color_stage_first(params, PL_HOOK_GAMUT_MAP);
+        const struct pl_hook *convert = color_stage_first(params, PL_HOOK_COLOR_CONVERT);
         struct pl_hook_texture feature_map = tone
             ? (struct pl_hook_texture) {0} : get_feature_map(pass);
         struct pl_color_domain current = {.color = img->color};
         if (prelinearized)
             current.color.transfer = PL_COLOR_TRC_LINEAR;
-        const struct pl_color_domain target_domain = {.color = cache_color(target, params)};
+        const struct pl_color_domain target_domain = {.color = linear_mixer_input(params)
+            ? mapped_color(target, params) : target_csp};
         struct pl_color_map_args args = {
             .src = image->color, .dst = target_csp,
             .state = &rr->tone_map_state,
@@ -3277,12 +3302,13 @@ static void pass_convert_colors(struct pass_state *pass)
             .feature_map_texture = feature_map.params.format ? &feature_map.params : NULL,
         };
         if (!pass_color_stage(pass, img, PL_HOOK_TONE_MAP, &current, &args))
-            return;
+            return false;
         sh = img_sh(pass, img);
         args.input = &current;
         args.skip_tone_mapping = tone != NULL;
         args.skip_gamut_mapping = gamut != NULL;
-        args.output = gamut ? &gamut->color_input : &target_domain;
+        args.output = gamut ? &gamut->color_input :
+                      !linear_mixer_input(params) && convert ? &convert->color_input : &target_domain;
         // With both mapping stages replaced, connect their declared domains
         // directly; in particular Jab-to-Jab emits no RGB conversion.
         if (tone && gamut)
@@ -3291,10 +3317,12 @@ static void pass_convert_colors(struct pass_state *pass)
             pl_shader_color_map_ex(sh, params->color_map_params, &args);
         current = *args.output;
         if (!pass_color_stage(pass, img, PL_HOOK_GAMUT_MAP, &current, &args))
-            return;
+            return false;
+        img->repr = decoded_repr;
+        if (!linear_mixer_input(params))
+            return pass_finish_colors(pass, &current, &args);
         sh = img_sh(pass, img);
         pl_shader_color_convert_ex(sh, &current, &target_domain);
-        img->repr = decoded_repr;
 
     } else {
         // Preserve the existing composite-LUT path, including its target LUT
@@ -3304,11 +3332,13 @@ static void pass_convert_colors(struct pass_state *pass)
             pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
     }
 
-    img->color = cache_color(target, params);
+    img->color = mapped_color(target, params);
+    return !pl_shader_is_failed(sh);
 }
 
 // Finish a native linear source/mix exactly once, before output representation.
-static bool pass_finish_colors(struct pass_state *pass)
+static bool pass_finish_colors(struct pass_state *pass, const struct pl_color_domain *input,
+                               const struct pl_color_map_args *mapping)
 {
     if (conversion_lut(pass->params))
         return true;
@@ -3319,7 +3349,7 @@ static bool pass_finish_colors(struct pass_state *pass)
     pl_shader sh = img_sh(pass, img);
     pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
     const struct pl_color_repr decoded_repr = img->repr;
-    struct pl_color_domain current = {.color = img->color};
+    struct pl_color_domain current = input ? *input : (struct pl_color_domain) {.color = img->color};
     struct pl_color_domain output = {.color = target->color};
     if (target->icc)
         output.color.transfer = PL_COLOR_TRC_LINEAR;
@@ -3327,7 +3357,7 @@ static bool pass_finish_colors(struct pass_state *pass)
         .src = pass->image.color, .dst = target->color,
         .state = &rr->tone_map_state,
     };
-    if (!pass_color_stage(pass, img, PL_HOOK_COLOR_CONVERT, &current, &args))
+    if (!pass_color_stage(pass, img, PL_HOOK_COLOR_CONVERT, &current, mapping ? mapping : &args))
         return false;
     sh = img_sh(pass, img);
     pl_shader_color_convert_ex(sh, &current, &output);
@@ -3718,7 +3748,7 @@ static bool pass_output_target(struct pass_state *pass)
     // Cached sources already contain them; direct rendering needs the same
     // linear composition before entering the common output finishing stage.
     bool source_overlays_cached = pass->info.stage == PL_RENDER_STAGE_BLEND;
-    if (!source_overlays_cached && image->num_overlays && !conversion_lut(params)) {
+    if (!source_overlays_cached && image->num_overlays && linear_mixer_input(params)) {
         img->fmt = cache_format(pass);
         if (!img->fmt) {
             PL_ERR(rr, "Linear source overlays require a floating-point texture");
@@ -3732,7 +3762,7 @@ static bool pass_output_target(struct pass_state *pass)
                              source.tex ? &source.tex->params : source.texture);
         source_overlays_cached = true;
     }
-    if (!pass_finish_colors(pass))
+    if (linear_mixer_input(params) && !pass_finish_colors(pass, NULL, NULL))
         return false;
 
     bool need_clear = pl_frame_is_cropped(target);
@@ -4556,10 +4586,19 @@ static bool pass_acquire_frames(struct pass_state *pass, bool acquire_image)
 
 static bool pass_init(struct pass_state *pass, bool acquire_image)
 {
+    if (!mixer_input_valid(pass->params)) {
+        PL_ERR(pass->rr, "Invalid frame mixer input contract (linear RGB requires FBOs and cannot use a conversion LUT)");
+        return false;
+    }
+
     if (pass->preparation) {
         if (!validate_structs(pass->rr, pass->src_ref < 0 ? NULL : &pass->image, &pass->target))
             return false;
         find_fbo_format(pass);
+        if (linear_mixer_input(pass->params) && (!pass->fbofmt[4] || !cache_format(pass))) {
+            PL_ERR(pass->rr, "Linear frame mixer input requires floating-point cache storage");
+            return false;
+        }
         pass_fix_frames(pass);
         pass->tmp = pl_tmp(NULL);
         return true;
@@ -4573,6 +4612,10 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
         goto error;
 
     find_fbo_format(pass);
+    if (linear_mixer_input(pass->params) && (!pass->fbofmt[4] || !cache_format(pass))) {
+        PL_ERR(pass->rr, "Linear frame mixer input requires floating-point cache storage");
+        goto error;
+    }
     pass_fix_frames(pass);
 
     pass->tmp = pl_tmp(NULL);
@@ -4684,8 +4727,7 @@ bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
         goto error;
     if (!pass_scale_main(&pass))
         goto error;
-    pass_convert_colors(&pass);
-    if (!pass_output_target(&pass))
+    if (!pass_prepare_colors(&pass) || !pass_output_target(&pass))
         goto error;
 
     pass_uninit(&pass);
@@ -4917,8 +4959,8 @@ static bool pass_mix_output(struct pass_state *pass, const struct cached_frame *
         },
     };
 
-    // Composite conversion LUTs retain their legacy output-domain mixing.
-    if (conversion_lut(pass->params) && mixing) {
+    // Completed RGB keeps the existing linear-light blend and target encoding.
+    if (!linear_mixer_input(pass->params) && mixing) {
         pass->img.color = pass->target.color;
         pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_INDEPENDENT);
         pl_shader_color_map_ex(sh, NULL,
@@ -5030,8 +5072,13 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
         .info.stage = PL_RENDER_STAGE_BLEND,
     };
 
-    if (rr->errors & PL_RENDER_ERR_FRAME_MIXING)
+    if (rr->errors & PL_RENDER_ERR_FRAME_MIXING) {
+        if (linear_mixer_input(params)) {
+            PL_ERR(rr, "Linear frame mixer input cannot use a disabled frame mixer");
+            return false;
+        }
         goto fallback;
+    }
     if (!pass_init(&pass, false))
         return false;
     if (!pass.fbofmt[4])
@@ -5114,7 +5161,7 @@ retry:
 
         // Check to see if we can blindly reuse this cache entry. This is the
         // case if either the params are compatible, or the user doesn't care
-        bool can_reuse = f->tex;
+        bool can_reuse = f->tex && f->input_domain == params->frame_mixer_input;
         bool strict_reuse = skip_cache || single_frame ||
                             !params->preserve_mixing_cache;
         if (can_reuse && strict_reuse) {
@@ -5156,7 +5203,7 @@ retry:
             ));
 
             if (!ok) {
-                PL_ERR(rr, "Could not create floating-point frame cache texture");
+                PL_ERR(rr, "Could not create frame cache texture");
                 pass_uninit(&pass);
                 return false;
             }
@@ -5180,9 +5227,17 @@ retry:
                 goto inter_pass_error;
             if (!(ok = pass_scale_main(&inter_pass)))
                 goto inter_pass_error;
-            pass_convert_colors(&inter_pass);
+            if (!pass_prepare_colors(&inter_pass)) {
+                // This source never reached the cache. Do not publish or
+                // preserve its storage as a valid entry on a later request.
+                pl_tex_destroy(rr->gpu, &f->tex);
+                inter_pass.acquired.target = false;
+                pass_uninit(&inter_pass);
+                pass_uninit(&pass);
+                return false;
+            }
 
-            pl_assert(inter_pass.img.sh); // guaranteed by `pass_convert_colors`
+            pl_assert(inter_pass.img.sh); // guaranteed by `pass_prepare_colors`
             pl_shader_set_alpha(inter_pass.img.sh, &inter_pass.img.repr,
                                 PL_ALPHA_PREMULTIPLIED); // for frame mixing
 
@@ -5202,6 +5257,7 @@ retry:
             f->crop = img->crop;
             f->color = inter_pass.img.color;
             f->target_color = inter_pass.target.color;
+            f->input_domain = params->frame_mixer_input;
             f->repr = inter_pass.img.repr;
             f->comps = inter_pass.img.comps;
             f->profile = target->profile;
@@ -5247,8 +5303,13 @@ inter_pass_error:
     pass.info.count = fidx;
     pl_assert(fidx > 0);
 
-    if (!pass_mix_output(&pass, frames, weights, fidx, wsum, out_w, out_h))
+    if (!pass_mix_output(&pass, frames, weights, fidx, wsum, out_w, out_h)) {
+        if (linear_mixer_input(params)) {
+            pass_uninit(&pass);
+            return false;
+        }
         goto fallback;
+    }
 
     pass_uninit(&pass);
     return true;
@@ -5535,8 +5596,8 @@ static bool preparation_admit(pl_renderer_preparation p,
                      "selected feature is outside the current strict image subset");
         return false;
     }
-    if (params->num_hooks < 0 || (params->num_hooks && !params->hooks) ||
-        !color_hooks_valid(params)) {
+    if (!mixer_input_valid(params) || params->num_hooks < 0 ||
+        (params->num_hooks && !params->hooks) || !color_hooks_valid(params)) {
         prepare_fail(p, PL_RENDERER_PREPARE_INVALID, "invalid hook arrays");
         return false;
     }
@@ -5611,8 +5672,7 @@ static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparat
             goto failed;
         if (!pass_scale_main(&pass) || p->result != PL_RENDERER_PREPARE_OK)
             goto failed;
-        pass_convert_colors(&pass);
-        if (p->result != PL_RENDERER_PREPARE_OK)
+        if (!pass_prepare_colors(&pass) || p->result != PL_RENDERER_PREPARE_OK)
             goto failed;
         if (cached) {
             pl_shader_set_alpha(pass.img.sh, &pass.img.repr, PL_ALPHA_PREMULTIPLIED);
@@ -5636,6 +5696,7 @@ static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparat
                 .prepared_tex = tex,
                 .color = pass.img.color,
                 .target_color = pass.target.color,
+                .input_domain = pass.params->frame_mixer_input,
                 .repr = pass.img.repr,
                 .comps = pass.img.comps,
             };
@@ -5731,7 +5792,8 @@ static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
 
 static bool preparation_snapshot_valid(const struct pl_renderer_snapshot *snapshot)
 {
-    return snapshot && snapshot->params && snapshot->retain && snapshot->release &&
+    return snapshot && snapshot->params && mixer_input_valid(snapshot->params) &&
+        snapshot->retain && snapshot->release &&
         snapshot->mode >= PL_RENDERER_PREPARE_ASYNC &&
         snapshot->mode <= PL_RENDERER_PREPARE_SYNC;
 }
@@ -6412,7 +6474,8 @@ static void capture_shader_state(pl_renderer a, pl_renderer b)
 static bool capture_cache_compatible(pl_renderer_preparation p,
                                      pl_renderer_preparation active)
 {
-    if (p->mix_direct != active->mix_direct || p->num_sources != active->num_sources)
+    if (p->snapshot.params->frame_mixer_input != active->snapshot.params->frame_mixer_input ||
+        p->mix_direct != active->mix_direct || p->num_sources != active->num_sources)
         return false;
     const struct pl_hook_texture *a = p->mix_frame.prepared_tex;
     const struct pl_hook_texture *b = active->mix_frame.prepared_tex;

@@ -12,9 +12,10 @@ project('libplacebo', ['c', 'cpp'],
     7,
     # API version
     # Keep the upstream API in the leading digits and reserve four trailing
-    # digits for VoidVideo ABI revisions. `voidvideo-0` is not an upstream API
-    # entry, so exclude it from the upstream changelog count.
+    # digits for VoidVideo ABI revisions. Exclude the two VoidVideo entries
+    # from the upstream changelog count.
     ({
+      'voidvideo-1': 'add explicit completed or linear frame mixer input contract',
       'voidvideo-0': 'add host clock correlation to presentation feedback',
       '375': 'add timestamp and clock metadata to presentation feedback',
       '374': 'add pl_color_map_params.mastering_clip',
@@ -392,7 +393,7 @@ project('libplacebo', ['c', 'cpp'],
       '3': '',
       '2': '',
       '1': '',
-    }.keys().length() - 1) * 10000,
+    }.keys().length() - 2) * 10000 + 1,
     # Fix version
     0)
 )

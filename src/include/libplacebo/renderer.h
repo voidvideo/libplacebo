@@ -160,6 +160,18 @@ struct pl_render_info {
     int count;
 };
 
+// Color contract for source frames supplied to frame mixing.
+enum pl_frame_mixer_input {
+    // Completed target RGB: color conversion, ICC and target LUT run once per
+    // source before caching. This is the existing built-in mixer contract.
+    PL_FRAME_MIXER_INPUT_COMPLETED = 0,
+    // Linear RGB: cache after tone/gamut mapping; run COLOR_CONVERT, target
+    // ICC/LUT and output encoding after mixing. Requires floating-point cache
+    // storage. Not compatible with disable_fbos or a render-level
+    // PL_LUT_CONVERSION; an unavailable cache is reported as failure.
+    PL_FRAME_MIXER_INPUT_LINEAR,
+};
+
 // Represents the options used for rendering. These affect the quality of
 // the result.
 struct pl_render_params {
@@ -269,9 +281,10 @@ struct pl_render_params {
     // Color stages run in fixed order: TONE_MAP, GAMUT_MAP, COLOR_CONVERT;
     // hooks within a stage run in list order. An empty stage keeps its native
     // operation. Color hooks declare explicit color_input/color_output domains.
-    // TONE_MAP and GAMUT_MAP run after scaling and before the linear RGB cache.
-    // COLOR_CONVERT runs after mixing, before target ICC/LUT processing and output
-    // encoding. A render-level conversion LUT overrides this chain, as before.
+    // TONE_MAP and GAMUT_MAP run after scaling. With completed-RGB mixer input,
+    // COLOR_CONVERT and target ICC/LUT run before source caching. With linear-RGB
+    // input, they run after mixing. Direct rendering finishes colors once.
+    // A render-level conversion LUT overrides this chain in completed-RGB mode.
     // Descriptors are borrowed during rendering or retained
     // by the preparation snapshot owner. Ordinary hook lifecycle/cache rules apply.
     const struct pl_hook * const *hooks;
@@ -415,6 +428,11 @@ struct pl_render_params {
     PL_DEPRECATED_IN(v6.335) float polar_cutoff; // hard-coded as 1e-3
     PL_DEPRECATED_IN(v7.346) bool skip_target_clearing; // `border = PL_CLEAR_SKIP`
     PL_DEPRECATED_IN(v7.346) bool blend_against_tiles; // `background = PL_CLEAR_TILES`
+
+    // Select the source-cache contract explicitly. Zero preserves the existing
+    // completed-RGB behavior. This field is part of immutable prepared snapshots
+    // and cache identity, even when preserve_mixing_cache is enabled.
+    enum pl_frame_mixer_input frame_mixer_input;
 };
 
 // Bare minimum parameters, with no features enabled. This is the fastest

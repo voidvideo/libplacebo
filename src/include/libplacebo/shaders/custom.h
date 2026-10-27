@@ -157,8 +157,9 @@ enum pl_hook_stage {
     PL_HOOK_SCALED          = 1 << 13, // After scaling, before color management
     PL_HOOK_PRE_OUTPUT      = 1 << 14, // After color management, before blending/rotation
     PL_HOOK_OUTPUT          = 1 << 15, // After blending/rotation, before dithering
-    // Exclusive color-mapping chain. TONE_MAP and GAMUT_MAP run before the
-    // linear frame cache; COLOR_CONVERT runs after mixing, before target ICC/LUT.
+    // Exclusive color-mapping chain. TONE_MAP and GAMUT_MAP run before caching.
+    // COLOR_CONVERT precedes target ICC/LUT: before the completed-RGB source
+    // cache by default, or after mixing when linear-RGB mixer input is selected.
     // Replacement stages, dispatched only through pl_render_params.hooks.
     // A hook declares exactly one stage and explicit color_input/color_output.
     PL_HOOK_TONE_MAP        = 1 << 16,
