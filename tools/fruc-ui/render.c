@@ -19,12 +19,17 @@ int main(int argc, char **argv) {
   assert(argc == 3 || argc == 4);
   FILE *times = argc == 4 ? fopen(argv[3], "r") : NULL;
   assert(argc == 3 || times);
-  enum { W = 960, H = 540, N = 12 };
+  enum { W = 960, H = 540 };
   size_t bytes = W * H * 4;
   unsigned char *pixels = malloc(bytes);
   assert(pixels);
   FILE *in = fopen(argv[1], "rb"), *out = fopen(argv[2], "wb");
   assert(in && out);
+  assert(fseek(in, 0, SEEK_END) == 0);
+  long input_size = ftell(in);
+  assert(input_size > 0 && input_size % bytes == 0);
+  const int N = input_size / bytes;
+  assert(N >= 2 && fseek(in, 0, SEEK_SET) == 0);
   pl_log log =
       pl_log_create(PL_API_VER, pl_log_params(.log_cb = pl_log_simple,
                                               .log_level = PL_LOG_WARN));
@@ -80,11 +85,12 @@ int main(int argc, char **argv) {
   while ((state = pl_renderer_prepare_poll(prep)) == PL_PASS_PREPARE_PENDING)
     usleep(1000);
   assert(state == PL_PASS_PREPARE_READY);
-  for (int tick = 0; tick < 28; tick++) {
+  for (int tick = 0; times || tick < 28; tick++) {
     double pts = tick / 60.0;
     if (times && fscanf(times, "%lf", &pts) != 1)
       break;
     int i = (int)floor(pts * 24);
+    assert(i >= 0 && i + 1 < N);
     float t = times ? (float)(pts * 24 - i) : (tick * 2 % 5) / 5.0f;
     pair[0] = &frames[i % N];
     pair[1] = &frames[(i + 1) % N];
