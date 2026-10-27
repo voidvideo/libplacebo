@@ -72,3 +72,13 @@ mixer_loader = executable('test.frame_mixer_loader', 'frame_mixer_loader.c',
 )
 test('frame_mixer_loader', mixer_loader, args: [mixer_module.full_path()],
     depends: [mixer_module])
+
+# Compile only this production unit with deterministic allocation faults. This
+# target does not link the library, so substitutions cannot affect other code.
+mixer_stress = executable('test.frame_mixer_stress',
+    ['frame_mixer_stress.c', '../frame_mixer.c'],
+    include_directories: [inc],
+    c_args: ['-Dcalloc=mixer_test_calloc', '-Dfree=mixer_test_free',
+             '-Wno-unused-parameter'],
+)
+test('frame_mixer_stress', mixer_stress)
