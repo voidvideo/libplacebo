@@ -284,7 +284,66 @@ static void renderer_test(pl_gpu gpu)
     puts("FRUC native and prepared 24-to-60 rendering passed");
 }
 
-int main(void)
+static void dump_ui_flow(pl_gpu gpu, pl_dispatch dp, const char *input, const char *prefix)
+{
+    enum { W = 960, H = 540 };
+    FILE *file = fopen(input, "rb");
+    REQUIRE(file);
+    unsigned char *pixels = malloc(W * H * 4);
+    REQUIRE(pixels);
+    struct pl_fruc *engine = pl_fruc_create(gpu, W, H);
+    REQUIRE(engine);
+    pl_tex images[2];
+    for (int i = 0; i < 2; i++) {
+        REQUIRE(fread(pixels, 1, W * H * 4, file) == W * H * 4);
+        images[i] = pl_tex_create(gpu, pl_tex_params(.w=W, .h=H,
+            .format=pl_find_named_fmt(gpu, "rgba8"), .sampleable=true, .initial_data=pixels));
+        REQUIRE(images[i]);
+        struct pl_hook_texture source = texture(images[i]);
+        pl_shader sh = pl_dispatch_begin(dp);
+        pl_shader_fruc_grayscale(sh, &source, W, H);
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader=&sh, .target=engine->gray[i])));
+    }
+    fclose(file);
+    free(pixels);
+    REQUIRE(pl_fruc_execute(gpu, engine));
+    for (int i = 0; i < 2; i++) {
+        int w = engine->flow[i]->params.w, h = engine->flow[i]->params.h;
+        pl_tex out = pl_tex_create(gpu, pl_tex_params(.w=w, .h=h,
+            .format=pl_find_named_fmt(gpu, "rgba32f"), .storable=true,
+            .renderable=true, .host_readable=true));
+        REQUIRE(out);
+        struct pl_shader_desc descriptor = {
+            .desc = {.name="flow", .type=PL_DESC_SAMPLED_TEX},
+            .binding = {.object=engine->flow[i], .sample_mode=PL_TEX_SAMPLE_NEAREST},
+        };
+        pl_shader sh = pl_dispatch_begin(dp);
+        REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+            .body="color = vec4(vec2(texelFetch(flow, ivec2(gl_GlobalInvocationID.xy), 0).xy) / 32.0, 0.0, 1.0);",
+            .input=PL_SHADER_SIG_NONE, .output=PL_SHADER_SIG_COLOR,
+            .compute=true, .compute_group_size={16,16}, .output_w=w, .output_h=h,
+            .descriptors=&descriptor, .num_descriptors=1,
+        }));
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader=&sh, .target=out)));
+        float *data = malloc(w * h * 4 * sizeof(float));
+        REQUIRE(data);
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=out, .ptr=data)));
+        char path[4096];
+        int n = snprintf(path, sizeof(path), "%s-%d.flow", prefix, i);
+        REQUIRE(n > 0 && n < sizeof(path));
+        file = fopen(path, "wb");
+        REQUIRE(file);
+        fprintf(file, "%d %d\n", w, h);
+        REQUIRE(fwrite(data, sizeof(float), w * h * 4, file) == w * h * 4);
+        fclose(file);
+        free(data);
+        pl_tex_destroy(gpu, &out);
+        pl_tex_destroy(gpu, &images[i]);
+    }
+    pl_fruc_destroy(gpu, &engine);
+}
+
+int main(int argc, char **argv)
 {
     pl_log log = pl_test_logger();
     pl_vk_inst instance = pl_vk_inst_create(log, pl_vk_inst_params(.debug = true));
@@ -299,6 +358,15 @@ int main(void)
     }
     pl_gpu gpu = vk->gpu;
     pl_dispatch dp = pl_dispatch_create(log, gpu);
+    if (argc == 4 && strcmp(argv[1], "--dump-ui-flow") == 0) {
+        dump_ui_flow(gpu, dp, argv[2], argv[3]);
+        pl_dispatch_destroy(&dp);
+        pl_vulkan_destroy(&vk);
+        pl_vk_inst_destroy(&instance);
+        pl_log_destroy(&log);
+        return 0;
+    }
+    REQUIRE(argc == 1);
     optical_flow_test(gpu, dp);
     ui_motion_test(gpu, dp);
     renderer_test(gpu);
