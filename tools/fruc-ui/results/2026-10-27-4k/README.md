@@ -1,5 +1,10 @@
 # Native 4K Practical-RIFE evaluation
 
+**PyTorch-only historical results. Excluded from the Vulkan feasibility decision.**
+The required deployment runtime is ncnn/Vulkan. These measurements do not assess
+that runtime and must not be used to reject real-time Vulkan interpolation.
+They remain here only to preserve the original experiment and its limitations.
+
 None of the six tested configurations meets the inference throughput needed for
 3840×2160, 24→60 conversion on this RTX 5070. The fastest is RIFE 4.25 Lite,
 half-scale estimation, FP16, at 19.47 generated frames/s. The cadence needs 48

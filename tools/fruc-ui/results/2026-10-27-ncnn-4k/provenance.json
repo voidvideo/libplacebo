@@ -1,0 +1,28 @@
+{
+  "plugin_release": "r9_mod_v33",
+  "upstream": "https://github.com/styler00dollar/VapourSynth-RIFE-ncnn-Vulkan",
+  "upstream_commit": "c3ec6aabc07c8fa37a4f58d7fed9e2ad1fc1b13f",
+  "ncnn_sdk_release": "20250503",
+  "ncnn_sdk_commit": "305837fd4a722ebc47c5d72e72d8ec9ae970e932",
+  "plugin_pinned_ncnn_commit": "305837fd4a722ebc47c5d72e72d8ec9ae970e932",
+  "ncnn_sdk_url": "https://github.com/Tencent/ncnn/releases/download/20250503/ncnn-20250503-ubuntu-2404-shared.zip",
+  "gpu": "NVIDIA GeForce RTX 5070",
+  "driver": "615.71.09",
+  "artifacts": {
+    "/home/nick/.cache/voidvideo-fruc-benchmark/ncnn-compatible.zip": "10172b06881f9a6e324ceb828c8fd4452280ba35dc073ff98160743b882cf6d2",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/librife_linux_x86-64.so": "18a00a5e3ac90a5dfcfdf85fdb81d977381a5a2560a4c45dbe9a469d007b1886",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/ncnn-resident": "f53520a631a8f7c2445e33c0aad9ce167999a452d96989191bc342c86feaaf68",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/pair4k.f32": "c06d22f3b313bc011580efc442d7a3c0907885524005d0e1a844449cf09f65c7",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/ncnn-compatible/ncnn-20250503-ubuntu-2404-shared/lib/libncnn.so": "d413df5a6923e9edacb70391f6abd381b0cdfab2342af37533f813a8e2e17874",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/vs-rife-ncnn-sparse/RIFE/warp.cpp": "b3265e82aac39ffdb697bc25a0980e7f52c5b0b911d2b32c537fc40f7bcd8d02",
+    "tools/fruc-ui/ncnn_resident.cpp": "1876f08e5a6632e8401c225fde2e5fd17151a6805cf436ef640066138a885f73",
+    "tools/fruc-ui/bench_ncnn_4k.py": "031f094caac6f23588d0a75f80831084820318f97d637cf69127bb0f7ca36583",
+    "tools/fruc-ui/report_ncnn_4k.py": "70cecf44981d91365891433a2d75963d15a7e1007887424243b860312b48c2e5"
+  },
+  "python_packages": "NumPy 2.5.4, OpenCV 5.0.0.93; host VapourSynth R72",
+  "compiler": "g++ -std=c++17 -O3 -fopenmp",
+  "resident_scope": "GPU-resident input and output; timed command recording, network execution, submission and wait; no timed host transfers",
+  "matrix_gpu_execution": "Sequential; active desktop; not an exclusive GPU",
+  "quality_scope": "Stopped following user clarification. Quality runs are excluded from this speed report.",
+  "timing_framework_note": "Plugin timing records identify the earlier framework hash. That exact script is retained locally as bench_ncnn_4k-used.py. The final framework removes quality mode; its timing implementation is unchanged."
+}

@@ -92,7 +92,7 @@ Temporal error measures the change in reconstruction error across scored frames;
 the 24→60 scoring intervals are unequal after original frames are excluded.
 Inspect text, outlines, and occlusion boundaries before interpreting averages.
 
-Run wall times include startup, file handling, and encoding. RIFE-ncnn currently
+Run wall times include startup, file handling, and encoding. The original RIFE-ncnn adapter
 starts a process per requested intermediate frame, so those wall times cannot
 estimate integrated inference speed. Python model adapters also record synchronized
 GPU inference duration, separating the first inference from subsequent samples.
@@ -116,6 +116,9 @@ source revision, model checksum, and output count. Evaluation does not approve
 shipping a candidate or importing its dependencies into VoidVideo.
 
 ## Native 4K RIFE evaluation
+
+These historical PyTorch measurements are excluded from the ncnn/Vulkan
+feasibility decision. Use the persistent ncnn/Vulkan evaluation below.
 
 `bench_rife_4k.py` draws the same six menu layouts directly at 3840×2160.
 Geometry rounds to native pixels and fonts rasterize at the target resolution.
@@ -151,3 +154,58 @@ rate separately from the equivalent output rate, which also counts the twelve
 source-coincident frames. Quality measurements run separately over changing frame
 pairs. They use rounded RGB8 output and edge masks expanded by eight native pixels,
 matching the two-logical-pixel region used by the smaller benchmark.
+
+
+## Persistent native 4K ncnn/Vulkan evaluation
+
+Use `ncnn_resident.cpp` for GPU-resident speed measurements.
+`bench_ncnn_4k.py` supplies secondary full-filter timings. The PyTorch adapter
+above measures a different runtime and cannot establish Vulkan feasibility.
+Install NumPy, Pillow and VapourSynth in the test Python environment.
+Load the upstream VapourSynth-RIFE-ncnn-Vulkan plugin and its matching model
+exports. The recorded run used release `r9_mod_v33` and models from revision
+`c3ec6aabc07c8fa37a4f58d7fed9e2ad1fc1b13f`.
+
+```sh
+python tools/fruc-ui/bench_ncnn_4k.py /path/to/librife.so /path/to/model /path/to/results/timing/model-t2 --workers 2 --mode timing
+python tools/fruc-ui/report_ncnn_4k.py /path/to/results
+```
+
+Each output directory must be new. Test worker counts 1, 2 and 3 in separate
+processes. Run GPU tests serially. Timing disables frame caches and requests
+unique generated output indices. It includes CPU packing, GPU transfers,
+inference and readback. Request latency includes queueing; it is not network-only
+latency. Total board memory includes the desktop and other processes.
+Scene detection, frame skipping, TTA and UHD mode are explicitly disabled.
+This adapter now runs speed tests only. Earlier quality work remains in the
+local cache and is excluded from this speed report.
+
+If a process crashes, its initial `running` record is incomplete evidence.
+Record the process exit code and mark the run failed before reporting results.
+Never count an incomplete run as successful or reuse its directory.
+
+`ncnn_resident.cpp` measures a separate boundary: a persistent model with input
+frames and timestep maps already on the GPU. It uses upstream `Warp` unchanged.
+Build against the Vulkan-enabled ncnn 20250503 shared SDK; the upstream Warp API
+is incompatible with the 20261020 SDK. Set `sdk` to the extracted SDK directory
+and `rife` to the upstream checkout:
+
+```sh
+g++ -std=c++17 -O3 -fopenmp tools/fruc-ui/ncnn_resident.cpp "$rife/RIFE/warp.cpp" -I"$rife/RIFE" -I"$sdk/include/ncnn" -L"$sdk/lib" -Wl,-rpath,"$sdk/lib" -lncnn -o /path/to/ncnn-resident
+/path/to/ncnn-resident /path/to/model /path/to/pair.f32 /path/to/output.f32 /path/to/results/resident/model/run.json
+```
+
+Create the resident output directory first. The input file contains two planar
+RGB float32 frames, each 3840×2160 with values normalized to 0–1, in source order.
+For the recorded comparison these are `scene(10, 'scroll_fast', 4)` and
+`scene(11, 'scroll_fast', 4)` from `suite.py`. The harness applies model padding
+and FP16 storage. It warms up nine times, then cycles fractions 0.4, 0.8, 0.2,
+and 0.6 for at least fifteen seconds and 48 inferences. Each inference submits
+and waits for completion. The timed interval excludes upload and download.
+The final output file contains the cropped planar float32 result at fraction
+0.4. The final download occurs after the timer stops and serves only to check
+that the benchmark produced a finite image.
+
+The SDK and prebuilt plugin are distinct builds. Report their measurements
+separately; their difference cannot be attributed solely to transfer costs.
+Neither test establishes live playback performance or authorizes integration.

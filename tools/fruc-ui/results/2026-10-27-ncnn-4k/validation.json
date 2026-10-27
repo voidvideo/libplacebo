@@ -1,0 +1,26 @@
+{
+  "rife-v4.25-lite_ensembleFalse": {
+    "finite_nonconstant_output": true,
+    "output_float_count": 24883200,
+    "timed_inference_count": 157,
+    "seconds": 15.048304673
+  },
+  "rife-v4.25_ensembleFalse": {
+    "finite_nonconstant_output": true,
+    "output_float_count": 24883200,
+    "timed_inference_count": 143,
+    "seconds": 15.046852779
+  },
+  "rife-v4.4_ensembleFalse_fastTrue": {
+    "finite_nonconstant_output": true,
+    "output_float_count": 24883200,
+    "timed_inference_count": 267,
+    "seconds": 15.01161015
+  },
+  "rife-v4.6_ensembleFalse": {
+    "finite_nonconstant_output": true,
+    "output_float_count": 24883200,
+    "timed_inference_count": 229,
+    "seconds": 15.006025611
+  }
+}
