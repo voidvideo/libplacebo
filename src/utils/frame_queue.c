@@ -1403,8 +1403,8 @@ enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue p,
     }
     float normalized_radius = settings->radius *
         fmaxf(1.0f, cadence->output_duration / cadence->source_duration);
-    double radius = mode == PL_QUEUE_PLAN_TEMPORAL ?
-        normalized_radius * cadence->source_duration : 0;
+    double radius = cadence->intent == PL_QUEUE_PLAN_INTENT_BRACKET ? cadence->source_duration :
+        mode == PL_QUEUE_PLAN_TEMPORAL ? normalized_radius * cadence->source_duration : 0;
     plan->info = (struct pl_queue_plan_info) {
         .epoch = p->plan_epoch, .policy_revision = p->policy_revision,
         .mode = mode, .declared_cadence = true, .support_radius = radius,

@@ -160,6 +160,7 @@ static void renderer_test(pl_gpu gpu)
         .frame_data=&frames[0], .map=map_source});
     pl_queue_plan plan = NULL;
     REQUIRE(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    REQUIRE(pl_queue_plan_get_info(plan)->support_radius == cadence.source_duration);
     REQUIRE(pl_queue_plan_set_target(plan, 1.0/60) == PL_QUEUE_PLAN_PENDING);
     REQUIRE(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
     pl_queue_plan_destroy(&plan);
