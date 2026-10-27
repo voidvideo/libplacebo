@@ -60,3 +60,15 @@ foreach t : ts
 endforeach
 
 subdir('include')
+
+# Exercise the public discovery ABI across a real dynamic-library boundary.
+mixer_module = shared_module('test_frame_mixer_module', 'frame_mixer_module.c',
+    include_directories: [inc],
+    c_args: ['-Wno-unused-parameter'],
+    gnu_symbol_visibility: 'hidden',
+)
+mixer_loader = executable('test.frame_mixer_loader', 'frame_mixer_loader.c',
+    dependencies: [tdep_shared, cc.find_library('dl', required: false)],
+)
+test('frame_mixer_loader', mixer_loader, args: [mixer_module.full_path()],
+    depends: [mixer_module])
