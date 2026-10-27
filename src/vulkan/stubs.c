@@ -16,6 +16,7 @@
  */
 
 #include "../common.h"
+#include "../fruc.h"
 #include "log.h"
 
 #include <libplacebo/vulkan.h>
@@ -112,3 +113,11 @@ void pl_vulkan_set_command_trace(pl_vulkan vk,
 {
     pl_unreachable();
 }
+bool pl_fruc_describe(pl_gpu gpu, int width, int height,
+                      struct pl_hook_texture gray[2], struct pl_hook_texture flow[2])
+{
+    return false;
+}
+struct pl_fruc *pl_fruc_create(pl_gpu gpu, int width, int height) { return NULL; }
+bool pl_fruc_execute(pl_gpu gpu, struct pl_fruc *fruc) { return false; }
+void pl_fruc_destroy(pl_gpu gpu, struct pl_fruc **fruc) {}

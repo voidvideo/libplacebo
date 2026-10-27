@@ -61,7 +61,7 @@ struct priv {
     VkResult exclusive_result;
     atomic_uint_fast64_t exclusive_snapshot;
 #endif
-    uint32_t queue_families[3];
+    uint32_t queue_families[4];
     int cur_width, cur_height;
     int swapchain_depth;
     pl_rc_t frames_in_flight;       // number of frames currently queued

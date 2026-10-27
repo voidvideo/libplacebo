@@ -31,6 +31,7 @@ if vulkan_build.allowed()
     'vulkan/command.c',
     'vulkan/context.c',
     'vulkan/formats.c',
+    'vulkan/fruc.c',
     'vulkan/gpu.c',
     'vulkan/gpu_buf.c',
     'vulkan/gpu_tex.c',

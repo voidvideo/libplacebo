@@ -92,6 +92,17 @@ static const struct vk_fun vk_inst_funs[] = {
 // functions exported by dependent instance-level extensions
 static const struct vk_ext vk_device_extensions[] = {
     {
+        .name = VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_INST_FUN(GetPhysicalDeviceOpticalFlowImageFormatsNV),
+            PL_VK_DEV_FUN(CreateOpticalFlowSessionNV),
+            PL_VK_DEV_FUN(DestroyOpticalFlowSessionNV),
+            PL_VK_DEV_FUN(BindOpticalFlowSessionImageNV),
+            PL_VK_DEV_FUN(CmdOpticalFlowExecuteNV),
+            {0},
+        },
+    },
+    {
         .name = VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(AcquireNextImageKHR),
@@ -259,6 +270,7 @@ static const struct vk_ext vk_device_extensions[] = {
 
 // Make sure to keep this in sync with the above!
 const char * const pl_vulkan_recommended_extensions[] = {
+    VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
     VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
@@ -325,6 +337,11 @@ static const VkPhysicalDeviceCooperativeMatrixFeaturesKHR recommended_cooperativ
     .cooperativeMatrix = true,
 };
 #endif
+
+static const VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV,
+    .opticalFlow = true,
+};
 
 static const VkPhysicalDeviceShaderClockFeaturesKHR shader_clock = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR,
@@ -1450,6 +1467,11 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
     vk_features_normalize(tmp, &pl_vulkan_required_features, vk->api_ver, &features);
     vk_features_normalize(tmp, &pl_vulkan_recommended_features, vk->api_ver, &features);
     vk_features_normalize(tmp, params->features, vk->api_ver, &features);
+    if (extension_enabled(vk->exts.elem, vk->exts.num, VK_NV_OPTICAL_FLOW_EXTENSION_NAME))
+        vk_features_normalize(tmp, &(VkPhysicalDeviceFeatures2) {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = (void *) &optical_flow,
+        }, vk->api_ver, &features);
 
     // Explicitly clear the features struct before querying feature support
     // from the driver. This way, we don't mistakenly mark as supported
@@ -1498,9 +1520,13 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
 
     // Enable all queues at device creation time, to maximize compatibility
     // with other API users (e.g. FFmpeg)
+    const VkPhysicalDeviceOpticalFlowFeaturesNV *of_features =
+        (const void *) vk_find_struct(&vk->features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV);
+    int idx_of = of_features && of_features->opticalFlow
+        ? find_qf(qfs, qfnum, VK_QUEUE_OPTICAL_FLOW_BIT_NV) : -1;
     PL_ARRAY(VkDeviceQueueCreateInfo) qinfos = {0};
     for (int i = 0; i < qfnum; i++) {
-        bool use_qf = i == idx_gfx || i == idx_comp || i == idx_tf;
+        bool use_qf = i == idx_gfx || i == idx_comp || i == idx_tf || i == idx_of;
         use_qf |= qfs[i].queueFlags & params->extra_queues;
         if (!use_qf)
             continue;
@@ -1543,7 +1569,7 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
     // Create the command pools for the queues we care about
     const uint32_t qmax = PL_DEF(params->queue_count, UINT32_MAX);
     for (int i = 0; i < qfnum; i++) {
-        if (i != idx_gfx && i != idx_tf && i != idx_comp)
+        if (i != idx_gfx && i != idx_tf && i != idx_comp && i != idx_of)
             continue; // ignore QFs not used internally
 
         int qnum = qfs[i].queueCount;
@@ -1559,6 +1585,8 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
 
         // Update the pool_* pointers based on the corresponding index
         const char *qf_name = NULL;
+        if (i == idx_of)
+            qf_name = "optical flow";
         if (i == idx_tf) {
             vk->pool_transfer = pool;
             qf_name = "transfer";

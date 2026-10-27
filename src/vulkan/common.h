@@ -112,6 +112,11 @@ struct vk_ctx {
     PL_VK_FUN(GetPhysicalDeviceExternalBufferProperties);
     PL_VK_FUN(GetPhysicalDeviceExternalSemaphoreProperties);
     PL_VK_FUN(GetPhysicalDeviceFeatures2);
+    PL_VK_FUN(GetPhysicalDeviceOpticalFlowImageFormatsNV);
+    PL_VK_FUN(CreateOpticalFlowSessionNV);
+    PL_VK_FUN(DestroyOpticalFlowSessionNV);
+    PL_VK_FUN(BindOpticalFlowSessionImageNV);
+    PL_VK_FUN(CmdOpticalFlowExecuteNV);
 #ifdef VK_KHR_cooperative_matrix
     PL_VK_FUN(GetPhysicalDeviceCooperativeMatrixPropertiesKHR);
 #endif

@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "pl_thread.h"
+#include "fruc.h"
 #include <libplacebo/vulkan.h>
 #include <libplacebo/dispatch.h>
 #include <libplacebo/shaders/fruc.h>
@@ -11,13 +12,97 @@ static struct pl_hook_texture texture(pl_tex tex)
     };
 }
 
+static void optical_flow_test(pl_gpu gpu, pl_dispatch dp)
+{
+    enum { N = 128 };
+    struct pl_hook_texture gray[2], flow[2];
+    if (!pl_fruc_describe(gpu, N, N, gray, flow)) {
+        printf("FRUC hardware execution unavailable on this device\n");
+        return;
+    }
+    struct pl_fruc *engine = pl_fruc_create(gpu, N, N);
+    REQUIRE(engine);
+    float pixels[N][N][4], output[N][N][4];
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        float value = ((x * 13 + y * 37 + x * y * 17) % 251) / 250.0f;
+        for (int c = 0; c < 3; c++) pixels[y][x][c] = value;
+        pixels[y][x][3] = 1.0f;
+    }
+    struct pl_fruc_source source = {.width = N, .height = N, .t = 0.5f};
+    pl_tex inputs[2];
+    for (int i = 0; i < 2; i++) {
+        inputs[i] = pl_tex_create(gpu, pl_tex_params(
+            .w = N, .h = N, .format = pl_find_named_fmt(gpu, "rgba32f"),
+            .sampleable = true, .host_writable = true, .initial_data = pixels));
+        REQUIRE(inputs[i]);
+        source.frames[i] = texture(inputs[i]);
+        source.flow[i] = texture(engine->flow[i]);
+    }
+    pl_tex target = pl_tex_create(gpu, pl_tex_params(
+        .w = N, .h = N, .format = pl_find_named_fmt(gpu, "rgba32f"),
+        .storable = true, .renderable = true, .host_readable = true));
+    REQUIRE(target);
+    for (int iteration = 0; iteration < 4; iteration++) {
+        for (int i = 0; i < 2; i++) {
+            pl_shader sh = pl_dispatch_begin(dp);
+            pl_shader_fruc_grayscale(sh, &source.frames[i], N, N);
+            REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = engine->gray[i])));
+        }
+        REQUIRE(pl_fruc_execute(gpu, engine));
+        pl_shader sh = pl_dispatch_begin(dp);
+        pl_shader_fruc_interpolate(sh, &source);
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target)));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = target, .ptr = output)));
+        double error = 0;
+        for (int y = 8; y < N-8; y++) for (int x = 8; x < N-8; x++)
+            error += fabsf(output[y][x][0] - pixels[y][x][0]);
+        REQUIRE(error / ((N-16)*(N-16)) < 0.01);
+    }
+    // A four-pixel translation must produce the two-pixel intermediate image.
+    float shifted[N][N][4];
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++)
+        memcpy(shifted[y][x], pixels[y][PL_MAX(0, x-4)], sizeof(shifted[y][x]));
+    REQUIRE(pl_tex_upload(gpu, pl_tex_transfer_params(.tex = inputs[1], .ptr = shifted)));
+    for (int i = 0; i < 2; i++) {
+        pl_shader sh = pl_dispatch_begin(dp);
+        pl_shader_fruc_grayscale(sh, &source.frames[i], N, N);
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = engine->gray[i])));
+    }
+    REQUIRE(pl_fruc_execute(gpu, engine));
+    pl_shader sh = pl_dispatch_begin(dp);
+    pl_shader_fruc_interpolate(sh, &source);
+    REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = target)));
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = target, .ptr = output)));
+    double motion_error = 0;
+    for (int y = 16; y < N-16; y++) for (int x = 16; x < N-16; x++)
+        motion_error += fabsf(output[y][x][0] - pixels[y][x-2][0]);
+    REQUIRE(motion_error / ((N-32)*(N-32)) < 0.04);
+
+    // Teardown must also be safe with optical-flow work still queued.
+    REQUIRE(pl_fruc_execute(gpu, engine));
+    pl_fruc_destroy(gpu, &engine);
+    for (int i = 0; i < 2; i++) pl_tex_destroy(gpu, &inputs[i]);
+    pl_tex_destroy(gpu, &target);
+    pl_gpu_finish(gpu);
+    printf("FRUC hardware execution passed\n");
+}
+
 int main(void)
 {
     pl_log log = pl_test_logger();
-    pl_vulkan vk = pl_vulkan_create(log, pl_vulkan_params(.allow_software = true));
-    if (!vk) return SKIP;
+    pl_vk_inst instance = pl_vk_inst_create(log, pl_vk_inst_params(.debug = true));
+    REQUIRE(instance);
+    pl_vulkan vk = pl_vulkan_create_with_instance_extensions(log, pl_vulkan_params(
+        .instance = instance->instance, .get_proc_addr = instance->get_proc_addr,
+        .allow_software = true), instance->extensions, instance->num_extensions);
+    if (!vk) {
+        pl_vk_inst_destroy(&instance);
+        pl_log_destroy(&log);
+        return SKIP;
+    }
     pl_gpu gpu = vk->gpu;
     pl_dispatch dp = pl_dispatch_create(log, gpu);
+    optical_flow_test(gpu, dp);
     enum { W = 64, H = 8, PAD = 4 };
     float pixels[2][H][W+PAD][4], result[H][W][4];
     int16_t vectors[2][H][W][2];
@@ -128,5 +213,6 @@ int main(void)
     }
     pl_dispatch_destroy(&dp);
     pl_vulkan_destroy(&vk);
+    pl_vk_inst_destroy(&instance);
     pl_log_destroy(&log);
 }
