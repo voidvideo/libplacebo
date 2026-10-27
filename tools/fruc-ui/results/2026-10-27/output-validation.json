@@ -1,0 +1,370 @@
+{
+  "bim-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  },
+  "bim-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "ffmpeg-24to60": {
+    "scroll_slow": {
+      "count": 58,
+      "source_coincident_max_mae_8bit": 0.4582979681069959
+    },
+    "scroll_fast": {
+      "count": 58,
+      "source_coincident_max_mae_8bit": 0.4582979681069959
+    },
+    "vertical": {
+      "count": 58,
+      "source_coincident_max_mae_8bit": 0.5002719907407407
+    },
+    "focus_glide": {
+      "count": 58,
+      "source_coincident_max_mae_8bit": 0.5004719650205761
+    },
+    "crossing": {
+      "count": 58,
+      "source_coincident_max_mae_8bit": 0.3877552726337449
+    },
+    "static": {
+      "count": 58,
+      "source_coincident_max_mae_8bit": 0.4582979681069959
+    }
+  },
+  "ffmpeg-midpoint": {
+    "scroll_slow": {
+      "count": 23
+    },
+    "scroll_fast": {
+      "count": 23
+    },
+    "vertical": {
+      "count": 23
+    },
+    "focus_glide": {
+      "count": 23
+    },
+    "crossing": {
+      "count": 23
+    },
+    "static": {
+      "count": 23
+    }
+  },
+  "ffmpeg-vulkan-port-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  },
+  "ffmpeg-vulkan-port-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "film-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  },
+  "film-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "gimm-port-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "mvtools-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  },
+  "mvtools-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "rife425-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  },
+  "rife425-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "rife46-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  },
+  "rife46-midpoint": {
+    "scroll_slow": {
+      "count": 24
+    },
+    "scroll_fast": {
+      "count": 24
+    },
+    "vertical": {
+      "count": 24
+    },
+    "focus_glide": {
+      "count": 24
+    },
+    "crossing": {
+      "count": 24
+    },
+    "static": {
+      "count": 24
+    }
+  },
+  "gimm-port-24to60": {
+    "scroll_slow": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "scroll_fast": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "vertical": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "focus_glide": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "crossing": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    },
+    "static": {
+      "count": 60,
+      "source_coincident_max_mae_8bit": 0.0
+    }
+  }
+}

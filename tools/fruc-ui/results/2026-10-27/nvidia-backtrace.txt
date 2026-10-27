@@ -1,0 +1,30 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff01ff6c0 (LWP 923964)]
+[New Thread 0x7fffee4296c0 (LWP 923965)]
+[New Thread 0x7fffedc286c0 (LWP 923966)]
+[New Thread 0x7ffde150f6c0 (LWP 923967)]
+strInput file directory strPath : /home/nick/.cache/voidvideo-fruc-benchmark/suite/scroll_fast/input
+strInput file pattern : *.png
+Folder already exists
+
+[New Thread 0x7ffdcbfff6c0 (LWP 923968)]
+*** buffer overflow detected ***: terminated
+
+Thread 1 "NvOFFRUCSample" received signal SIGABRT, Aborted.
+__pthread_kill_implementation (threadid=<optimized out>, signo=signo@entry=6, no_tid=no_tid@entry=0) at ./nptl/pthread_kill.c:44
+warning: 44	./nptl/pthread_kill.c: No such file or directory
+#0  __pthread_kill_implementation (threadid=<optimized out>, signo=signo@entry=6, no_tid=no_tid@entry=0) at ./nptl/pthread_kill.c:44
+#1  0x00007ffff7aa073f in __pthread_kill_internal (threadid=<optimized out>, signo=6) at ./nptl/pthread_kill.c:89
+#2  0x00007ffff7a4bc42 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#3  0x00007ffff7a344ac in __GI_abort () at ./stdlib/abort.c:77
+#4  0x00007ffff7a35291 in __libc_message_impl (fmt=fmt@entry=0x7ffff7bb51a4 "*** %s ***: terminated\n") at ../sysdeps/posix/libc_fatal.c:134
+#5  0x00007ffff7b27715 in __GI___fortify_fail (msg=msg@entry=0x7ffff7bb518b "buffer overflow detected") at ./debug/fortify_fail.c:24
+#6  0x00007ffff7b27120 in __GI___chk_fail () at ./debug/chk_fail.c:28
+#7  0x00007ffff7b28dd1 in ___vsnprintf_chk (s=<optimized out>, maxlen=<optimized out>, flag=<optimized out>, slen=<optimized out>, format=<optimized out>, ap=<optimized out>) at ./debug/vsnprintf_chk.c:28
+#8  0x00007ffde0a32595 in CLogger::LogMsg(LOG_VERBOSITY, char const*, ...) () from /home/nick/.cache/voidvideo-fruc-benchmark/nvidia-runtime/libNvOFFRUC.so
+#9  0x00007ffde0a3a806 in NvGPURGB2Y::Process(RGB2YParam&) () from /home/nick/.cache/voidvideo-fruc-benchmark/nvidia-runtime/libNvOFFRUC.so
+#10 0x00007ffde0a2193b in NvOFFRUCPreProc::Execute(NvOFFRUCPreProcParam&, CUDASurface const&) () from /home/nick/.cache/voidvideo-fruc-benchmark/nvidia-runtime/libNvOFFRUC.so
+#11 0x00007ffde0a11ed0 in CNvOFFRUCCuda::NvOFFRUCProcess(_NvOFFRUC_PROCESS_IN_PARAMS const*, _NvOFFRUC_PROCESS_OUT_PARAMS const*) () from /home/nick/.cache/voidvideo-fruc-benchmark/nvidia-runtime/libNvOFFRUC.so
+#12 0x00007ffde0a0fa33 in NvOFFRUCProcess () from /home/nick/.cache/voidvideo-fruc-benchmark/nvidia-runtime/libNvOFFRUC.so
+#13 0x000055555555c628 in main ()

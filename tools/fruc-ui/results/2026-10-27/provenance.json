@@ -1,0 +1,23 @@
+{
+  "hardware": "name, driver_version, memory.total [MiB]\nNVIDIA GeForce RTX 5070, 615.71.09, 12227 MiB\n",
+  "ffmpeg": "ffmpeg version 7.1.5 Copyright (c) 2000-2026 the FFmpeg developers",
+  "source_revisions": {
+    "Practical-RIFE": "bbfd2ea90910789a860ea3e2b32a240cd577b75e",
+    "GIMM-VFI": "dbc56449994a3c2e045d46fd46bed570239913f8",
+    "BiM-VFI": "df79cbcad4214d48911040def459174d0a4c9791",
+    "FILM": "33bf477ea2c65a2ed1b5f2280ee1f02be06910e8",
+    "ComfyUI-GIMM-VFI": "4c9a3123762af85e7c796e41737da0b70c75d72d"
+  },
+  "models": {
+    "/home/nick/.cache/voidvideo-fruc-benchmark/rife.zip": "1e2c7ee7fa7daa326542d50622f0afedc80cf6f1858bda411d16385ffa5cdf68",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/rife425.zip": "e63d481b7ae5d4a4e6ad7ac5b410ff78f3bf7be3b51b2e38ca8152747abde5b4",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/film_net_fp32.pt": "f810cada26d0c288e50a27eac43af74446eb84b857ccbc77a22bb006f4d27240",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/bim.pth": "510cbcb07a7f8fcb17b4da241bbee2a6e20a8eb9bb423cf4df4815b7cd6d1cc0",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb_lpips.pt": "b33e41536850594c01551978c4b63b1acd291c60d22310fbb6a4e57ac375033f",
+    "/home/nick/Downloads/Optical_Flow_SDK_5.0.7/NvOFFRUC/NvOFFRUCSample/bin/ubuntu/libNvOFFRUC.so": "04fcecca2540776b6e5fc08db03128c8133c4b3a749457a93896064f6c90533d",
+    "/tmp/voidvideo-fruc-research/baseline.so": "f185b872eabc84a37a7a5fed9a0c08d212e63e0bede0ccf868bd037390e1e535",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/gimm-port-models/raft-things_fp32.safetensors": "ba7cb7781f9f67030e2f6acc4151ac8701b633d93d39e8d61991f2b472a0e45a",
+    "/home/nick/.cache/voidvideo-fruc-benchmark/gimm-port-models/gimmvfi_r_arb_lpips_fp32.safetensors": "897b892e7ee481f2e5c09e59661b645abbd6c9aba9c0c01346bbe31aa569e277"
+  },
+  "torch_packages": "anyio==4.15.1\nbeautifulsoup4==4.15.0\ncertifi==2026.10.23\ncharset-normalizer==3.5.2\nclick==8.5.0\ncuda-pathfinder==1.8.4\ncupy-cuda12x==14.2.0\neasydict==1.13\neinops==0.8.2\nfilelock==4.2.4\nfsspec==2026.9.0\ngdown==6.4.2\nh11==0.16.0\nhf-xet==1.7.0\nhttpcore2==2.16.0\nhttpx2==2.16.0\nhuggingface-hub==2.3.0\nidna==3.20\njinja2==3.1.6\nmarkupsafe==3.0.4\nmpmath==1.3.0\nnetworkx==3.6.1\nnumpy==2.4.6\nnvidia-cublas-cu12==12.8.3.14\nnvidia-cuda-cupti-cu12==12.8.57\nnvidia-cuda-nvrtc-cu12==12.8.61\nnvidia-cuda-runtime-cu12==12.8.57\nnvidia-cudnn-cu12==9.7.1.26\nnvidia-cufft-cu12==11.3.3.41\nnvidia-cufile-cu12==1.13.0.11\nnvidia-curand-cu12==10.3.9.55\nnvidia-cusolver-cu12==11.7.2.55\nnvidia-cusparse-cu12==12.5.7.53\nnvidia-cusparselt-cu12==0.6.3\nnvidia-nccl-cu12==2.26.2\nnvidia-nvjitlink-cu12==12.8.61\nnvidia-nvtx-cu12==12.8.55\nomegaconf==2.4.0\nopencv-python-headless==5.0.0.93\npackaging==26.3\npillow==13.0.0\npysocks==1.7.1\npyyaml==6.0.3\nrequests==2.34.2\nsafetensors==0.8.0\nscipy==1.17.1\nsetuptools==84.2.1\nsoupsieve==3.0.4\nsympy==1.14.0\ntimm==0.6.13\ntorch @ https://download.pytorch.org/whl/cu128/torch-2.7.1%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl\ntorchvision @ https://download.pytorch.org/whl/cu128/torchvision-0.22.1%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl\ntqdm==4.70.1\ntriton==3.3.1\ntruststore==0.10.5\ntyping-extensions==4.16.0\nurllib3==2.8.0\nyacs==0.1.8\n"
+}

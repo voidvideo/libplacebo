@@ -14,7 +14,7 @@ from PIL import Image
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('backend', choices=['mvtools', 'ffmpeg', 'rife-ncnn', 'film', 'rife', 'bim', 'libplacebo'])
+    p.add_argument('backend', choices=['mvtools', 'ffmpeg', 'rife-ncnn', 'film', 'rife', 'bim', 'gimm-port', 'libplacebo'])
     p.add_argument('fixtures', type=Path)
     p.add_argument('output', type=Path)
     p.add_argument('--track', choices=['midpoint', '24to60'], required=True)
@@ -35,7 +35,7 @@ def main():
     for path in (args.resource, args.model):
         if path is None:
             continue
-        files = [path] if path.is_file() else [f for f in path.rglob('*') if f.suffix in ('.pkl', '.pt', '.bin', '.param')]
+        files = [path] if path.is_file() else [f for f in path.rglob('*') if f.suffix in ('.pkl', '.pt', '.bin', '.param', '.safetensors')]
         for file in files:
             with file.open('rb') as stream:
                 record['artifact_sha256'][str(file)] = hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -44,7 +44,7 @@ def main():
     timings = []
     start_all = time.perf_counter()
     try:
-        if args.backend in ('film', 'rife', 'bim'):
+        if args.backend in ('film', 'rife', 'bim', 'gimm-port'):
             import torch
             import torch.nn.functional as F
             assert torch.cuda.is_available(), 'CUDA is required for this benchmark configuration'
@@ -61,7 +61,7 @@ def main():
                 model.eval()
                 model.device()
                 predict = lambda a,b,t: model.inference(a,b,timestep=t)
-            else:
+            elif args.backend == 'bim':
                 # Import the official inference component without executing
                 # unrelated training/metrics package initializers.
                 import sys
@@ -76,8 +76,43 @@ def main():
                 model.load_state_dict(checkpoint['model'],strict=True)
                 predict=lambda a,b,t: model(a,b,a.new_full((1,1,1,1),t),pyr_level=5,run_with_gt=False)['imgt_pred']
                 record['pyramid_levels']=5
+            else:
+                import sys
+                sys.path.insert(0,str(args.resource))
+                from omegaconf import OmegaConf
+                from safetensors.torch import load_file
+                from gimmvfi.generalizable_INR.gimmvfi_r import GIMMVFI_R
+                from gimmvfi.generalizable_INR.configs import GIMMVFIConfig
+                from gimmvfi.generalizable_INR.raft import RAFT
+                from gimmvfi.utils.utils import InputPadder, RaftArgs
+                config=OmegaConf.load(args.resource/'configs/gimmvfi/gimmvfi_r_arb.yaml')
+                config=GIMMVFIConfig.create(config.arch)
+                model=GIMMVFI_R(torch.float32,config)
+                state=load_file(args.model/'gimmvfi_r_arb_lpips_fp32.safetensors')
+                # The upstream port loads RAFT from a separate checkpoint and
+                # ignores this checkpoint's embedded flow_estimator entries.
+                state={k:v for k,v in state.items() if not k.startswith('flow_estimator.')}
+                model.load_state_dict(state,strict=True)
+                raft=RAFT(RaftArgs(small=False,mixed_precision=False,alternate_corr=False))
+                raft.load_state_dict(load_file(args.model/'raft-things_fp32.safetensors'),strict=True)
+                model.flow_estimator=raft
+                model=model.eval().cuda()
+                def predict(a,b,t):
+                    padder=InputPadder(a.shape,32)
+                    a,b=padder.pad(a,b)
+                    xs=torch.stack((a,b),dim=2)
+                    coords=[(model.sample_coord_input(1,xs.shape[-2:],[t],device=xs.device,upsample_ratio=1.0),None)]
+                    output=model(xs,coords,t=[xs.new_full((1,),t)],ds_factor=1.0)
+                    return padder.unpad(output['imgt_pred'][0])
+                record['ds_factor']=1.0
             record['torch'] = torch.__version__
             record['device'] = torch.cuda.get_device_name()
+            record['preprocessing'] = {
+                'rife': 'Official video path: zero-pad right/bottom to multiples of 128',
+                'film': 'Official util.pad_batch: centered zero-padding to multiples of 64',
+                'bim': 'Unpadded RGB input; official model normalizes before its internal padding',
+                'gimm-port': 'Port InputPadder at 32-pixel alignment; RAFT variant, FP32, ds_factor=1',
+            }[args.backend]
         if args.backend == 'mvtools':
             import vapoursynth as vs
             vs.core.std.LoadPlugin(path=str(args.resource))
@@ -93,11 +128,13 @@ def main():
                 timestamps=args.output/'timestamps.txt'
                 timestamps.write_text(''.join(f'{t:.12f}\n' for t in times))
                 rawpath=args.output/f'{scene}.rgba'
-                command=[str(args.resource),str(src/'input.rgba'),str(rawpath),str(timestamps)]
+                stats=args.output/f'{scene}-timings.json'
+                command=[str(args.resource),str(src/'input.rgba'),str(rawpath),str(timestamps),str(stats)]
                 commands.append(command)
                 with (args.output/'tool.log').open('a') as log:
                     subprocess.run(command,env=dict(os.environ,LD_PRELOAD=str(args.model)),stdout=log,stderr=log,check=True)
                 frames=np.fromfile(rawpath,np.uint8).reshape(-1,H,W,4)
+                timings.extend(x['milliseconds'] for x in json.loads(stats.read_text()) if 0 < x['fraction'] < 1)
                 for i,frame in enumerate(frames): Image.fromarray(frame[:,:,:3]).save(dst/f'{i:04}.png')
             elif args.backend == 'ffmpeg':
                 rate = 48 if args.track == 'midpoint' else 60
@@ -144,16 +181,22 @@ def main():
                     else:
                         def tensor(image):
                             v=torch.from_numpy(image.copy()).permute(2,0,1).unsqueeze(0).float().cuda()/255
-                            return F.pad(v,(0,(-W)%64,0,(-H)%64))
+                            if args.backend in ('bim','gimm-port'): return v
+                            align=128 if args.backend=='rife' else 64
+                            pw,ph=(-W)%align,(-H)%align
+                            left,top=(pw//2,ph//2) if args.backend=='film' else (0,0)
+                            return F.pad(v,(left,pw-left,top,ph-top))
                         a,b=tensor(images[j]),tensor(images[j+1])
                         torch.cuda.synchronize(); begin_gpu=time.perf_counter()
                         value=predict(a,b,fraction)
                         torch.cuda.synchronize(); timings.append((time.perf_counter()-begin_gpu)*1000)
-                        value=value[0,:,:H,:W].clamp(0,1).permute(1,2,0).cpu().numpy()
+                        left,top=(((-W)%64)//2,((-H)%64)//2) if args.backend=='film' else (0,0)
+                        value=value[0,:,top:top+H,left:left+W].clamp(0,1).permute(1,2,0).cpu().numpy()
                         Image.fromarray(np.rint(value*255).astype(np.uint8)).save(path)
             record['scenes'][scene]={'wall_seconds':time.perf_counter()-begin,'output_count':len(list(dst.glob('*.png'))),'expected_count':len(times),'commands':commands}
         record['status']='complete' if all(s['output_count']==s['expected_count'] for s in record['scenes'].values()) else 'partial_output'
         if timings:
+            record['timing_scope']='synchronized rendering including optical flow, excluding readback' if args.backend=='libplacebo' else 'synchronized model inference excluding upload and readback'
             record['first_inference_ms']=timings[0]
             record['subsequent_inference_ms']={'median':float(np.median(timings[1:])),'p95':float(np.percentile(timings[1:],95)),'samples':len(timings)-1}
     except BaseException as e:

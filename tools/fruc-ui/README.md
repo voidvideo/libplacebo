@@ -43,13 +43,30 @@ in `--model`. It requests exact fractional timestamps with `-s`. The `film`
 adapter takes a TorchScript model in `--model`. The `rife` adapter takes the
 Practical-RIFE checkout in `--resource`, with the downloaded release's
 `train_log` directory inside that checkout. Both Python model adapters require
-CUDA-enabled PyTorch and pad images to multiples of 64 before inference, then
-crop the padding from the output. They do not change model weights or algorithms.
+CUDA-enabled PyTorch. RIFE follows its upstream video adapter's right/bottom
+zero-padding to multiples of 128. FILM follows its upstream centered zero-padding
+to multiples of 64. Both crop that padding from the output. They do not change
+model weights or algorithms.
+
+The `bim` adapter takes the official BiM-VFI checkout in `--resource` and its
+checkpoint in `--model`. It loads the inference component directly, uses five
+pyramid levels, and leaves training-only package initializers unloaded. It passes
+unpadded RGB to the model so that the model normalizes before its own padding.
+
+The `gimm-port` adapter evaluates the maintained ComfyUI GIMM-VFI port separately
+from the original repository. It imports the port's inference modules without
+installing ComfyUI. Supply its checkout in `--resource` and a directory containing
+`gimmvfi_r_arb_lpips_fp32.safetensors` and `raft-things_fp32.safetensors` in
+`--model`. It uses the RAFT variant, FP32, `ds_factor=1`, and the port's 32-pixel
+replicate padding. It loads the separate RAFT checkpoint as the port does.
 
 The `libplacebo` adapter takes the compiled `render.c` executable in `--resource`
 and an existing shared library in `--model`. It selects that library only for
 the benchmark process. The helper reads all source frames and the explicit
 timestamp file; it does not loop the input to manufacture missing frames.
+The adapter records synchronized render duration, including optical flow and
+dispatch but excluding output readback. This differs from the Python adapters'
+model-only duration, which also excludes source upload.
 
 Run each candidate again with `--track 24to60` and a different output directory
 to test fractional-rate conversion. A tool that supports only midpoint output
@@ -60,6 +77,9 @@ must remain absent from that track unless it supplies native fractional timing.
 `bench_report.py` writes `scores.json` and `index.html`. The HTML view shows
 lossless PNGs at synchronized timestamps. Its playback button advances through
 the scored frames at a fixed inspection speed; it is not a real-time playback test.
+Use `--encode-video` to add compressed, 60 FPS previews of each candidate's actual
+24→60 output. Missing tail frames remain missing in those previews. The enlarged
+text crops and scores still use lossless PNGs.
 
 Scores use common available timestamps across candidates in each scene and track.
 FFmpeg can end before the final requested timestamp because of lookahead. The
@@ -87,6 +107,7 @@ Run candidates serially on an otherwise idle GPU before comparing performance.
 - [FILM PyTorch conversion](https://github.com/dajes/frame-interpolation-pytorch),
   an unofficial conversion of Google's FILM model
 - [GIMM-VFI](https://github.com/GSeanCDAT/GIMM-VFI)
+- [GIMM-VFI ComfyUI port](https://github.com/kijai/ComfyUI-GIMM-VFI)
 - [BiM-VFI](https://github.com/KAIST-VICLab/BiM-VFI)
 - [NVIDIA Optical Flow SDK](https://developer.nvidia.com/optical-flow-sdk)
 

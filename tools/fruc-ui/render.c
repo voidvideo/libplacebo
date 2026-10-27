@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 static void ref(void *x) {}
 static struct pl_frame frame(pl_tex t) {
@@ -16,9 +17,12 @@ static struct pl_frame frame(pl_tex t) {
                            .color = pl_color_space_srgb};
 }
 int main(int argc, char **argv) {
-  assert(argc == 3 || argc == 4);
-  FILE *times = argc == 4 ? fopen(argv[3], "r") : NULL;
+  assert(argc >= 3 && argc <= 5);
+  FILE *times = argc >= 4 ? fopen(argv[3], "r") : NULL;
   assert(argc == 3 || times);
+  FILE *stats = argc == 5 ? fopen(argv[4], "w") : NULL;
+  assert(argc != 5 || stats);
+  if (stats) fputs("[", stats);
   enum { W = 960, H = 540 };
   size_t bytes = W * H * 4;
   unsigned char *pixels = malloc(bytes);
@@ -99,16 +103,28 @@ int main(int argc, char **argv) {
     ts[0] = -t;
     ts[1] = 1 - t;
     mix.num_frames = t == 0 ? 1 : 2;
+    struct timespec begin, end;
+    clock_gettime(CLOCK_MONOTONIC, &begin);
     assert(pl_renderer_preflight_image_mix(prep, &mix, &target) ==
            PL_RENDERER_PREPARE_OK);
     assert(pl_render_image_mix_prepared(prep, &mix, &target) ==
            PL_RENDERER_PREPARE_OK);
+    if (stats) {
+      pl_gpu_finish(gpu);
+      clock_gettime(CLOCK_MONOTONIC, &end);
+      double ms = (end.tv_sec - begin.tv_sec) * 1000.0 +
+                  (end.tv_nsec - begin.tv_nsec) / 1e6;
+      fprintf(stats, "%s{\"index\":%d,\"fraction\":%.8f,\"milliseconds\":%.6f}",
+              tick ? "," : "", tick, t, ms);
+    }
     assert(pl_tex_download(
         gpu, pl_tex_transfer_params(.tex = output, .ptr = pixels)));
     assert(fwrite(pixels, 1, bytes, out) == bytes);
   }
   fclose(in);
   fclose(out);
+  if (times) fclose(times);
+  if (stats) { fputs("]\n", stats); fclose(stats); }
   pl_renderer_prepare_destroy(&prep);
   pl_renderer_destroy(&rr);
   for (int i = 0; i < N; i++)
