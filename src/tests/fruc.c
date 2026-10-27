@@ -2,6 +2,8 @@
 #include "pl_thread.h"
 #include "fruc.h"
 #include <libplacebo/vulkan.h>
+#include <libplacebo/renderer.h>
+#include <libplacebo/utils/frame_queue.h>
 #include <libplacebo/dispatch.h>
 #include <libplacebo/shaders/fruc.h>
 
@@ -87,6 +89,125 @@ static void optical_flow_test(pl_gpu gpu, pl_dispatch dp)
     printf("FRUC hardware execution passed\n");
 }
 
+static void snapshot_ref(void *owner) { (void) owner; }
+
+static struct pl_frame rgb_frame(pl_tex tex)
+{
+    return (struct pl_frame) {
+        .num_planes = 1,
+        .planes = {{.texture = tex, .components = 4, .component_mapping = {0,1,2,3}}},
+        .repr = {.sys = PL_COLOR_SYSTEM_RGB, .levels = PL_COLOR_LEVELS_PC,
+                 .alpha = PL_ALPHA_PREMULTIPLIED},
+        .color = {.primaries = PL_COLOR_PRIM_BT_709, .transfer = PL_COLOR_TRC_LINEAR},
+    };
+}
+
+static bool map_source(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src, struct pl_frame *out)
+{
+    *out = *(struct pl_frame *) src->frame_data;
+    return true;
+}
+
+static void renderer_test(pl_gpu gpu)
+{
+    enum { N = 128, SOURCES = 7 };
+    struct pl_hook_texture gray[2], flow[2];
+    if (!pl_fruc_describe(gpu, N, N, gray, flow)) return;
+    float base[N][N], pixels[N][N][4], actual[N][N][4], expected[N][N][4];
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++)
+        base[y][x] = ((x * 13 + y * 37 + x * y * 17) % 251) / 250.0f;
+    pl_tex inputs[SOURCES];
+    struct pl_frame frames[SOURCES];
+    for (int n = 0; n < SOURCES; n++) {
+        for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+            for (int c = 0; c < 3; c++) pixels[y][x][c] = base[y][PL_MAX(0,x-4*n)];
+            pixels[y][x][3] = 1.0f;
+        }
+        inputs[n] = pl_tex_create(gpu, pl_tex_params(.w=N, .h=N,
+            .format=pl_find_named_fmt(gpu, "rgba32f"), .sampleable=true, .initial_data=pixels));
+        REQUIRE(inputs[n]);
+        frames[n] = rgb_frame(inputs[n]);
+    }
+    pl_tex output = pl_tex_create(gpu, pl_tex_params(.w=N, .h=N,
+        .format=pl_find_named_fmt(gpu, "rgba32f"), .renderable=true, .storable=true, .host_readable=true));
+    pl_tex reference = pl_tex_create(gpu, &output->params);
+    REQUIRE(output && reference);
+    struct pl_frame target = rgb_frame(output), native_target = rgb_frame(reference);
+    struct pl_render_params params = pl_render_default_params;
+    params.frame_mixer = &pl_filter_fruc;
+    params.dither_params = NULL;
+    struct pl_renderer_snapshot snapshot = {.params=&params, .owner=&params,
+        .retain=snapshot_ref, .release=snapshot_ref, .mode=PL_RENDERER_PREPARE_ASYNC};
+    pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
+    pl_renderer native = pl_renderer_create(gpu->log, gpu);
+    const struct pl_frame *pair[2] = {&frames[0], &frames[1]};
+    uint64_t signatures[2] = {1,2};
+    float timestamps[2] = {-0.4f, 0.6f};
+    struct pl_frame_mix mix = {.num_frames=2, .frames=pair, .signatures=signatures,
+        .timestamps=timestamps, .vsync_duration=24.0f/60.0f};
+    pl_renderer_preparation prep = NULL;
+    REQUIRE(pl_renderer_describe_image_mix(renderer, &mix, &target, &snapshot, &prep) == PL_RENDERER_PREPARE_OK);
+    REQUIRE(pl_renderer_prepare_submit(prep) == PL_RENDERER_PREPARE_OK);
+    enum pl_pass_prepare_state state;
+    while ((state = pl_renderer_prepare_poll(prep)) == PL_PASS_PREPARE_PENDING)
+        pl_thread_sleep(0.001);
+    REQUIRE(state == PL_PASS_PREPARE_READY);
+    pl_queue queue = pl_queue_create(gpu);
+    struct pl_queue_params settings = {.interpolation_threshold = 2.0f};
+    struct pl_queue_plan_cadence cadence = {.source_duration=1.0f/24,
+        .output_duration=1.0f/60, .intent=PL_QUEUE_PLAN_INTENT_BRACKET};
+    pl_queue_push(queue, &(struct pl_source_frame) {.pts=0, .duration=1.0f/24,
+        .frame_data=&frames[0], .map=map_source});
+    pl_queue_plan plan = NULL;
+    REQUIRE(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    REQUIRE(pl_queue_plan_set_target(plan, 1.0/60) == PL_QUEUE_PLAN_PENDING);
+    REQUIRE(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
+    pl_queue_plan_destroy(&plan);
+    for (int n=1; n<SOURCES; n++)
+        pl_queue_push(queue, &(struct pl_source_frame) {.pts=n/24.0, .duration=1.0f/24,
+            .frame_data=&frames[n], .map=map_source});
+    // Fifteen output timestamps at 60 Hz span six source intervals at 24 Hz.
+    for (int tick = 0; tick < 15; tick++) {
+        int source = tick * 2 / 5;
+        float t = (tick * 2 % 5) / 5.0f;
+        pair[0] = &frames[source]; pair[1] = &frames[source+1];
+        signatures[0] = source+1; signatures[1] = source+2;
+        timestamps[0] = -t; timestamps[1] = 1.0f-t;
+        REQUIRE(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+        REQUIRE(pl_queue_plan_set_target(plan, tick/60.0) == PL_QUEUE_PLAN_READY);
+        REQUIRE(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+        REQUIRE(mix.num_frames == (t == 0.0f ? 1 : 2));
+        if (mix.num_frames == 2)
+            REQUIRE(fabsf(-mix.timestamps[0] / (mix.timestamps[1]-mix.timestamps[0]) - t) < 1e-6);
+        pl_queue_plan_destroy(&plan);
+        REQUIRE(pl_renderer_preflight_image_mix(prep, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        REQUIRE(pl_render_image_mix_prepared(prep, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        REQUIRE(pl_render_image_mix(native, &mix, &native_target, &params));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=output, .ptr=actual)));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=reference, .ptr=expected)));
+        double motion_error = 0;
+        for (int y = 24; y < N-24; y++) for (int x = 40; x < N-24; x++) {
+            REQUIRE(fabsf(actual[y][x][0] - expected[y][x][0]) < 0.003);
+            float position = x - 4*(source+t);
+            int left = floorf(position);
+            float value = base[y][left]*(1-(position-left)) + base[y][left+1]*(position-left);
+            motion_error += fabsf(actual[y][x][0]-value);
+        }
+        REQUIRE(motion_error / ((N-48)*(N-64)) < 0.05);
+    }
+    // An absent future frame is pending, never a successful substituted frame.
+    mix.num_frames = 1; mix.timestamps = timestamps; timestamps[0] = -0.4f;
+    REQUIRE(pl_renderer_preflight_image_mix(prep, &mix, &target) == PL_RENDERER_PREPARE_NOT_READY);
+    REQUIRE(!pl_render_image_mix(native, &mix, &native_target, &params));
+    pl_queue_destroy(&queue);
+    pl_renderer_prepare_destroy(&prep);
+    pl_renderer_destroy(&native);
+    pl_renderer_destroy(&renderer);
+    pl_tex_destroy(gpu, &reference); pl_tex_destroy(gpu, &output);
+    for (int n=0; n<SOURCES; n++) pl_tex_destroy(gpu, &inputs[n]);
+    puts("FRUC native and prepared 24-to-60 rendering passed");
+}
+
 int main(void)
 {
     pl_log log = pl_test_logger();
@@ -103,6 +224,7 @@ int main(void)
     pl_gpu gpu = vk->gpu;
     pl_dispatch dp = pl_dispatch_create(log, gpu);
     optical_flow_test(gpu, dp);
+    renderer_test(gpu);
     enum { W = 64, H = 8, PAD = 4 };
     float pixels[2][H][W+PAD][4], result[H][W][4];
     int16_t vectors[2][H][W][2];

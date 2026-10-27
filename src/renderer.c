@@ -22,11 +22,13 @@
 #include "hash.h"
 #include "shaders.h"
 #include "dispatch.h"
+#include "fruc.h"
 
 #include <libplacebo/renderer.h>
 
 struct cached_frame {
     uint64_t signature;
+    float timestamp;
     uint64_t params_hash; // for detecting `pl_render_params` changes
     struct pl_color_space color;
     struct pl_color_repr repr;
@@ -52,6 +54,14 @@ struct osd_vertex {
 struct icc_state {
     pl_icc_object icc;
     uint64_t error; // set to profile signature on failure
+};
+
+struct fruc_slot {
+    struct pl_fruc *engine;
+    uint64_t signatures[2], hashes[2];
+    pl_tex textures[2];
+    struct pl_color_space colors[2];
+    bool valid;
 };
 
 struct pl_renderer_t {
@@ -86,6 +96,8 @@ struct pl_renderer_t {
     // Frame cache (for frame mixing / interpolation)
     PL_ARRAY(struct cached_frame) frames;
     PL_ARRAY(pl_tex) frame_fbos;
+    struct fruc_slot fruc[2];
+    int fruc_next;
 
     // For debugging / logging purposes
     int prev_dither;
@@ -152,6 +164,7 @@ struct pl_renderer_preparation_t {
     struct prepared_frame_shape image_shape[PL_MAX_PLANES], target_shape[PL_MAX_PLANES];
     int image_planes, target_planes;
     bool mix, mix_direct, mix_valid, source_only;
+    int fruc_width, fruc_height;
     int num_sources;
     pl_renderer_preparation *sources;
     bool *source_used;
@@ -257,6 +270,9 @@ void pl_renderer_destroy(pl_renderer *p_rr)
     if (!rr)
         return;
 
+    for (int i = 0; i < 2; i++)
+        pl_fruc_destroy(rr->gpu, &rr->fruc[i].engine);
+
     // Free all intermediate FBOs
     for (int n = 0; n < PL_ARRAY_SIZE(rr->fbos); n++) {
         for (int i = 0; i < rr->fbos[n].num; i++)
@@ -338,6 +354,7 @@ const struct pl_render_params pl_render_high_quality_params = {
 };
 
 const struct pl_filter_preset pl_frame_mixers[] = {
+    { "fruc",           &pl_filter_fruc,            "NVIDIA optical flow (FFmpeg FRUC)" },
     { "none",           NULL,                       "No frame mixing" },
     { "linear",         &pl_filter_bilinear,        "Linear frame mixing" },
     { "oversample",     &pl_filter_oversample,      "Oversample (AKA SmoothMotion)" },
@@ -4745,9 +4762,120 @@ static struct params_info render_params_info(const struct pl_render_params *para
 }
 
 // Shared output builder for cached frame presentation and ordinary mixing.
+static bool fruc_enabled(const struct pl_render_params *params)
+{
+    return params->frame_mixer && params->frame_mixer->kernel == &pl_filter_function_fruc;
+}
+
+static bool fruc_stage(pl_renderer rr, int width, int height)
+{
+    for (int i = 0; i < 2; i++) {
+        struct fruc_slot *slot = &rr->fruc[i];
+        if (slot->engine && (slot->engine->width != width || slot->engine->height != height)) {
+            pl_fruc_destroy(rr->gpu, &slot->engine);
+            slot->valid = false;
+        }
+        if (!slot->engine)
+            slot->engine = pl_fruc_create(rr->gpu, width, height);
+        if (!slot->engine)
+            return false;
+    }
+    return true;
+}
+
+static bool pass_fruc_output(struct pass_state *pass, const struct cached_frame *frames,
+                             int width, int height)
+{
+    pl_renderer rr = pass->rr;
+    pl_renderer_preparation p = pass->preparation;
+    bool execute = !p || p->executing;
+    struct pl_hook_texture gray[2], flow[2];
+    if (!pl_fruc_describe(rr->gpu, width, height, gray, flow)) {
+        PL_ERR(rr, "FRUC requires NVIDIA Vulkan optical flow for the output dimensions");
+        return false;
+    }
+    if (p) {
+        p->fruc_width = width;
+        p->fruc_height = height;
+    } else if (!fruc_stage(rr, width, height)) {
+        return false;
+    }
+    int index = rr->fruc_next;
+    bool cached = false;
+    if (execute) {
+        for (int n = 0; n < 2; n++) {
+            struct fruc_slot *slot = &rr->fruc[n];
+            bool match = slot->valid;
+            for (int i = 0; i < 2; i++)
+                match &= slot->signatures[i] == frames[i].signature &&
+                         slot->hashes[i] == frames[i].params_hash &&
+                         slot->textures[i] == frames[i].tex &&
+                         pl_color_space_equal(&slot->colors[i], &frames[i].color);
+            if (match) { index = n; cached = true; break; }
+        }
+    }
+    struct fruc_slot *slot = &rr->fruc[index];
+    if (execute && !slot->engine)
+        return false;
+    struct pl_fruc_source source = {.width = width, .height = height};
+    float span = frames[1].timestamp - frames[0].timestamp;
+    if (span <= 0.0f || frames[0].timestamp > 0.0f || frames[1].timestamp < 0.0f)
+        return false;
+    source.t = -frames[0].timestamp / span;
+    for (int i = 0; i < 2; i++) {
+        source.frames[i] = frames[i].prepared_tex ? *frames[i].prepared_tex :
+            (struct pl_hook_texture) {.params = frames[i].tex->params,
+                                     .sampler_type = frames[i].tex->sampler_type};
+        source.frames[i].texture = frames[i].tex;
+        source.flow[i] = flow[i];
+        if (execute) {
+            gray[i].texture = slot->engine->gray[i];
+            source.flow[i].texture = slot->engine->flow[i];
+        }
+        // Cached pairs still traverse the prepared graph, without dispatching.
+        if (cached && !p)
+            continue;
+        bool checking = p && p->checking;
+        if (cached && p) { p->executing = false; p->checking = true; }
+        pl_shader sh = pass_shader(pass, false);
+        pl_shader_fruc_grayscale(sh, &source.frames[i], width, height);
+        struct pl_dispatch_params dispatch = {.shader = &sh, .target = gray[i].texture};
+        bool ok = p ? prepared_finish(p, rr->dp, &dispatch, &gray[i].params) == PL_DISPATCH_OK
+                    : pl_dispatch_finish(rr->dp, &dispatch);
+        if (cached && p) { p->executing = true; p->checking = checking; }
+        if (!ok) return false;
+    }
+    if (execute && !cached) {
+        slot->valid = false;
+        if (!pl_fruc_execute(rr->gpu, slot->engine)) return false;
+        for (int i = 0; i < 2; i++) {
+            slot->signatures[i] = frames[i].signature;
+            slot->hashes[i] = frames[i].params_hash;
+            slot->textures[i] = frames[i].tex;
+            slot->colors[i] = frames[i].color;
+        }
+        slot->valid = true;
+        rr->fruc_next = 1 - index;
+    }
+    pl_shader sh = pass_shader(pass, false);
+    pl_shader_fruc_interpolate(sh, &source);
+    pass->img = (struct img) {
+        .sh = sh, .w = width, .h = height,
+        .comps = PL_MAX(frames[0].comps, frames[1].comps),
+        .color = pass->target.color, .rect = {0, 0, width, height},
+        .repr = {.sys = PL_COLOR_SYSTEM_RGB, .levels = PL_COLOR_LEVELS_PC,
+                 .alpha = PL_ALPHA_PREMULTIPLIED},
+    };
+    return pass_output_target(pass);
+}
+
 static bool pass_mix_output(struct pass_state *pass, const struct cached_frame *frames,
                             const float *weights, int fidx, float wsum, int out_w, int out_h)
 {
+    if (fruc_enabled(pass->params)) {
+        if (fidx == 2) return pass_fruc_output(pass, frames, out_w, out_h);
+        if (fidx != 1 || frames[0].timestamp != 0.0f) return false;
+    }
     pl_shader sh = pass_shader(pass, false);
     sh_describef(sh, "frame mixing (%d frame%s)", fidx, fidx > 1 ? "s" : "");
     sh->output = PL_SHADER_SIG_COLOR;
@@ -4869,6 +4997,23 @@ static bool mix_frame_weight(const struct pl_frame_mix *images,
     float rts = images->timestamps[i];
     struct pl_filter_config mixer = *filter;
     float weight;
+    if (mixer.kernel == &pl_filter_function_fruc) {
+        // Exact source timestamps use that source. Otherwise require the two
+        // adjacent frames bracketing the requested presentation time.
+        int left = -1, right = -1;
+        for (int j = 0; j < images->num_frames; j++) {
+            if (images->timestamps[j] == 0.0f) {
+                if (i != j) return false;
+                *out_weight = 1.0f;
+                return true;
+            }
+            if (images->timestamps[j] < 0.0f) left = j;
+            if (images->timestamps[j] > 0.0f && right < 0) right = j;
+        }
+        if (left < 0 || right < 0 || (i != left && i != right)) return false;
+        *out_weight = 1.0f;
+        return true;
+    }
     if (single_frame) {
 
         // Only render the refimg, ignore others
@@ -5119,6 +5264,7 @@ inter_pass_error:
 
         pl_assert(fidx < MAX_MIX_FRAMES);
         frames[fidx] = *f;
+        frames[fidx].timestamp = images->timestamps[i];
         weights[fidx] = weight;
         wsum += weight;
         fidx++;
@@ -5138,6 +5284,10 @@ inter_pass_error:
     }
 
     // If we got back no frames, retry with ZOH semantics
+    if (!fidx && fruc_enabled(params)) {
+        pass_uninit(&pass);
+        return false;
+    }
     if (!fidx) {
         pl_assert(!single_frame);
         single_frame = true;
@@ -5162,6 +5312,7 @@ fail:
 
 fallback:
     pass_uninit(&pass);
+    if (fruc_enabled(params)) return false;
     return pl_render_image(rr, refimg, ptarget, params);
 
 error: // for parameter validation failures
@@ -5779,6 +5930,10 @@ static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer rendere
     bool direct = !probe.fbofmt[4] || !pl_rect_w(probe.dst_rect) ||
                   !pl_rect_h(probe.dst_rect);
     pass_uninit(&probe);
+    if (direct && fruc_enabled(snapshot->params)) {
+        pl_renderer_prepare_destroy(&p);
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
+    }
     if (direct) {
         uint64_t signature = 0;
         for (int i = 0; i < images->num_frames; i++) {
@@ -5808,12 +5963,13 @@ static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer rendere
         }
         if (i < MAX_MIX_FRAMES) {
             frames[i] = p->sources[i]->mix_frame;
+            frames[i].timestamp = i == 0 ? 0.0f : 1.0f;
             weights[i] = 1.0f;
         }
     }
     // Prepare each possible contributor count. Runtime weights and bindings
     // are variables; selecting fewer contributors must never compile a shader.
-    for (int count = 1; count <= PL_MIN(p->num_sources, MAX_MIX_FRAMES); count++) {
+    for (int count = 1; count <= PL_MIN(p->num_sources, fruc_enabled(snapshot->params) ? 2 : MAX_MIX_FRAMES); count++) {
         result = temporal_output(p, pl_frame_mix_nearest(images), target,
                                  frames, weights, count, count);
         if (result != PL_RENDERER_PREPARE_OK)
@@ -5839,6 +5995,8 @@ enum pl_renderer_prepare_result pl_renderer_describe_image_mix(pl_renderer rende
     enum pl_renderer_prepare_result result = preparation_mix_image(images, &image, &signature);
     if (result == PL_RENDERER_PREPARE_INVALID)
         return result;
+    if (fruc_enabled(snapshot->params) && snapshot->params->disable_fbos)
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
     if (snapshot->mode == PL_RENDERER_PREPARE_SYNC)
         return describe_synchronous(renderer, target, snapshot, out, true);
     if (images && images->num_frames == 0)
@@ -5862,7 +6020,7 @@ enum pl_renderer_prepare_result pl_renderer_describe_image_capture(pl_renderer r
     if (out) *out = NULL;
     if (!preparation_snapshot_valid(snapshot) || snapshot->mode != PL_RENDERER_PREPARE_ASYNC)
         return PL_RENDERER_PREPARE_INVALID;
-    if (stages && snapshot->params->disable_fbos)
+    if ((stages || fruc_enabled(snapshot->params)) && snapshot->params->disable_fbos)
         return PL_RENDERER_PREPARE_UNSUPPORTED;
     return describe_image(renderer, image, target, snapshot, out, false, 0, false, stages);
 }
@@ -5875,7 +6033,7 @@ enum pl_renderer_prepare_result pl_renderer_describe_image_mix_capture(pl_render
     if (out) *out = NULL;
     if (!preparation_snapshot_valid(snapshot) || snapshot->mode != PL_RENDERER_PREPARE_ASYNC)
         return PL_RENDERER_PREPARE_INVALID;
-    if (stages && snapshot->params->disable_fbos)
+    if ((stages || fruc_enabled(snapshot->params)) && snapshot->params->disable_fbos)
         return PL_RENDERER_PREPARE_UNSUPPORTED;
     const struct pl_frame *image;
     uint64_t signature;
@@ -5893,6 +6051,10 @@ enum pl_renderer_prepare_result pl_renderer_prepare_submit(pl_renderer_preparati
     if (p->result != PL_RENDERER_PREPARE_OK)
         return p->result;
     p->submitted = true;
+    if (p->fruc_width && !fruc_stage(p->rr, p->fruc_width, p->fruc_height)) {
+        prepare_fail(p, PL_RENDERER_PREPARE_FAILED, "FRUC resource staging failed");
+        return p->result;
+    }
     for (int i = 0; i < p->num_sources; i++) {
         enum pl_renderer_prepare_result result = pl_renderer_prepare_submit(p->sources[i]);
         if (result != PL_RENDERER_PREPARE_OK) {
@@ -6115,6 +6277,8 @@ retry:
         slots[count++] = -1;
         sum += weight;
     }
+    if (!count && fruc_enabled(p->snapshot.params))
+        return PL_RENDERER_PREPARE_NOT_READY;
     if (!count && !single) {
         single = true;
         goto retry;
@@ -6166,6 +6330,8 @@ retry:
             return result;
         next_frame = source->shader_frame_index;
         frames[i] = source->preview_frame;
+        frames[i].signature = images->signatures[indices[i]];
+        frames[i].timestamp = images->timestamps[indices[i]];
         frames[i].tex = NULL;
     }
     p->checking = true;
@@ -6191,6 +6357,8 @@ retry:
             return result;
         p->frame_index = source->frame_index;
         frames[i] = source->mix_frame;
+        frames[i].signature = images->signatures[indices[i]];
+        frames[i].timestamp = images->timestamps[indices[i]];
         frames[i].tex = frames[i].prepared_tex->texture;
     }
     // Match native cache eviction, including retention of eligible frames

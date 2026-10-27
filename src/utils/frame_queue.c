@@ -1233,7 +1233,12 @@ static enum pl_queue_plan_status plan_check_locked(pl_queue_plan plan)
 
     int last = first;
     bool complete = true;
-    if (info->mode == PL_QUEUE_PLAN_LAST_DUE || info->mode == PL_QUEUE_PLAN_PREFIX) {
+    if (plan->intent == PL_QUEUE_PLAN_INTENT_BRACKET) {
+        if (p->queue.elem[first]->pts != info->pts) {
+            if (first + 1 >= p->queue.num) return plan_missing(p);
+            last++;
+        }
+    } else if (info->mode == PL_QUEUE_PLAN_LAST_DUE || info->mode == PL_QUEUE_PLAN_PREFIX) {
         if (!plan->members.num) {
             last = info->mode == PL_QUEUE_PLAN_PREFIX ?
                 first + PL_MIN(plan->max_entries, p->queue.num - first) - 1 : first;
@@ -1371,7 +1376,7 @@ enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue p,
     if (!isfinite(cadence->source_duration) || cadence->source_duration < 0 ||
         !isfinite(cadence->output_duration) || cadence->output_duration < 0)
         return PL_QUEUE_PLAN_ERROR;
-    if (cadence->intent < PL_QUEUE_PLAN_INTENT_DEFAULT || cadence->intent > PL_QUEUE_PLAN_INTENT_PREFIX ||
+    if (cadence->intent < PL_QUEUE_PLAN_INTENT_DEFAULT || cadence->intent > PL_QUEUE_PLAN_INTENT_BRACKET ||
         (cadence->intent == PL_QUEUE_PLAN_INTENT_PREFIX && cadence->max_entries <= 0))
         return PL_QUEUE_PLAN_ERROR;
     if (!cadence->source_duration ||
@@ -1391,6 +1396,7 @@ enum pl_queue_plan_status pl_queue_plan_prepare(pl_queue p,
         mode = selection_mode(cadence->source_duration, cadence->output_duration,
             p->threshold_frames, settings, &plan->next_threshold);
         break;
+    case PL_QUEUE_PLAN_INTENT_BRACKET: mode = PL_QUEUE_PLAN_OVERSAMPLE; break;
     case PL_QUEUE_PLAN_INTENT_SINGLE: break;
     case PL_QUEUE_PLAN_INTENT_LAST_DUE: mode = PL_QUEUE_PLAN_LAST_DUE; break;
     case PL_QUEUE_PLAN_INTENT_PREFIX: mode = PL_QUEUE_PLAN_PREFIX; break;

@@ -2192,7 +2192,7 @@ int main(void)
     test_replacement_lifecycle(gpu, frame(source));
     test_preparation_policy(gpu, frame(source));
     for (int i = 0; i < pl_num_frame_mixers; i++)
-        if (pl_frame_mixers[i].filter)
+        if (pl_frame_mixers[i].filter && pl_frame_mixers[i].filter != &pl_filter_fruc)
             test_temporal_mix(gpu, pl_frame_mixers[i].filter, false, false, false);
     test_temporal_mix(gpu, &pl_filter_oversample, false, true, false);
     test_temporal_mix(gpu, &pl_filter_oversample, true, false, false);

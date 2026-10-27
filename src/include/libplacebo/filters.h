@@ -159,6 +159,7 @@ PL_API extern const struct pl_filter_function pl_filter_function_spline64;
 // parameter controlling the threshold at which to switch back to ordinary
 // nearest neighbour sampling. (See `pl_shader_sample_oversample`)
 PL_API extern const struct pl_filter_function pl_filter_function_oversample;
+PL_API extern const struct pl_filter_function pl_filter_function_fruc;
 
 // A list of built-in filter functions, terminated by NULL
 //
@@ -297,6 +298,8 @@ PL_API extern const struct pl_filter_config pl_filter_ewa_robidoux;
 PL_API extern const struct pl_filter_config pl_filter_ewa_robidouxsharp;
 // Special/opaque filters
 PL_API extern const struct pl_filter_config pl_filter_oversample;
+// Two-frame NVIDIA Vulkan optical-flow interpolation, at the output timestamp.
+PL_API extern const struct pl_filter_config pl_filter_fruc;
 
 // Backwards compatibility
 #define pl_filter_triangle          pl_filter_bilinear

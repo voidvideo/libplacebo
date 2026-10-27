@@ -286,6 +286,7 @@ enum pl_queue_plan_intent {
     PL_QUEUE_PLAN_INTENT_SINGLE,      // one nearest sample, no interpolation
     PL_QUEUE_PLAN_INTENT_LAST_DUE,    // one last sample at or before the target
     PL_QUEUE_PLAN_INTENT_PREFIX,      // available prefix starting at last-due
+    PL_QUEUE_PLAN_INTENT_BRACKET,     // exact sample or surrounding pair; waits for future input
 };
 
 struct pl_queue_plan_cadence {
