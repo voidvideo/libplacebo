@@ -82,3 +82,16 @@ mixer_stress = executable('test.frame_mixer_stress',
              '-Wno-unused-parameter'],
 )
 test('frame_mixer_stress', mixer_stress)
+
+if components.get('vulkan') and components.get('vk-proc-addr')
+  blend_module = shared_module('test_frame_mixer_blend', 'frame_mixer_blend.c',
+    dependencies: [tdep_shared, vulkan_headers],
+    c_args: ['-Wno-unused-parameter'],
+    gnu_symbol_visibility: 'hidden',
+  )
+  renderer_mixer = executable('test.renderer_mixer', 'renderer_mixer.c',
+    dependencies: [tdep_shared, vulkan_headers, cc.find_library('dl', required: false)],
+  )
+  test('renderer_mixer', renderer_mixer, args: [blend_module.full_path()],
+       depends: [blend_module], timeout: 120)
+endif

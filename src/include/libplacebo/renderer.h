@@ -21,6 +21,7 @@
 #include <libplacebo/config.h>
 #include <libplacebo/colorspace.h>
 #include <libplacebo/filters.h>
+#include <libplacebo/frame_mixer.h>
 #include <libplacebo/gpu.h>
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/shaders/deinterlacing.h>
@@ -1097,6 +1098,41 @@ struct pl_renderer_capture {
 };
 PL_API bool pl_renderer_get_capture(pl_renderer_preparation preparation,
     enum pl_hook_stage stage, int index, struct pl_renderer_capture *out);
+
+// Prepared external mixer integration. The host supplies the exact source window;
+// no filter weights, nearest-frame substitution, or presentation policy apply.
+// One output request is admitted per handle. Independent handles can overlap.
+// All calls are serialized. Describe/stage prepare shaders; begin/finish execute
+// renderer GPU work. Submit/poll call the external implementation, and can run
+// on a different host worker after an explicit serialized ownership handoff.
+// The GPU and snapshot dependencies must outlive this handle. It retains mixer.
+typedef struct pl_renderer_mixer_t *pl_renderer_mixer;
+PL_API enum pl_renderer_prepare_result pl_renderer_mixer_describe(
+    pl_renderer renderer, pl_mixer mixer, const struct pl_frame_mix *images,
+    const struct pl_frame *target, const struct pl_renderer_snapshot *snapshot,
+    pl_renderer_mixer *out);
+PL_API enum pl_renderer_prepare_result pl_renderer_mixer_stage(pl_renderer_mixer);
+PL_API enum pl_pass_prepare_state pl_renderer_mixer_prepare_poll(pl_renderer_mixer);
+// Begin renders cache misses only and freezes the cache until finish/discard.
+// source_pts are absolute seconds (one per input); mix.timestamps is not used.
+// epoch changes invalidate all source content without changing allocation IDs.
+// Source frame metadata/textures are borrowed only during this call. Target
+// finishing metadata must match the generation when finish is called later.
+PL_API enum pl_mixer_status pl_renderer_mixer_begin(pl_renderer_mixer,
+    const struct pl_frame_mix *images, const double *source_pts, double pts,
+    uint64_t epoch, const struct pl_frame *target);
+PL_API enum pl_mixer_status pl_renderer_mixer_submit(pl_renderer_mixer);
+PL_API enum pl_mixer_status pl_renderer_mixer_poll(pl_renderer_mixer);
+// Finish consumes a completed output through the prepared color/output stage.
+// PENDING never writes the target. A different target layout/color is rejected.
+// Failure leaves the request available for explicit discard, not substitution.
+PL_API enum pl_mixer_status pl_renderer_mixer_finish(pl_renderer_mixer,
+    const struct pl_frame *target);
+// Discard is explicit: pending GPU work or longer plugin resource leases return
+// BUSY. The caller must poll to terminal completion first. It does not cancel.
+PL_API enum pl_mixer_status pl_renderer_mixer_discard(pl_renderer_mixer);
+// BUSY preserves handles with admitted requests or retained plugin leases.
+PL_API enum pl_mixer_status pl_renderer_mixer_destroy(pl_renderer_mixer *);
 
 // Prepared equivalent of pl_render_image_mix. Disabled mixing selects the
 // nearest frame. Enabled mixing describes source caches and output variants

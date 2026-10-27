@@ -155,6 +155,8 @@ struct pl_renderer_preparation_t {
     struct prepared_frame_shape image_shape[PL_MAX_PLANES], target_shape[PL_MAX_PLANES];
     int image_planes, target_planes;
     bool mix, mix_direct, mix_valid, source_only;
+    pl_fmt external_cache_format;
+    enum pl_handle_type external_cache_export;
     int num_sources;
     pl_renderer_preparation *sources;
     bool *source_used;
@@ -802,6 +804,8 @@ static bool cache_color_equal(const struct cached_frame *frame,
 // Completed RGB keeps the renderer's existing intermediate-format policy.
 static pl_fmt cache_format(struct pass_state *pass)
 {
+    if (pass->preparation && pass->preparation->external_cache_format)
+        return pass->preparation->external_cache_format;
     if (!linear_mixer_input(pass->params))
         return pass->fbofmt[4];
     return pl_find_fmt(pass->rr->gpu, PL_FMT_FLOAT, 4, 16, 0,
@@ -5684,6 +5688,8 @@ static enum pl_renderer_prepare_result preparation_traverse(pl_renderer_preparat
             }
             const struct pl_hook_texture *tex = prepared_texture(&pass,
                 pass.img.w, pass.img.h, fmt, 4);
+            if (tex && !compare)
+                ((struct pl_hook_texture *)tex)->params.export_handle = p->external_cache_export;
             if (!tex || prepared_finish(p, p->rr->dp, pl_dispatch_params(
                     .shader = &pass.img.sh,
                     .target = p->executing ? tex->texture : NULL,
@@ -5762,10 +5768,11 @@ done:
     return p->result;
 }
 
-static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
+static enum pl_renderer_prepare_result describe_image_external(pl_renderer renderer,
     const struct pl_frame *image, const struct pl_frame *target,
     const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out,
-    bool mix, uint64_t signature, bool source_only, enum pl_hook_stage stages)
+    bool mix, uint64_t signature, bool source_only, enum pl_hook_stage stages,
+    const struct pl_mixer_requirements *external)
 {
     if (out)
         *out = NULL;
@@ -5780,6 +5787,10 @@ static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
     p->rr = source_only ? renderer : pl_renderer_create(renderer->log, renderer->gpu);
     p->mix = mix;
     p->source_only = source_only;
+    if (external) {
+        p->external_cache_format = external->format;
+        p->external_cache_export = external->export_handle;
+    }
     p->capture_stages = stages;
     enum pl_renderer_prepare_result result = preparation_traverse(p, image, target, signature);
     if (result != PL_RENDERER_PREPARE_OK) {
@@ -5788,6 +5799,15 @@ static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
     }
     *out = p;
     return PL_RENDERER_PREPARE_OK;
+}
+
+static enum pl_renderer_prepare_result describe_image(pl_renderer renderer,
+    const struct pl_frame *image, const struct pl_frame *target,
+    const struct pl_renderer_snapshot *snapshot, pl_renderer_preparation *out,
+    bool mix, uint64_t signature, bool source_only, enum pl_hook_stage stages)
+{
+    return describe_image_external(renderer, image, target, snapshot, out,
+                                   mix, signature, source_only, stages, NULL);
 }
 
 static bool preparation_snapshot_valid(const struct pl_renderer_snapshot *snapshot)
@@ -6616,4 +6636,369 @@ bool pl_renderer_get_capture(pl_renderer_preparation p, enum pl_hook_stage stage
         return false;
     *out = (struct pl_renderer_capture) {0};
     return get_capture(p, stage, &index, out);
+}
+
+// External mixers share the prepared source-cache/output builders, but have an
+// explicit request lifecycle instead of the ordinary synchronous filter path.
+struct pl_renderer_mixer_t {
+    pl_renderer_preparation graph;
+    pl_mixer mixer;
+    struct pl_mixer_requirements requirements;
+    struct pl_hook_texture output;
+    struct pl_tex_t output_metadata;
+    struct pl_frame image;
+    struct cached_frame mixed;
+    struct pl_mixer_frame inputs[MAX_MIX_FRAMES];
+    uint64_t allocations[MAX_MIX_FRAMES], contents[MAX_MIX_FRAMES];
+    struct pl_mixer_job_params request;
+    pl_mixer_job job;
+    enum pl_mixer_status status;
+    unsigned leases;
+    uint64_t epoch;
+    bool have_epoch, active, submitted;
+    const struct pl_custom_lut *target_lut;
+    uint64_t target_lut_signature;
+    enum pl_lut_type target_lut_type;
+    pl_icc_object target_icc;
+};
+static atomic_uint_fast64_t mixer_identity = 1;
+static uint64_t mixer_next_identity(void)
+{
+    return atomic_fetch_add_explicit(&mixer_identity, 1, memory_order_relaxed);
+}
+static void mixer_lease(void *priv)
+{
+    ((pl_renderer_mixer)priv)->leases++;
+}
+static void mixer_unlease(void *priv)
+{
+    pl_renderer_mixer m = priv;
+    pl_assert(m->leases);
+    m->leases--;
+}
+static enum pl_mixer_status mixer_prepare_status(enum pl_renderer_prepare_result r)
+{
+    switch (r) {
+    case PL_RENDERER_PREPARE_OK: return PL_MIXER_OK;
+    case PL_RENDERER_PREPARE_UNSUPPORTED: return PL_MIXER_UNSUPPORTED;
+    case PL_RENDERER_PREPARE_INVALID:
+    case PL_RENDERER_PREPARE_NOT_READY: return PL_MIXER_INVALID;
+    default: return PL_MIXER_FAILED;
+    }
+}
+static enum pl_renderer_prepare_result mixer_output(pl_renderer_mixer m,
+    const struct pl_frame *target, bool execute)
+{
+    pl_renderer_preparation p = m->graph;
+    enum pl_render_error errors = p->rr->errors;
+    p->checking = !execute;
+    p->executing = execute;
+    p->result = PL_RENDERER_PREPARE_OK;
+    const float weight = 1.0f;
+    enum pl_renderer_prepare_result r = temporal_output(p, &m->image, target,
+                                                       &m->mixed, &weight, 1, 1.0f);
+    p->checking = p->executing = false;
+    if (!execute) {
+        p->rr->errors = errors;
+        p->result = PL_RENDERER_PREPARE_OK;
+    }
+    return r;
+}
+enum pl_renderer_prepare_result pl_renderer_mixer_describe(
+    pl_renderer rr, pl_mixer mixer, const struct pl_frame_mix *images,
+    const struct pl_frame *target, const struct pl_renderer_snapshot *snapshot,
+    pl_renderer_mixer *out)
+{
+    if (out) *out = NULL;
+    if (!out || !rr || !mixer || pl_mixer_get_gpu(mixer) != rr->gpu || !target ||
+        !preparation_snapshot_valid(snapshot) || !images || !images->frames ||
+        !images->signatures || images->num_frames <= 0)
+        return PL_RENDERER_PREPARE_INVALID;
+    const struct pl_mixer_requirements *q = pl_mixer_get_requirements(mixer);
+    if (snapshot->mode != PL_RENDERER_PREPARE_ASYNC || snapshot->params->disable_fbos ||
+        images->num_frames > MAX_MIX_FRAMES || images->num_frames > q->max_frames ||
+        images->num_frames < q->min_frames || q->format->num_components != 4 ||
+        !(q->format->caps & PL_FMT_CAP_SAMPLEABLE) || !(q->format->caps & PL_FMT_CAP_RENDERABLE))
+        return PL_RENDERER_PREPARE_UNSUPPORTED;
+    if (linear_mixer_input(snapshot->params) != (q->domain == PL_MIXER_COLOR_LINEAR))
+        return PL_RENDERER_PREPARE_INVALID;
+    // A cache-space image currently has no source rotation metadata. Reject
+    // rotated sources until that layout is represented explicitly in this API.
+    for (int i = 0; i < images->num_frames; i++) {
+        if (!images->frames[i]) return PL_RENDERER_PREPARE_INVALID;
+        if (pl_rotation_normalize(images->frames[i]->rotation))
+            return PL_RENDERER_PREPARE_UNSUPPORTED;
+    }
+    pl_renderer_mixer m = pl_zalloc_ptr(NULL, m);
+    m->mixer = mixer;
+    pl_mixer_retain(mixer);
+    m->requirements = *q;
+    m->target_lut = target->lut;
+    m->target_lut_signature = target->lut ? target->lut->signature : 0;
+    m->target_lut_type = target->lut_type;
+    m->target_icc = target->icc;
+    pl_renderer_preparation p = pl_zalloc_ptr(NULL, p);
+    m->graph = p;
+    p->snapshot = *snapshot;
+    snapshot->retain(snapshot->owner);
+    p->rr = pl_renderer_create(rr->log, rr->gpu);
+    p->mix = true;
+    p->sources = pl_zalloc(p, images->num_frames * sizeof(*p->sources));
+    enum pl_renderer_prepare_result result = PL_RENDERER_PREPARE_OK;
+    for (int i = 0; i < images->num_frames; i++) {
+        result = describe_image_external(p->rr, images->frames[i], target, snapshot,
+            &p->sources[i], true, images->signatures[i], true, 0, q);
+        if (result != PL_RENDERER_PREPARE_OK) goto error;
+        p->num_sources++;
+        const struct cached_frame *f = &p->sources[i]->mix_frame;
+        if (!f->prepared_tex || p->sources[i]->mix_direct) {
+            result = PL_RENDERER_PREPARE_UNSUPPORTED; goto error;
+        }
+        if (i && (f->prepared_tex->params.w != m->output.params.w ||
+                  f->prepared_tex->params.h != m->output.params.h)) {
+            result = PL_RENDERER_PREPARE_UNSUPPORTED; goto error;
+        }
+        if (!i) {
+            m->output = *f->prepared_tex;
+            m->mixed = *f;
+        }
+        m->allocations[i] = mixer_next_identity();
+    }
+    m->output.texture = NULL;
+    m->output_metadata.params = m->output.params;
+    m->output_metadata.sampler_type = m->output.sampler_type;
+    m->mixed.prepared_tex = &m->output;
+    m->mixed.comps = 4;
+    // Keep the first source's inferred color metadata for output hook mapping
+    // arguments, while the sampled image remains the already-rendered cache.
+    struct pass_state reference = {
+        .rr = p->rr, .preparation = p->sources[0], .params = snapshot->params,
+        .image = *images->frames[0], .target = *target,
+    };
+    if (!pass_init(&reference, false)) {
+        pass_uninit(&reference);
+        result = PL_RENDERER_PREPARE_INVALID; goto error;
+    }
+    struct pl_color_space source_color = reference.image.color;
+    pass_uninit(&reference);
+    m->image = (struct pl_frame) {
+        .num_planes = 1,
+        .planes = {{.texture = &m->output_metadata, .components = 4,
+                    .component_mapping = {0, 1, 2, 3}}},
+        .repr = {.sys = PL_COLOR_SYSTEM_RGB, .levels = PL_COLOR_LEVELS_PC,
+                 .alpha = PL_ALPHA_PREMULTIPLIED},
+        .color = source_color,
+    };
+    const float weight = 1.0f;
+    result = temporal_output(p, &m->image, target, &m->mixed, &weight, 1, 1.0f);
+    if (result != PL_RENDERER_PREPARE_OK) goto error;
+    m->request.output_allocation_id = mixer_next_identity();
+    *out = m;
+    return PL_RENDERER_PREPARE_OK;
+error:
+    pl_renderer_mixer_destroy(&m);
+    return result;
+}
+enum pl_renderer_prepare_result pl_renderer_mixer_stage(pl_renderer_mixer m)
+{
+    if (!m || m->graph->submitted || m->output.texture ||
+        m->graph->result != PL_RENDERER_PREPARE_OK) return PL_RENDERER_PREPARE_INVALID;
+    m->output.texture = pl_tex_create(m->graph->rr->gpu, &m->output.params);
+    if (!m->output.texture) {
+        prepare_fail(m->graph, PL_RENDERER_PREPARE_FAILED, "external mixer output allocation failed");
+        return PL_RENDERER_PREPARE_FAILED;
+    }
+    m->mixed.tex = m->output.texture;
+    return pl_renderer_prepare_submit(m->graph);
+}
+enum pl_pass_prepare_state pl_renderer_mixer_prepare_poll(pl_renderer_mixer m)
+{
+    return m ? pl_renderer_prepare_poll(m->graph) : PL_PASS_PREPARE_FAILED;
+}
+static bool mixer_target_configuration_matches(pl_renderer_mixer m, const struct pl_frame *target)
+{
+    return target->lut == m->target_lut && target->lut_type == m->target_lut_type &&
+        (target->lut ? target->lut->signature : 0) == m->target_lut_signature &&
+        target->icc == m->target_icc;
+}
+enum pl_mixer_status pl_renderer_mixer_begin(pl_renderer_mixer m,
+    const struct pl_frame_mix *images, const double *source_pts, double pts,
+    uint64_t epoch, const struct pl_frame *target)
+{
+    if (!m || !images || !source_pts || !target || !images->frames ||
+        !images->signatures || !isfinite(pts)) return PL_MIXER_INVALID;
+    if (m->active || m->leases) return PL_MIXER_BUSY;
+    if (!mixer_target_configuration_matches(m, target)) return PL_MIXER_INVALID;
+    pl_renderer_preparation p = m->graph;
+    if (images->num_frames < m->requirements.min_frames ||
+        images->num_frames > m->requirements.max_frames || images->num_frames > p->num_sources)
+        return PL_MIXER_INVALID;
+    enum pl_pass_prepare_state ready = pl_renderer_prepare_poll(p);
+    if (ready != PL_PASS_PREPARE_READY)
+        return ready == PL_PASS_PREPARE_PENDING ? PL_MIXER_PENDING : PL_MIXER_FAILED;
+    unsigned past = 0, future = 0;
+    for (int i = 0; i < images->num_frames; i++) {
+        if (!images->frames[i] || !isfinite(source_pts[i]) ||
+            (i && source_pts[i] <= source_pts[i - 1])) return PL_MIXER_INVALID;
+        if (pl_rotation_normalize(images->frames[i]->rotation)) return PL_MIXER_UNSUPPORTED;
+        past += source_pts[i] < pts;
+        future += source_pts[i] > pts;
+    }
+    if (past != m->requirements.past_frames || future != m->requirements.future_frames)
+        return PL_MIXER_INVALID;
+    // Cache comparisons must use the same inferred target metadata as source
+    // rendering. Raw unspecified HDR fields otherwise force source acquisition
+    // again even when the prepared cache contains the required frame.
+    struct pass_state probe = {
+        .rr = p->rr, .preparation = p, .params = p->snapshot.params,
+        .image = *images->frames[0], .target = *target,
+    };
+    if (!pass_init(&probe, false)) {
+        pass_uninit(&probe); return PL_MIXER_INVALID;
+    }
+    struct pl_frame normalized_target = probe.target;
+    struct pl_color_space source_color = probe.image.color;
+    pass_uninit(&probe);
+    // Source-only graphs use target metadata, never the destination image.
+    // Acquire the actual presentation destination only when finish consumes it.
+    normalized_target.acquire = NULL;
+    normalized_target.release = NULL;
+    target = &normalized_target;
+    if (!m->have_epoch || m->epoch != epoch) {
+        for (int i = 0; i < p->num_sources; i++) p->sources[i]->mix_valid = false;
+        m->epoch = epoch; m->have_epoch = true;
+    }
+    // Reserve cache hits before assigning miss slots. Never overwrite a cache
+    // slot while an external request owns it (active/leases checked above).
+    int slots[MAX_MIX_FRAMES]; bool used[MAX_MIX_FRAMES] = {0};
+    for (int i = 0; i < images->num_frames; i++) {
+        slots[i] = -1;
+        for (int j = 0; j < p->num_sources; j++) {
+            if (!used[j] && p->sources[j]->mix_valid &&
+                p->sources[j]->mix_signature == images->signatures[i]) {
+                slots[i] = j; used[j] = true; break;
+            }
+        }
+    }
+    for (int i = 0; i < images->num_frames; i++) {
+        if (slots[i] < 0) {
+            for (int j = 0; j < p->num_sources; j++) {
+                if (used[j]) continue;
+                if (preflight_image(p->sources[j], images->frames[i], target,
+                                    images->signatures[i]) == PL_RENDERER_PREPARE_OK) {
+                    slots[i] = j; used[j] = true; break;
+                }
+            }
+        }
+        if (slots[i] < 0) return PL_MIXER_INVALID;
+        enum pl_renderer_prepare_result result = preflight_image(p->sources[slots[i]],
+            images->frames[i], target, images->signatures[i]);
+        if (result != PL_RENDERER_PREPARE_OK) return mixer_prepare_status(result);
+    }
+    // Validate output before executing any source graph.
+    m->image.color = source_color;
+    enum pl_renderer_prepare_result result = mixer_output(m, target, false);
+    if (result != PL_RENDERER_PREPARE_OK) return mixer_prepare_status(result);
+    for (int i = 0; i < images->num_frames; i++) {
+        int slot = slots[i];
+        pl_renderer_preparation source = p->sources[slot];
+        bool hit = source->mix_valid && source->mix_signature == images->signatures[i] &&
+                   cache_color_equal(&source->mix_frame, target, p->snapshot.params);
+        source->frame_index = p->frame_index;
+        result = render_image_prepared(source, images->frames[i], target, images->signatures[i]);
+        if (result != PL_RENDERER_PREPARE_OK) return mixer_prepare_status(result);
+        p->frame_index = source->frame_index;
+        if (!hit) m->contents[slot] = mixer_next_identity();
+        const struct cached_frame *f = &source->mix_frame;
+        m->inputs[i] = (struct pl_mixer_frame) {
+            .texture = f->prepared_tex->texture, .pts = source_pts[i],
+            .content_id = m->contents[slot], .allocation_id = m->allocations[slot],
+        };
+        if (!i) {
+            m->mixed.color = f->color;
+            m->mixed.target_color = f->target_color;
+            m->mixed.profile = target->profile;
+            m->image.color = source_color;
+        }
+    }
+    m->request = (struct pl_mixer_job_params) {
+        .epoch = epoch, .pts = pts, .frames = m->inputs, .num_frames = images->num_frames,
+        .output = m->output.texture, .output_allocation_id = m->request.output_allocation_id,
+        .color = m->mixed.color, .alpha = PL_ALPHA_PREMULTIPLIED,
+        .owner = m, .retain = mixer_lease, .release = mixer_unlease,
+    };
+    m->active = true;
+    m->submitted = false;
+    m->status = PL_MIXER_INVALID; // prepared, not yet submitted
+    return PL_MIXER_OK;
+}
+enum pl_mixer_status pl_renderer_mixer_submit(pl_renderer_mixer m)
+{
+    if (!m || !m->active || m->submitted)
+        return PL_MIXER_INVALID;
+    m->submitted = true;
+    m->status = pl_mixer_submit(m->mixer, &m->request, &m->job);
+    return m->status;
+}
+enum pl_mixer_status pl_renderer_mixer_poll(pl_renderer_mixer m)
+{
+    if (!m || !m->active || !m->job) return PL_MIXER_INVALID;
+    m->status = pl_mixer_poll(m->job);
+    return m->status;
+}
+enum pl_mixer_status pl_renderer_mixer_discard(pl_renderer_mixer m)
+{
+    if (!m || !m->active) return PL_MIXER_INVALID;
+    if (m->job) {
+        enum pl_mixer_status s = pl_mixer_job_destroy(&m->job);
+        if (s != PL_MIXER_OK) return s;
+    }
+    if (m->leases) return PL_MIXER_BUSY;
+    m->active = false;
+    return PL_MIXER_OK;
+}
+static bool mixer_target_matches(pl_renderer_mixer m, const struct pl_frame *target)
+{
+    struct pass_state pass = {
+        .rr = m->graph->rr, .preparation = m->graph,
+        .params = m->graph->snapshot.params, .image = m->image, .target = *target,
+    };
+    bool ok = mixer_target_configuration_matches(m, target) && pass_init(&pass, false) &&
+        cache_color_equal(&m->mixed, &pass.target, pass.params) &&
+        pl_icc_profile_equal(&m->mixed.profile, &pass.target.profile);
+    pass_uninit(&pass);
+    return ok;
+}
+enum pl_mixer_status pl_renderer_mixer_finish(pl_renderer_mixer m, const struct pl_frame *target)
+{
+    if (!m || !target || !m->active || !m->job) return PL_MIXER_INVALID;
+    if (m->status != PL_MIXER_OK) return m->status;
+    if (m->leases > 1) return PL_MIXER_BUSY;
+    if (!mixer_target_matches(m, target)) return PL_MIXER_INVALID;
+    enum pl_renderer_prepare_result result = mixer_output(m, target, false);
+    if (result != PL_RENDERER_PREPARE_OK) return mixer_prepare_status(result);
+    struct pass_state access = {.rr = m->graph->rr, .target = *target};
+    if (!acquire_frame(&access, &access.target, &access.acquired.target)) {
+        pass_uninit(&access); return PL_MIXER_FAILED;
+    }
+    // Recheck acquisition changes before output GPU work.
+    if (!mixer_target_matches(m, &access.target)) {
+        pass_uninit(&access); return PL_MIXER_INVALID;
+    }
+    result = mixer_output(m, &access.target, false);
+    if (result == PL_RENDERER_PREPARE_OK) result = mixer_output(m, &access.target, true);
+    pass_uninit(&access);
+    if (result != PL_RENDERER_PREPARE_OK) return mixer_prepare_status(result);
+    return pl_renderer_mixer_discard(m);
+}
+enum pl_mixer_status pl_renderer_mixer_destroy(pl_renderer_mixer *ptr)
+{
+    if (!ptr || !*ptr) return PL_MIXER_INVALID;
+    pl_renderer_mixer m = *ptr;
+    if (m->active || m->leases || m->job) return PL_MIXER_BUSY;
+    pl_tex_destroy(m->graph->rr->gpu, &m->output.texture);
+    pl_renderer_prepare_destroy(&m->graph);
+    pl_mixer_release(m->mixer);
+    pl_free(m); *ptr = NULL;
+    return PL_MIXER_OK;
 }

@@ -162,7 +162,12 @@ PL_API const struct pl_mixer_descriptor *pl_mixer_registry_get(pl_mixer_registry
 PL_API enum pl_mixer_status pl_mixer_create(pl_mixer_registry, const char *id,
     pl_gpu, const struct pl_mixer_config *, pl_mixer *out);
 PL_API const struct pl_mixer_requirements *pl_mixer_get_requirements(pl_mixer);
-// BUSY preserves the instance until all jobs have been released.
+// Retained renderer integrations use these paired references. Each retain must
+// have one release; the original owner still calls destroy after references end.
+PL_API pl_gpu pl_mixer_get_gpu(pl_mixer);
+PL_API void pl_mixer_retain(pl_mixer);
+PL_API void pl_mixer_release(pl_mixer);
+// BUSY preserves the instance until all jobs and retained owners have released.
 PL_API enum pl_mixer_status pl_mixer_destroy(pl_mixer *);
 PL_API enum pl_mixer_status pl_mixer_submit(pl_mixer,
     const struct pl_mixer_job_params *, pl_mixer_job *out);
@@ -174,7 +179,8 @@ PL_API enum pl_mixer_status pl_mixer_job_destroy(pl_mixer_job *);
 // supplied gpu/textures. CUDA implementations use exportable texture storage
 // and external semaphores through those same Vulkan APIs. CUDA imports, streams,
 // device matching, layout conversion and handle duplication belong to the plugin.
-// This API does not load libraries, select queue frames, or expose renderer caches.
+// This lifecycle API does not load libraries or select queue frames. The
+// pl_renderer_mixer API in renderer.h supplies prepared renderer cache integration.
 // Plugins must end imported-resource lifetimes before releasing the owning
 // job, or explicitly retain its owner for the entire longer import lifetime.
 // Completion must leave no semaphore dependency referencing an object about

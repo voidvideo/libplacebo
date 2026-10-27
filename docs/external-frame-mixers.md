@@ -1,11 +1,11 @@
 # External frame mixer C interface
 
-This is the first implementation of the external implementation lifecycle.
-The public contract is in [frame_mixer.h](../src/include/libplacebo/frame_mixer.h).
-It supplies registration, enumeration, configuration negotiation, and retained
-asynchronous jobs. It does **not yet connect to the renderer's internal frame
-cache or select an external implementation through `pl_render_params`**.
-Existing rendering behavior is unchanged.
+The public contract in [frame_mixer.h](../src/include/libplacebo/frame_mixer.h)
+supplies registration, configuration negotiation, and retained asynchronous jobs.
+The adapter in [renderer.h](../src/include/libplacebo/renderer.h) connects those
+jobs to prepared source caches and the renderer's color-finishing stage.
+The application loads modules and supplies the exact source window. Existing
+`pl_render_image_mix` calls continue to use their ordinary filter path.
 
 ## Load and control an implementation
 
@@ -73,9 +73,69 @@ polling; consumer-side GPU dependency chaining is not implemented here.
 
 Destroying a pending job returns `BUSY` and preserves the job. After terminal
 completion, job destruction calls the implementation's ticket cleanup, then
-releases the resource owner. Instance destruction refuses live jobs; unregister
+releases the resource owner. Instance destruction refuses live jobs and retained adapter owners; unregister
 refuses live instances; registry destruction refuses live registrations. There
 is no implicit cancellation, wait, retry, or alternate mixer selection.
+
+## Connect jobs to the prepared renderer
+
+Create a `pl_renderer_mixer` for an immutable mixer configuration and renderer
+snapshot. The snapshot must use `PL_RENDERER_PREPARE_ASYNC`, and its mixer color
+domain must match the implementation's negotiated requirements.
+
+1. Call `pl_renderer_mixer_describe` with representative source frames and target.
+   It describes source-cache and output passes without running the mixer.
+2. Call `pl_renderer_mixer_stage` to allocate textures and submit shader preparation.
+   Poll `pl_renderer_mixer_prepare_poll` until ready. A failed preparation is not usable.
+3. Call `pl_renderer_mixer_begin` with the exact source window, source timestamps,
+   requested timestamp, epoch, and target. It renders cache misses and reserves
+   those textures. It does not call the external implementation.
+4. Call `pl_renderer_mixer_submit`. Poll `pl_renderer_mixer_poll` while pending.
+   These callbacks may run on another worker after a serialized ownership handoff.
+5. After `OK`, call `pl_renderer_mixer_finish` on the renderer owner. It acquires
+   the destination, runs the prepared output stage, and releases the request.
+6. Destroy the adapter after all requests and retained resource leases have ended.
+   Then destroy the mixer instance and unload its module through the core lifecycle.
+
+Source timestamps and the requested timestamp are absolute seconds.
+`pl_frame_mix.timestamps` does not participate in this adapter. The application
+selects frames that satisfy the negotiated past/future counts. The adapter does
+not select presentation deadlines or invent missing source frames.
+
+The adapter owns cached rendered textures, a separate output texture, and the
+prepared graph. It borrows source frame descriptors only during describe/begin;
+it does not retain borrowed queue pointers. The caller must maintain the snapshot's
+referenced dependencies and GPU for the adapter lifetime. The first source's
+inferred color metadata supplies the output hook mapping context.
+
+Unchanged source signatures reuse rendered pixels and content IDs. A newly rendered
+source receives a new content ID. Allocation IDs stay stable while those textures
+exist. An epoch change invalidates cached contents. A pending request or longer
+plugin lease prevents the adapter from reusing its textures.
+
+Completed RGB uses the existing completed-frame cache contract. Linear RGB uses
+the explicit linear cache contract and runs deferred color finishing after mixing.
+Both paths reuse the renderer's source and output builders, including their LUT
+placement. The mixer receives the actual cache color metadata and premultiplied
+alpha. Export requirements apply when allocating both cache and output textures.
+
+One request is admitted per adapter. Independent adapters can overlap, including
+old and new immutable configurations. A resize or incompatible target/color
+configuration requires a newly described adapter. Target LUT and ICC configuration
+must remain consistent with the described graph.
+
+`finish` returns `PENDING` without acquiring or writing the target while the job is
+pending. A failed request remains available for explicit `discard`. Discard does
+not cancel GPU work: it returns `BUSY` until pending work and retained leases end.
+A request prepared by `begin` but not submitted can also be discarded. Destruction
+returns `BUSY` while a request or retained lease exists. No alternate output is
+selected when these operations fail.
+
+The current adapter requires sampleable, renderable four-component textures and
+enabled intermediate framebuffers. It supports at most 16 cache slots, with no more
+inputs per request than the initially described source count. Nonzero source
+rotation is explicitly unsupported. It does not add automatic queue selection or
+application configuration-generation management.
 
 ## Backend responsibilities
 
@@ -100,24 +160,21 @@ The plugin may retain a job owner explicitly for a longer import lifetime, but
 must release that reference before final retirement. GPU-only tensor conversions
 are permitted; the interface does not require CPU readback.
 
-These are plugin obligations, not hardware validation results. Current tests
-exercise the C ABI, dynamic loading, validation, and lifetime rules with fixtures.
-They do not execute Vulkan shaders or CUDA inference.
+## Verified scope and remaining integration
 
-## Remaining renderer integration
+`renderer_mixer` loads a separate Vulkan blend module and executes GPU shaders.
+It checks completed and linear RGB, nonlinear target LUT placement, source render
+reuse, allocation/content identities, pending output protection, explicit failure,
+configuration overlap, resize, and resource retirement. Twenty consecutive runs
+passed on an NVIDIA GeForce RTX 5070. This is a correctness fixture with small
+textures, not a 4K throughput or fullscreen playback benchmark.
 
-The next implementation must connect this lifecycle to the prepared renderer:
+The prepared-render numerical regression also passed with the installed Vulkan
+validation layer disabled. That is not validation-layer coverage. The queue-plan
+regression still fails at the same assertion in an earlier build; this change does
+not modify that queue implementation.
 
-1. Admit the negotiated source window through the queue and render/cache each
-   source under the selected completed or linear color contract.
-2. Include export requirements in cache allocation and identity. Keep allocations
-   leased across asynchronous jobs without retaining borrowed queue pointers.
-3. Dispatch the external job, preserve its pending state, and consume only its
-   matching completed output before the appropriate color-finishing stage.
-4. Tie instance generations and retirement to Void's existing preparation owner.
-5. Verify an actual external Vulkan implementation and CUDA sharing on hardware.
-
-The existing queue prefix limit does not establish an arbitrary required temporal
-window. The existing prepared-render pending status is not an external job ticket.
-Both connections require explicit implementation; this lifecycle does not pretend
-those integration steps already exist.
+CUDA resource sharing has not been executed on hardware by these tests. Void's
+application-side admission, worker handoff, and configuration retirement still
+need integration. The adapter does not select an external mixer through
+`pl_render_params`, and these changes do not update Void's dependency pin or binaries.

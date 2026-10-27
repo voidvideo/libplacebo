@@ -31,7 +31,7 @@ struct pl_mixer_t {
     void *instance;
     pl_gpu gpu;
     struct pl_mixer_requirements req;
-    unsigned jobs;
+    unsigned jobs, owners;
 };
 struct pl_mixer_job_t {
     pl_mixer mixer;
@@ -145,7 +145,7 @@ const struct pl_mixer_requirements *pl_mixer_get_requirements(pl_mixer m)
 enum pl_mixer_status pl_mixer_destroy(pl_mixer *m)
 {
     if (!m || !*m) return PL_MIXER_INVALID;
-    if ((*m)->jobs) return PL_MIXER_BUSY;
+    if ((*m)->jobs || (*m)->owners) return PL_MIXER_BUSY;
     (*m)->entry->desc.destroy((*m)->instance);
     (*m)->entry->instances--;
     free(*m); *m = NULL;
@@ -220,3 +220,7 @@ enum pl_mixer_status pl_mixer_job_destroy(pl_mixer_job *j)
     free(*j); *j = NULL;
     return PL_MIXER_OK;
 }
+
+pl_gpu pl_mixer_get_gpu(pl_mixer m) { return m ? m->gpu : NULL; }
+void pl_mixer_retain(pl_mixer m) { if (m) m->owners++; }
+void pl_mixer_release(pl_mixer m) { if (m && m->owners) m->owners--; }
