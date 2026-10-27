@@ -269,8 +269,10 @@ struct pl_render_params {
     // Color stages run in fixed order: TONE_MAP, GAMUT_MAP, COLOR_CONVERT;
     // hooks within a stage run in list order. An empty stage keeps its native
     // operation. Color hooks declare explicit color_input/color_output domains.
-    // They run after scaling and before frame caching; ICC/target LUT processing
-    // remains downstream. Descriptors are borrowed during rendering or retained
+    // TONE_MAP and GAMUT_MAP run after scaling and before the linear RGB cache.
+    // COLOR_CONVERT runs after mixing, before target ICC/LUT processing and output
+    // encoding. A render-level conversion LUT overrides this chain, as before.
+    // Descriptors are borrowed during rendering or retained
     // by the preparation snapshot owner. Ordinary hook lifecycle/cache rules apply.
     const struct pl_hook * const *hooks;
     int num_hooks;

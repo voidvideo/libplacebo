@@ -1754,6 +1754,198 @@ static void test_color_lut_prepared(pl_gpu gpu, struct pl_frame image,
     pl_tex_destroy(gpu, &output);
 }
 
+// Count source and output execution independently without auxiliary GPU work.
+static struct pl_hook_res cache_domain_hook(void *priv, const struct pl_hook_params *p)
+{
+    struct snapshot_owner *owner = priv;
+    owner->ordinary++;
+    return (struct pl_hook_res) {
+        .output = PL_HOOK_SIG_COLOR, .sh = p->sh, .repr = p->repr,
+        .color = p->color, .components = p->components, .rect = p->rect,
+    };
+}
+
+static struct pl_hook_prepare_result cache_domain_describe(void *priv,
+    const struct pl_hook_prepare_params *p)
+{
+    return (struct pl_hook_prepare_result) {
+        .status = PL_DISPATCH_OK, .output = PL_HOOK_SIG_COLOR, .sh = p->sh,
+        .repr = p->repr, .color = p->color, .components = p->components, .rect = p->rect,
+    };
+}
+
+static struct pl_hook_prepare_result cache_domain_execute(void *priv,
+    const struct pl_hook_prepare_params *p)
+{
+    struct snapshot_owner *owner = priv;
+    if (p->stage == PL_HOOK_RGB)
+        owner->analysis_executions++;
+    if (p->stage == PL_HOOK_COLOR_CONVERT)
+        owner->output_executions++;
+    return cache_domain_describe(priv, p);
+}
+
+static void test_linear_cache(pl_gpu gpu, bool hdr, bool lut, bool overlay)
+{
+    printf("Linear cache reference: hdr=%d lut=%d overlay=%d\n", hdr, lut, overlay);
+    enum { N = 4 };
+    const float values[] = {hdr ? 2.0f : .25f, hdr ? 4.0f : .75f};
+    const float alpha[] = {lut && !overlay ? .5f : 1.0f, 1.0f};
+    pl_fmt format = pl_find_named_fmt(gpu, "rgba32f");
+    REQUIRE(format);
+    pl_tex textures[2];
+    struct pl_frame inputs[2];
+    for (int i = 0; i < 2; i++) {
+        float pixels[N*N*4];
+        for (int j = 0; j < N*N; j++) {
+            for (int c = 0; c < 3; c++) pixels[j*4+c] = values[i];
+            pixels[j*4+3] = alpha[i];
+        }
+        textures[i] = pl_tex_create(gpu, pl_tex_params(
+            .w = N, .h = N, .format = format, .sampleable = true,
+            .initial_data = pixels));
+        REQUIRE(textures[i]);
+        inputs[i] = frame(textures[i]);
+        inputs[i].color.transfer = hdr ? PL_COLOR_TRC_LINEAR : PL_COLOR_TRC_GAMMA22;
+        inputs[i].color.hdr.max_luma = hdr ? PL_COLOR_SDR_WHITE * 8 : PL_COLOR_SDR_WHITE;
+    }
+    pl_tex output = pl_tex_create(gpu, pl_tex_params(
+        .w = N, .h = N, .format = format, .renderable = true, .host_readable = true));
+    REQUIRE(output);
+    struct pl_frame target = frame(output);
+    target.color = inputs[0].color;
+    float table[24];
+    for (int b = 0; b < 2; b++) for (int g = 0; g < 2; g++) for (int r = 0; r < 2; r++) {
+        int i = 3*(4*b+2*g+r);
+        table[i] = r*g; table[i+1] = g*b; table[i+2] = b*r;
+    }
+    // Trilinear sampling reproduces these cross-products exactly. On gray
+    // pixels this is a square, which does not commute with linear mixing.
+    struct pl_custom_lut calibration = {.signature = 9234, .size = {2,2,2},
+        .data = table, .interpolation = PL_LUT_LINEAR};
+    if (lut) { target.lut = &calibration; target.lut_type = PL_LUT_NORMALIZED; }
+    struct pl_overlay_part part = {
+        .src = {0,0,N,N}, .dst = {0,0,N,N}, .color = {.5f,.5f,.5f,.5f},
+    };
+    // NORMAL avoids using a channel as a glyph mask: the texture contains the
+    // encoded gray and alpha that the CPU composition below accounts for.
+    struct pl_overlay ol = {
+        .tex = textures[1], .mode = PL_OVERLAY_NORMAL,
+        .color = inputs[1].color, .repr = inputs[1].repr,
+        .parts = &part, .num_parts = 1,
+    };
+    if (overlay) {
+        // Use the second source as an opaque source-attached overlay. This
+        // isolates whether calibration runs on that overlay in every path.
+        inputs[0].overlays = &ol; inputs[0].num_overlays = 1;
+    }
+    struct snapshot_owner *owner = new_snapshot(gpu, false);
+    owner->params.background = PL_CLEAR_SKIP;
+    owner->params.dither_params = NULL;
+    owner->params.frame_mixer = &pl_filter_bilinear;
+    owner->params.preserve_mixing_cache = false;
+    owner->params.skip_caching_single_frame = false;
+    struct pl_hook hooks[2] = {
+        {.stages = PL_HOOK_RGB, .input = PL_HOOK_SIG_COLOR,
+         .hook = cache_domain_hook, .describe = cache_domain_describe,
+         .execute_prepared = cache_domain_execute, .priv = owner, .signature = 992},
+        {.stages = PL_HOOK_COLOR_CONVERT, .input = PL_HOOK_SIG_COLOR,
+         .hook = cache_domain_hook, .describe = cache_domain_describe,
+         .execute_prepared = cache_domain_execute, .priv = owner, .signature = 993,
+         .color_input = {.color = target.color}, .color_output = {.color = target.color}},
+    };
+    const struct pl_hook *hook_ptrs[] = {&hooks[0], &hooks[1]};
+    owner->params.hooks = hook_ptrs; owner->params.num_hooks = 2;
+    const struct pl_frame *frames[] = {&inputs[0], &inputs[1]};
+    uint64_t signatures[] = {201,202};
+    float timestamps[] = {-.5f,.5f};
+    struct pl_frame_mix mix = {.num_frames = 2, .frames = frames,
+        .signatures = signatures, .timestamps = timestamps, .vsync_duration = 1};
+    struct pl_renderer_snapshot snapshot = {
+        .params = &owner->params, .owner = owner, .retain = retain, .release = release,
+    };
+    pl_renderer prepared = pl_renderer_create(gpu->log, gpu);
+    pl_renderer ordinary = pl_renderer_create(gpu->log, gpu);
+    pl_renderer_preparation preparation = NULL;
+    REQUIRE(pl_renderer_describe_image_mix(prepared, &mix, &target, &snapshot,
+                                           &preparation) == PL_RENDERER_PREPARE_OK);
+    wait_prepared(preparation);
+    for (int iteration = 0; iteration < 3; iteration++) {
+        forbid_compile = true;
+        REQUIRE(pl_render_image_mix_prepared(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        forbid_compile = false;
+        REQUIRE(owner->analysis_executions == 2);
+        REQUIRE(owner->output_executions == iteration + 1);
+        float actual[N*N*4];
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
+        const float a = overlay ? values[1] : values[0];
+        const float linear_a = hdr ? a : powf(a, 2.2f);
+        const float linear_b = hdr ? values[1] : powf(values[1], 2.2f);
+        float expected = (linear_a*alpha[0] + linear_b*alpha[1]) / (alpha[0]+alpha[1]);
+        if (!hdr) expected = powf(expected, 1.0f/2.2f);
+        if (lut) expected *= expected;
+        for (int path = 0; path < 2; path++) {
+            for (int j = 0; j < N*N; j++) {
+                for (int c = 0; c < 3; c++)
+                    REQUIRE(fabsf(actual[j*4+c] - expected) < .003f);
+                REQUIRE(fabsf(actual[j*4+3] - (alpha[0]+alpha[1])*.5f) < .001f);
+            }
+            if (!path) {
+                REQUIRE(pl_render_image_mix(ordinary, &mix, &target, &owner->params));
+                REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = actual)));
+            }
+        }
+    }
+    if (!hdr && !lut) {
+        // The cache stores linear RGB, but original target transfer remains
+        // part of mapping intent. Its change must rerender both contributors.
+        int calls = owner->ordinary;
+        target.color.transfer = PL_COLOR_TRC_GAMMA28;
+        REQUIRE(pl_render_image_mix(ordinary, &mix, &target, &owner->params));
+        REQUIRE(owner->ordinary == calls + 3);
+        calls = owner->ordinary;
+        REQUIRE(pl_render_image_mix(ordinary, &mix, &target, &owner->params));
+        REQUIRE(owner->ordinary == calls + 1);
+        target.color.transfer = PL_COLOR_TRC_GAMMA22;
+    }
+    pl_renderer_prepare_destroy(&preparation);
+    // A single source must produce the same result with or without the cache.
+    mix.num_frames = 1; timestamps[0] = 0;
+    REQUIRE(pl_renderer_describe_image_mix(prepared, &mix, &target, &snapshot,
+                                           &preparation) == PL_RENDERER_PREPARE_OK);
+    wait_prepared(preparation);
+    float cached[N*N*4], direct[N*N*4];
+    REQUIRE(pl_render_image_mix_prepared(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = cached)));
+    REQUIRE(pl_render_image(ordinary, &inputs[0], &target, &owner->params));
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = direct)));
+    for (int i = 0; i < N*N*4; i++) REQUIRE(fabsf(cached[i] - direct[i]) < .003f);
+    pl_renderer_prepare_destroy(&preparation);
+    if (overlay) {
+        // The same source overlay must enter target ICC exactly once in both
+        // paths, before the display LUT. Reusing its signature must be safe.
+        struct pl_icc_profile profile = TEST_PROFILE(sRGB_v2_nano_icc);
+        pl_icc_object icc = pl_icc_open(gpu->log, &profile, pl_icc_params(
+            .size_r = 8, .size_g = 8, .size_b = 8));
+        REQUIRE(icc);
+        target.icc = icc;
+        REQUIRE(pl_renderer_describe_image_mix(prepared, &mix, &target, &snapshot,
+                                               &preparation) == PL_RENDERER_PREPARE_OK);
+        wait_prepared(preparation);
+        REQUIRE(pl_render_image_mix_prepared(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = cached)));
+        REQUIRE(pl_render_image(ordinary, &inputs[0], &target, &owner->params));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = output, .ptr = direct)));
+        for (int i = 0; i < N*N*4; i++) REQUIRE(fabsf(cached[i] - direct[i]) < .003f);
+        pl_renderer_prepare_destroy(&preparation);
+        pl_icc_close(&icc);
+    }
+    pl_renderer_destroy(&prepared); pl_renderer_destroy(&ordinary);
+    REQUIRE(owner->refs == 1); free(owner);
+    for (int i = 0; i < 2; i++) pl_tex_destroy(gpu, &textures[i]);
+    pl_tex_destroy(gpu, &output);
+}
+
 static void test_native_color(pl_gpu gpu, struct pl_frame image, int peak)
 {
     struct snapshot_owner *owner = new_snapshot(gpu, false);
@@ -2108,6 +2300,10 @@ int main(void)
     for (int direct = 0; direct < 2; direct++)
         for (int present = 0; present < 2; present++)
             test_bt1886_metadata_loss(gpu, frame(source), direct, present);
+    test_linear_cache(gpu, false, false, false);
+    test_linear_cache(gpu, false, true, false);
+    test_linear_cache(gpu, false, true, true);
+    test_linear_cache(gpu, true, false, false);
     test_native_color(gpu, frame(source), false);
     test_native_color(gpu, frame(source), 1);
     test_native_color(gpu, frame(source), 2);
