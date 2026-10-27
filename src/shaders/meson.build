@@ -7,7 +7,6 @@ shader_sources = [
   'film_grain.c',
   'film_grain_av1.c',
   'film_grain_h274.c',
-  'fruc.c',
   'icc.c',
   'lut.c',
   'sampling.c',

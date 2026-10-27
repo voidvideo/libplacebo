@@ -528,8 +528,43 @@ static void caller_selection_intents(void)
     pl_queue_destroy(&queue);
 }
 
+static void bracket_rate_conversion(void)
+{
+    const struct pl_gpu_t gpu = {0};
+    pl_queue queue = pl_queue_create(&gpu);
+    struct sample samples[7] = {0};
+    struct pl_queue_params settings = {.interpolation_threshold = 2.0f};
+    struct pl_queue_plan_cadence cadence = {
+        .source_duration = 1.0f / 24, .output_duration = 1.0f / 60,
+        .intent = PL_QUEUE_PLAN_INTENT_BRACKET,
+    };
+    push(queue, &samples[0], 0, cadence.source_duration, PL_FIELD_NONE);
+    pl_queue_plan plan = NULL;
+    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+    assert(pl_queue_plan_get_info(plan)->support_radius == cadence.source_duration);
+    assert(pl_queue_plan_set_target(plan, 1.0 / 60) == PL_QUEUE_PLAN_PENDING);
+    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
+    pl_queue_plan_destroy(&plan);
+    for (int n = 1; n < PL_ARRAY_SIZE(samples); n++)
+        push(queue, &samples[n], n / 24.0, cadence.source_duration, PL_FIELD_NONE);
+    // Preserve the generic queue coverage formerly exercised by FRUC.
+    for (int tick = 0; tick < 15; tick++) {
+        float t = (tick * 2 % 5) / 5.0f;
+        struct pl_frame_mix mix;
+        assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
+        assert(pl_queue_plan_set_target(plan, tick / 60.0) == PL_QUEUE_PLAN_READY);
+        assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
+        assert(mix.num_frames == (t == 0.0f ? 1 : 2));
+        if (mix.num_frames == 2)
+            assert(fabsf(-mix.timestamps[0] / (mix.timestamps[1] - mix.timestamps[0]) - t) < 1e-6);
+        pl_queue_plan_destroy(&plan);
+    }
+    pl_queue_destroy(&queue);
+}
+
 int main(void)
 {
+    bracket_rate_conversion();
     caller_selection_intents();
     declared_cadence();
     declared_invalid_and_threshold();

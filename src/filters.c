@@ -614,12 +614,7 @@ const struct pl_filter_function pl_filter_function_oversample = {
     .opaque  = true,
 };
 
-const struct pl_filter_function pl_filter_function_fruc = {
-    .name = "fruc", .weight = oversample, .radius = 1.0, .opaque = true,
-};
-
 const struct pl_filter_function * const pl_filter_functions[] = {
-    &pl_filter_function_fruc,
     &pl_filter_function_box,
     &filter_function_dirichlet, // alias
     &pl_filter_function_triangle,
@@ -936,11 +931,6 @@ const struct pl_filter_config pl_filter_ewa_robidouxsharp = {
     .allowed     = PL_FILTER_SCALING,
 };
 
-const struct pl_filter_config pl_filter_fruc = {
-    .name = "fruc", .description = "NVIDIA optical flow (FFmpeg FRUC)",
-    .kernel = &pl_filter_function_fruc, .allowed = PL_FILTER_FRAME_MIXING,
-};
-
 const struct pl_filter_config pl_filter_oversample = {
     .name        = "oversample",
     .description = "Oversampling",
@@ -968,7 +958,6 @@ const struct pl_filter_config * const pl_filter_configs[] = {
     &pl_filter_hermite,
     &pl_filter_gaussian,
     &pl_filter_oversample,
-    &pl_filter_fruc,
     &pl_filter_mitchell,
     &pl_filter_mitchell_clamp,
     &pl_filter_sinc,

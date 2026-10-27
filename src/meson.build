@@ -72,7 +72,6 @@ headers = [
   'shaders/deinterlacing.h',
   'shaders/dithering.h',
   'shaders/film_grain.h',
-  'shaders/fruc.h',
   'shaders/icc.h',
   'shaders/lut.h',
   'shaders/sampling.h',
