@@ -191,7 +191,7 @@ is incompatible with the 20261020 SDK. Set `sdk` to the extracted SDK directory
 and `rife` to the upstream checkout:
 
 ```sh
-g++ -std=c++17 -O3 -fopenmp tools/fruc-ui/ncnn_resident.cpp "$rife/RIFE/warp.cpp" -I"$rife/RIFE" -I"$sdk/include/ncnn" -L"$sdk/lib" -Wl,-rpath,"$sdk/lib" -lncnn -o /path/to/ncnn-resident
+g++ -std=c++17 -O3 -fopenmp -pthread tools/fruc-ui/ncnn_resident.cpp "$rife/RIFE/warp.cpp" -I"$rife/RIFE" -I"$sdk/include/ncnn" -L"$sdk/lib" -Wl,-rpath,"$sdk/lib" -lncnn -o /path/to/ncnn-resident
 /path/to/ncnn-resident /path/to/model /path/to/pair.f32 /path/to/output.f32 /path/to/results/resident/model/run.json
 ```
 
@@ -209,3 +209,53 @@ that the benchmark produced a finite image.
 The SDK and prebuilt plugin are distinct builds. Report their measurements
 separately; their difference cannot be attributed solely to transfer costs.
 Neither test establishes live playback performance or authorizes integration.
+
+## GPU-resident TensorRT and concurrent Vulkan speed tests
+
+`bench_trt_4k.py` tests the upstream V2 ONNX exports linked by SVP. It enables
+TensorRT FP16, disables TF32, uses CUDA graphs and accepts one to three concurrent
+execution streams. Each stream owns an execution context and output buffer.
+Input buffers for all four fractional timestamps are uploaded before timing.
+Eight inferences are queued per stream per batch, then all streams synchronize.
+Throughput counts completed generated frames over total elapsed wall time.
+No input upload, output readback, model loading or engine compilation is timed.
+
+Use a separate test environment with `tensorrt-cu13==10.16.1.11`,
+`cuda-python==13.4.4` and NumPy. The recorded model archives are from
+[vs-mlrt's external models release](https://github.com/AmusementClub/vs-mlrt/releases/tag/external-models).
+Select `rife_v2/rife_v4.4.onnx`, `rife_v4.6.onnx`, `rife_v4.25_lite.onnx` or
+`rife_v4.25.onnx`. These V2 exports accept seven input channels and handle padding
+internally. Preserve native 3840×2160 input and output dimensions.
+
+Build each engine once, then run each stream count in a separate process:
+
+```sh
+python tools/fruc-ui/bench_trt_4k.py /path/to/model.onnx /path/to/pair.f32 /path/to/model.plan /path/to/results/builds/model --build
+python tools/fruc-ui/bench_trt_4k.py /path/to/model.onnx /path/to/pair.f32 /path/to/model.plan /path/to/results/tensorrt/model-s1 --streams 1
+python tools/fruc-ui/bench_trt_4k.py /path/to/model.onnx /path/to/pair.f32 /path/to/model.plan /path/to/results/tensorrt/model-s2 --streams 2
+python tools/fruc-ui/bench_trt_4k.py /path/to/model.onnx /path/to/pair.f32 /path/to/model.plan /path/to/results/tensorrt/model-s3 --streams 3
+python tools/fruc-ui/report_gpu_speed.py /path/to/results
+```
+
+Each output directory must be new. Engine builds use optimization level 3, a
+4 GiB workspace limit and a fixed 4K optimization profile. The harness applies
+the upstream V2 FP32 constraints to floating-point layers; integer shape/index
+layers retain their required types. Build failures are explicit and do not
+produce timing results. Model files and weights remain unchanged.
+
+For concurrent ncnn/Vulkan tests, compile `ncnn_resident.cpp` with `-pthread` in
+addition to the flags above. Its optional fifth argument selects 1, 2 or 3
+independent computation workers. Workers share model weights and resident inputs,
+use separate allocators, warm up before a common start signal, and submit and
+wait independently. Example:
+
+```sh
+/path/to/ncnn-resident /path/to/model /path/to/pair.f32 /path/to/output.f32 /path/to/results/ncnn/model-t2/run.json 2
+```
+
+Run all GPU engine builds and speed tests sequentially. Both backends run for at
+least fifteen seconds after warmup. A final readback checks only that execution
+produced a finite, nonconstant image. This speed suite does not evaluate quality.
+The two backends use different upstream exports and enqueue strategies; results
+compare the recorded configurations, not an isolated compiler change. Passing
+throughput does not verify libplacebo integration or live playback latency.

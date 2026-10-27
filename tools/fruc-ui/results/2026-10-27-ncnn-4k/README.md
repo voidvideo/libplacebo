@@ -1,5 +1,8 @@
 # Native 4K ncnn/Vulkan speed test
 
+Follow-up: [TensorRT and concurrent Vulkan speed tests](../2026-10-27-gpu-speed/README.md)
+include a TensorRT configuration that meets the 48 generated frames/s target.
+
 On this RTX 5070, the fastest tested serial GPU-resident graph was RIFE 4.4 at
 17.79 generated frames/s. Exact 3840×2160, 24→60 conversion requires 48 generated
 frames/s: twelve of the sixty output timestamps coincide with source frames.
