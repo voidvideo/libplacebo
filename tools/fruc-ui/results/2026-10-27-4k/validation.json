@@ -1,0 +1,44 @@
+{
+  "rife425-full": {
+    "status": "passed",
+    "scenes": 6,
+    "scored_frames": 288,
+    "saved_candidate_frames": 72,
+    "saved_reference_frames": 72
+  },
+  "rife425-half": {
+    "status": "passed",
+    "scenes": 6,
+    "scored_frames": 288,
+    "saved_candidate_frames": 72,
+    "saved_reference_frames": 72
+  },
+  "rife425-half-fp16": {
+    "status": "passed",
+    "scenes": 6,
+    "scored_frames": 288,
+    "saved_candidate_frames": 72,
+    "saved_reference_frames": 72
+  },
+  "rife425-lite-full": {
+    "status": "passed",
+    "scenes": 6,
+    "scored_frames": 288,
+    "saved_candidate_frames": 72,
+    "saved_reference_frames": 72
+  },
+  "rife425-lite-half": {
+    "status": "passed",
+    "scenes": 6,
+    "scored_frames": 288,
+    "saved_candidate_frames": 72,
+    "saved_reference_frames": 72
+  },
+  "rife425-lite-half-fp16": {
+    "status": "passed",
+    "scenes": 6,
+    "scored_frames": 288,
+    "saved_candidate_frames": 72,
+    "saved_reference_frames": 72
+  }
+}

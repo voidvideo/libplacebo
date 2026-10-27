@@ -1,0 +1,11 @@
+{
+  "practical_rife_revision": "bbfd2ea90910789a860ea3e2b32a240cd577b75e",
+  "lite_download": "https://drive.google.com/file/d/1zlKblGuKNatulJNFf5jdB-emp9AqGK05/view",
+  "full_download": "https://drive.google.com/file/d/1ZKjcbmt1hypiFprJPIKW0Tt0lr_2i7bg/view",
+  "archives": {
+    "rife425.zip": "e63d481b7ae5d4a4e6ad7ac5b410ff78f3bf7be3b51b2e38ca8152747abde5b4",
+    "rife425-lite.zip": "e84366c23e0eb1a637a55aad2e4f3442ec2bf4c388043b4aabbf590be289e6e8"
+  },
+  "packages": "anyio==4.15.1\nbeautifulsoup4==4.15.0\ncertifi==2026.10.23\ncharset-normalizer==3.5.2\nclick==8.5.0\ncuda-pathfinder==1.8.4\ncupy-cuda12x==14.2.0\neasydict==1.13\neinops==0.8.2\nfilelock==4.2.4\nfsspec==2026.9.0\ngdown==6.4.2\nh11==0.16.0\nhf-xet==1.7.0\nhttpcore2==2.16.0\nhttpx2==2.16.0\nhuggingface-hub==2.3.0\nidna==3.20\njinja2==3.1.6\nmarkupsafe==3.0.4\nmpmath==1.3.0\nnetworkx==3.6.1\nnumpy==2.4.6\nnvidia-cublas-cu12==12.8.3.14\nnvidia-cuda-cupti-cu12==12.8.57\nnvidia-cuda-nvrtc-cu12==12.8.61\nnvidia-cuda-runtime-cu12==12.8.57\nnvidia-cudnn-cu12==9.7.1.26\nnvidia-cufft-cu12==11.3.3.41\nnvidia-cufile-cu12==1.13.0.11\nnvidia-curand-cu12==10.3.9.55\nnvidia-cusolver-cu12==11.7.2.55\nnvidia-cusparse-cu12==12.5.7.53\nnvidia-cusparselt-cu12==0.6.3\nnvidia-nccl-cu12==2.26.2\nnvidia-nvjitlink-cu12==12.8.61\nnvidia-nvtx-cu12==12.8.55\nomegaconf==2.4.0\nopencv-python-headless==5.0.0.93\npackaging==26.3\npillow==13.0.0\npysocks==1.7.1\npyyaml==6.0.3\nrequests==2.34.2\nsafetensors==0.8.0\nscipy==1.17.1\nsetuptools==84.2.1\nsoupsieve==3.0.4\nsympy==1.14.0\ntimm==0.6.13\ntorch @ https://download.pytorch.org/whl/cu128/torch-2.7.1%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl\ntorchvision @ https://download.pytorch.org/whl/cu128/torchvision-0.22.1%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl\ntqdm==4.70.1\ntriton==3.3.1\ntruststore==0.10.5\ntyping-extensions==4.16.0\nurllib3==2.8.0\nyacs==0.1.8\n",
+  "framework_commit": "e459c11d470b57cc0609e6609205f30b1352c48e"
+}
