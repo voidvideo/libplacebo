@@ -91,6 +91,64 @@ static void optical_flow_test(pl_gpu gpu, pl_dispatch dp)
 
 static void snapshot_ref(void *owner) { (void) owner; }
 
+static void ui_motion_test(pl_gpu gpu, pl_dispatch dp)
+{
+    enum { W = 128, H = 16 };
+    float pixels[2][H][W][4], result[H][W][4];
+    int16_t vectors[2][H][W][2];
+    struct pl_fruc_source src = {.width = W, .height = H, .t = 0.5f};
+    pl_tex frames[2] = {0}, flows[2] = {0};
+    pl_tex out = pl_tex_create(gpu, pl_tex_params(.w=W, .h=H,
+        .format=pl_find_named_fmt(gpu, "rgba32f"), .storable=true,
+        .renderable=true, .host_readable=true));
+    REQUIRE(out);
+    for (int test = 0; test < 2; test++) {
+        for (int f = 0; f < 2; f++) {
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+                // Repeated UI strokes move 48 pixels. At x=28 both endpoints
+                // show background, but the intermediate frame shows a stroke.
+                float value = test ? (float)(x - f * 4) / W :
+                    (((x - f * 48 + 128) % 32) < 8 ? 1.0f : 0.0f);
+                for (int c = 0; c < 3; c++) pixels[f][y][x][c] = value;
+                pixels[f][y][x][3] = 1;
+                vectors[f][y][x][0] = (test ?
+                    (f ? (x >= 41 ? -4 : 20) : 4) : (f ? -48 : 48)) * 32;
+                vectors[f][y][x][1] = 0;
+            }
+            REQUIRE(pl_tex_recreate(gpu, &frames[f], pl_tex_params(.w=W, .h=H,
+                .format=pl_find_named_fmt(gpu, "rgba32f"),
+                .sampleable=true, .host_writable=true)));
+            REQUIRE(pl_tex_recreate(gpu, &flows[f], pl_tex_params(.w=W, .h=H,
+                .format=pl_find_fmt(gpu, PL_FMT_SINT, 2, 16, 16, PL_FMT_CAP_SAMPLEABLE),
+                .sampleable=true, .host_writable=true)));
+            REQUIRE(pl_tex_upload(gpu, pl_tex_transfer_params(.tex=frames[f], .ptr=pixels[f])));
+            REQUIRE(pl_tex_upload(gpu, pl_tex_transfer_params(.tex=flows[f], .ptr=vectors[f])));
+            src.frames[f] = texture(frames[f]);
+            src.flow[f] = texture(flows[f]);
+        }
+        pl_shader sh = pl_dispatch_begin(dp);
+        pl_shader_fruc_interpolate(sh, &src);
+        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader=&sh, .target=out)));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=out, .ptr=result)));
+        for (int y = 0; y < H; y++) {
+            if (!test) {
+                REQUIRE(fabsf(result[y][28][0] - 1.0f) < 0.001f);
+            } else {
+                // The forward trajectory agrees with its reverse. The other
+                // inverse trajectory enters inconsistent motion and must not
+                // receive equal weight. Ground truth is a two-pixel shift.
+                REQUIRE(fabsf(result[y][40][0] - 38.0f / W) < 0.002f);
+            }
+        }
+    }
+    for (int f = 0; f < 2; f++) {
+        pl_tex_destroy(gpu, &frames[f]);
+        pl_tex_destroy(gpu, &flows[f]);
+    }
+    pl_tex_destroy(gpu, &out);
+    printf("FRUC repeated UI motion and inconsistent-vector tests passed\n");
+}
+
 static struct pl_frame rgb_frame(pl_tex tex)
 {
     return (struct pl_frame) {
@@ -242,6 +300,7 @@ int main(void)
     pl_gpu gpu = vk->gpu;
     pl_dispatch dp = pl_dispatch_create(log, gpu);
     optical_flow_test(gpu, dp);
+    ui_motion_test(gpu, dp);
     renderer_test(gpu);
     enum { W = 64, H = 8, PAD = 4 };
     float pixels[2][H][W+PAD][4], result[H][W][4];

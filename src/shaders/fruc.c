@@ -5,7 +5,8 @@
  * at 9d2d5b1aa39a714ad92cd3dd0253bd3aa7ee8be7.
  * Adaptations: packed RGB mixer inputs, libplacebo shader bindings and output,
  * metadata-only preparation, and separate grayscale dispatches per input.
- * The motion reconstruction and static-region guard retain upstream behavior.
+ * Motion consistency weights and validation of the static-region guard extend
+ * the upstream reconstruction. These are local experimental quality changes.
  *
  * This file is part of libplacebo.
  *
@@ -98,6 +99,14 @@ void pl_shader_fruc_interpolate(pl_shader sh, const struct pl_fruc_source *src)
             return;
     }
     ident_t fn = sh_fresh(sh, "fruc_interpolate");
+    // Validate each reconstructed source position in its own direction. A
+    // round trip samples the reverse flow at the forward-warped endpoint,
+    // not at the same image coordinate. Color residuals check that this
+    // geometrically consistent correspondence also matches the images.
+    // Positive confidence weights define the blend even when both paths are
+    // unreliable; this stage does not repair the underlying motion field.
+    // The one-pixel flow scale and upstream 0.03 color scale are heuristics,
+    // not parameters supplied by NVIDIA's optical-flow engine.
     GLSLH("vec4 "$"(sampler2D f0, sampler2D f1, isampler2D fw, isampler2D bw,\n"
           "           vec2 base, vec2 size, float t) {\n"
           "    vec2 s0 = base, s1 = base;\n"
@@ -120,7 +129,24 @@ void pl_shader_fruc_interpolate(pl_shader sh, const struct pl_fruc_source *src)
           "    float guard = staticness * smoothstep(5.0, 20.0, disp);\n"
           "    vec4 c0 = textureLod(f0, s0 * uv0, 0.0);\n"
           "    vec4 c1 = textureLod(f1, s1 * uv1, 0.0);\n"
-          "    return mix(mix(c0, c1, t), mix(z0, z1, t), guard);\n"
+          "    vec2 vf = vec2(textureLod(fw, s0, 0.0).xy) / 32.0;\n"
+          "    vec2 vb = vec2(textureLod(bw, s1, 0.0).xy) / 32.0;\n"
+          "    vec2 rf = vec2(textureLod(bw, s0 + vf / size, 0.0).xy) / 32.0;\n"
+          "    vec2 rb = vec2(textureLod(fw, s1 + vb / size, 0.0).xy) / 32.0;\n"
+          "    float e0 = dot(vf + rf, vf + rf);\n"
+          "    float e1 = dot(vb + rb, vb + rb);\n"
+          "    float w0 = (1.0 - t) / (1.0 + e0);\n"
+          "    float w1 = t / (1.0 + e1);\n"
+          "    vec3 d0 = abs(c0.rgb - textureLod(f1, (s0 + vf / size) * uv1, 0.0).rgb);\n"
+          "    vec3 d1 = abs(c1.rgb - textureLod(f0, (s1 + vb / size) * uv0, 0.0).rgb);\n"
+          "    w0 /= 1.0 + dot(d0, d0) / (3.0 * 0.03 * 0.03);\n"
+          "    w1 /= 1.0 + dot(d1, d1) / (3.0 * 0.03 * 0.03);\n"
+          // Equal endpoint colors do not establish that a repeated UI pattern
+          // is stationary. Retain reliable motion only when both paths agree
+          // geometrically and photometrically; otherwise retain the guard.
+          "    float mismatch = max(dot(d0, vec3(0.333333)), dot(d1, vec3(0.333333)));\n"
+          "    guard *= 1.0 - (1.0 - smoothstep(0.01, 0.03, mismatch)) * (1.0 - smoothstep(0.5, 2.0, max(e0, e1)));\n"
+          "    return mix((w0 * c0 + w1 * c1) / (w0 + w1), mix(z0, z1, t), guard);\n"
           "}\n", fn);
     sh_describe(sh, "FRUC interpolation");
     GLSL("vec4 color = "$"("$", "$", "$", "$", "$", vec2(%d, %d), "$ ");\n",

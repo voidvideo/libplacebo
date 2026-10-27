@@ -23,8 +23,9 @@ struct pl_fruc_source {
 PL_API void pl_shader_fruc_grayscale(pl_shader sh,
     const struct pl_hook_texture *source, int width, int height);
 
-// FFmpeg FRUC synthesis, including six damped Picard iterations and its
-// static-region guard. Flow values use NVIDIA's signed S10.5 encoding.
+// FFmpeg-derived synthesis with six damped Picard iterations, motion/color
+// confidence weights, and a motion-validated static-region guard.
+// Flow values use NVIDIA's signed S10.5 encoding.
 // Dispatch into an RGB(A) target with the source precision.
 PL_API void pl_shader_fruc_interpolate(pl_shader sh, const struct pl_fruc_source *source);
 
