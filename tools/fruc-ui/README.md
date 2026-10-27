@@ -114,3 +114,40 @@ Run candidates serially on an otherwise idle GPU before comparing performance.
 Listing a candidate is not evidence that it ran successfully. Check its run status,
 source revision, model checksum, and output count. Evaluation does not approve
 shipping a candidate or importing its dependencies into VoidVideo.
+
+## Native 4K RIFE evaluation
+
+`bench_rife_4k.py` draws the same six menu layouts directly at 3840×2160.
+Geometry rounds to native pixels and fonts rasterize at the target resolution.
+It evaluates all 48 intermediate timestamps of each one-second 24→60 sequence
+and saves twelve representative timestamps per scene. The other twelve output
+timestamps coincide with source frames and need no inference.
+
+Run each configuration in a separate process, serially on the GPU:
+
+```sh
+python tools/fruc-ui/bench_rife_4k.py /path/to/Practical-RIFE /path/to/results/full --scale 1
+python tools/fruc-ui/bench_rife_4k.py /path/to/Practical-RIFE /path/to/results/half --scale 0.5
+python tools/fruc-ui/bench_rife_4k.py /path/to/Practical-RIFE-lite /path/to/results/lite-half-fp16 --scale 0.5 --precision fp16
+python3 tools/fruc-ui/report_rife_4k.py /path/to/results
+```
+
+Use the downloaded model's own `train_log` code and weights with the upstream
+`model` helpers. The adapter validates all inference weights and records unused
+training-only teacher/time-estimation weights. It uses upstream scale-dependent
+padding, cuDNN algorithm selection, and the upstream FP16 default tensor type
+when requested. Candidate algorithm files remain unchanged.
+
+The continuous timing test warms up the model, then repeatedly interpolates a
+resident fast-scroll frame pair at four fractional times for at least 15 seconds
+and 48 inferences. It records every synchronized inference time, total throughput,
+and PyTorch peak allocated/reserved GPU memory. It excludes input transfer, output
+readback, capture, rendering, and presentation. The memory figures exclude other
+processes and non-PyTorch driver allocations. This is an inference feasibility
+test, not proof of sustained application playback or a long thermal soak.
+
+The 24→60 cadence requires 48 generated frames per second. Report this generated
+rate separately from the equivalent output rate, which also counts the twelve
+source-coincident frames. Quality measurements run separately over changing frame
+pairs. They use rounded RGB8 output and edge masks expanded by eight native pixels,
+matching the two-logical-pixel region used by the smaller benchmark.

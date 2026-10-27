@@ -16,15 +16,30 @@ SMALL = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 16
 SCENES = ('scroll_slow', 'scroll_fast', 'vertical', 'focus_glide', 'crossing', 'static')
 
 
-def scene(n, kind):
-    im = Image.new('RGB', (W, H), (22, 26, 35))
-    d = ImageDraw.Draw(im)
+def scene(n, kind, scale=1):
+    # Draw geometry and font glyphs at the target resolution, without upscaling
+    # an existing bitmap. Coordinates below remain in logical menu units.
+    im = Image.new('RGB', (W * scale, H * scale), (22, 26, 35))
+    draw = ImageDraw.Draw(im)
+    class ScaledDraw:
+        def rectangle(self, xy, **kw):
+            if 'width' in kw: kw['width'] *= scale
+            draw.rectangle(tuple(v * scale for v in xy), **kw)
+        def line(self, xy, **kw):
+            if 'width' in kw: kw['width'] *= scale
+            draw.line(tuple(v * scale for v in xy), **kw)
+        def text(self, xy, text, font, **kw):
+            draw.text(tuple(v * scale for v in xy), text,
+                      font=font.font_variant(size=font.size * scale), **kw)
+    d = ScaledDraw()
+    def pixel(value):
+        return round(value * scale) / scale
     d.text((28, 16), 'VIDEO LIBRARY     Movies     Shows     Settings', font=FONT, fill='white')
     d.rectangle((24, 64, 936, 500), fill=(42, 48, 62))
     if kind in ('scroll_slow', 'scroll_fast', 'static'):
         speed = {'scroll_slow': 8, 'scroll_fast': 48, 'static': 0}[kind]
         for k in range(16):
-            x = round(50 + k * 160 - n * speed)
+            x = pixel(50 + k * 160 - n * speed)
             if x > W or x + 140 < 0:
                 continue
             d.rectangle((x, 110, x + 138, 355), fill=((70+k*31)%200, (80+k*43)%190, (100+k*23)%210), outline='white', width=2)
@@ -35,15 +50,15 @@ def scene(n, kind):
     elif kind in ('vertical', 'focus_glide'):
         titles = ['Picture settings', 'Audio output', 'Network connection', 'Display calibration', 'System information']
         for k in range(12):
-            y = round(95 + k*65 - (n*12 if kind == 'vertical' else 0))
+            y = pixel(95 + k*65 - (n*12 if kind == 'vertical' else 0))
             if 70 <= y <= 450:
                 d.rectangle((55, y, 585, y+57), fill=(55, 61, 74))
                 d.text((78, y+14), titles[k%5], font=FONT, fill='white')
-        y = round(95 + 260*(0.5-0.5*np.cos(n*np.pi/24))) if kind == 'focus_glide' else 160
+        y = pixel(95 + 260*(0.5-0.5*np.cos(n*np.pi/24))) if kind == 'focus_glide' else 160
         d.rectangle((53, y, 587, y+59), outline=(60, 200, 255), width=4)
         d.text((650, 180), 'FIXED PANEL', font=FONT, fill='white')
     else:
-        for x, y, color, label in [(round(60+n*24), 180, (160, 60, 90), 'MOVING RIGHT'), (round(720-n*24), 260, (40, 150, 190), 'MOVING LEFT')]:
+        for x, y, color, label in [(pixel(60+n*24), 180, (160, 60, 90), 'MOVING RIGHT'), (pixel(720-n*24), 260, (40, 150, 190), 'MOVING LEFT')]:
             d.rectangle((x, y, x+210, y+100), fill=color, outline='white', width=2)
             d.text((x+10, y+35), label, font=FONT, fill='white')
     d.rectangle((0, 510, W, H), fill=(10, 12, 18))
