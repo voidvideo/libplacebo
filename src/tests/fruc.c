@@ -135,6 +135,8 @@ static void renderer_test(pl_gpu gpu)
     struct pl_frame target = rgb_frame(output), native_target = rgb_frame(reference);
     struct pl_render_params params = pl_render_default_params;
     params.frame_mixer = &pl_filter_fruc;
+    params.skip_caching_single_frame = true;
+    params.preserve_mixing_cache = true;
     params.dither_params = NULL;
     struct pl_renderer_snapshot snapshot = {.params=&params, .owner=&params,
         .retain=snapshot_ref, .release=snapshot_ref, .mode=PL_RENDERER_PREPARE_ASYNC};
@@ -196,6 +198,21 @@ static void renderer_test(pl_gpu gpu)
         }
         REQUIRE(motion_error / ((N-48)*(N-64)) < 0.05);
     }
+    // Preserved source caches must be refreshed for FRUC's current pixel domain.
+    pl_renderer fresh = pl_renderer_create(gpu->log, gpu);
+    native_target.color.transfer = PL_COLOR_TRC_BT_1886;
+    struct pl_frame gamma_target = target;
+    gamma_target.color = native_target.color;
+    REQUIRE(pl_render_image_mix(native, &mix, &native_target, &params));
+    REQUIRE(pl_render_image_mix(fresh, &mix, &gamma_target, &params));
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=output, .ptr=actual)));
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=reference, .ptr=expected)));
+    double cache_error = 0;
+    for (int y=24; y<N-24; y++) for (int x=40; x<N-24; x++)
+        cache_error += fabsf(actual[y][x][0]-expected[y][x][0]);
+    REQUIRE(cache_error / ((N-48)*(N-64)) < 0.01);
+    pl_renderer_destroy(&fresh);
+
     // An absent future frame is pending, never a successful substituted frame.
     mix.num_frames = 1; mix.timestamps = timestamps; timestamps[0] = -0.4f;
     REQUIRE(pl_renderer_preflight_image_mix(prep, &mix, &target) == PL_RENDERER_PREPARE_NOT_READY);

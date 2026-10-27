@@ -5150,7 +5150,8 @@ retry:
             continue;
         }
 
-        bool skip_cache = single_frame && (params->skip_caching_single_frame || par_info.trivial);
+        bool skip_cache = !fruc_enabled(params) && single_frame &&
+                          (params->skip_caching_single_frame || par_info.trivial);
         if (!f && skip_cache) {
             PL_TRACE(rr, "Single frame not found in cache, bypassing");
             goto fallback;
@@ -5169,7 +5170,7 @@ retry:
         // Check to see if we can blindly reuse this cache entry. This is the
         // case if either the params are compatible, or the user doesn't care
         bool can_reuse = f->tex;
-        bool strict_reuse = skip_cache || single_frame ||
+        bool strict_reuse = fruc_enabled(params) || skip_cache || single_frame ||
                             !params->preserve_mixing_cache;
         if (can_reuse && strict_reuse) {
             can_reuse = f->tex->params.w == out_w &&
