@@ -169,10 +169,12 @@ configuration overlap, resize, and resource retirement. Twenty consecutive runs
 passed on an NVIDIA GeForce RTX 5070. This is a correctness fixture with small
 textures, not a 4K throughput or fullscreen playback benchmark.
 
-The prepared-render numerical regression also passed with the installed Vulkan
-validation layer disabled. That is not validation-layer coverage. The queue-plan
-regression now tests the agreed available-frame policy; publication
-demand tests use the explicit bracket intent. The queue implementation is unchanged.
+All 30 configured tests subsequently passed using Void's staged Vulkan loader
+and Khronos validation layer, both version 1.4.363, with validation enabled.
+The logs contained no validation errors or VUID messages. This includes the
+prepared-render numerical regression and external mixer fixture. The queue-plan
+regression tests the agreed available-frame policy; publication demand tests use
+the explicit bracket intent. The queue implementation is unchanged.
 
 CUDA resource sharing has not been executed on hardware by these tests. Void's
 application-side admission, worker handoff, and configuration retirement still
