@@ -417,6 +417,17 @@ int main(int argc, char **argv)
         if (!vk)
             continue;
 
+        // The maintained library provides a generic mixer API. Device creation
+        // must not opt applications into the removed NVIDIA optical-flow backend.
+        for (int ext = 0; ext < vk->num_extensions; ext++)
+            REQUIRE(strcmp(vk->extensions[ext], "VK_NV_optical_flow") != 0);
+        for (const VkBaseInStructure *feature = (const void *) vk->features;
+             feature; feature = feature->pNext)
+        {
+            REQUIRE(feature->sType !=
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV);
+        }
+
 #ifdef VK_KHR_cooperative_matrix
         cooperative_matrix_tests(vk);
 #endif
