@@ -246,6 +246,9 @@ struct pl_shader_var {
 struct pl_buffer_var {
     struct pl_var var;
     struct pl_var_layout layout;
+    // Preserve an explicit array declaration when var.dim_a == 1. This does
+    // not change layout or allocation size. Larger arrays remain arrays.
+    bool explicit_array;
 };
 
 typedef uint16_t pl_memory_qualifiers;

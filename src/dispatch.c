@@ -328,10 +328,10 @@ static bool add_pass_var(pl_dispatch dp, void *tmp, struct pass *pass,
 #define ADD_CAT(b, cat) pl_str_builder_concat(b, cat)
 #define ADD_CONST(b, s) pl_str_builder_const_str(b, s)
 
-static void add_var(pl_str_builder body, const struct pl_var *var)
+static void add_var(pl_str_builder body, const struct pl_var *var, bool explicit_array)
 {
     const char *type = pl_var_glsl_type_name(*var);
-    if (var->dim_a > 1) {
+    if (explicit_array || var->dim_a > 1) {
         ADD(body, "%s "$"[%d];\n", type, sh_ident_unpack(var->name), var->dim_a);
     } else {
         ADD(body, "%s "$";\n", type, sh_ident_unpack(var->name));
@@ -359,7 +359,7 @@ static void add_buffer_vars(pl_dispatch dp, void *tmp, pl_str_builder body,
         // Add an explicit offset wherever possible
         if (dp->gpu->glsl.version >= 440)
             ADD(body, "    layout(offset=%zu) ", bv->layout.offset);
-        add_var(body, &bv->var);
+        add_var(body, &bv->var, bv->explicit_array);
     }
     ADD(body, "};\n");
 }
@@ -686,7 +686,7 @@ static void generate_shaders(pl_dispatch dp,
         if (pv->type != PASS_VAR_GLOBAL)
             continue;
         ADD(pre, "uniform ");
-        add_var(pre, var);
+        add_var(pre, var, false);
     }
 
     pl_str_builder glsl = dp->tmp[TMP_MAIN];

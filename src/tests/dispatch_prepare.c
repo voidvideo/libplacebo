@@ -319,6 +319,80 @@ static enum pl_dispatch_result run_compute(pl_dispatch dp, pl_dispatch_prepared 
     return result;
 }
 
+// Exercise the descriptor generator and asynchronous prepared execution together.
+// Scalar fields must remain scalar; explicit length-one arrays retain indexing,
+// length, atomic and inout semantics without overwriting neighboring storage.
+static pl_shader array_shader(pl_dispatch dp, pl_buf buffer,
+                              const struct pl_buf_params *metadata)
+{
+    struct pl_buffer_var fields[] = {
+        { .var = pl_var_uint("history"), .explicit_array = true },
+        { .var = pl_var_uint("neighbor") },
+        { .var = pl_var_float("values"), .explicit_array = true },
+        { .var = pl_var_uint("array_count") },
+        { .var = pl_var_vec3("vectors"), .explicit_array = true },
+        { .var = pl_var_uint("tail") },
+    };
+    for (int i = 0; i < PL_ARRAY_SIZE(fields); i++)
+        fields[i].layout = pl_std430_layout(i < 4 ? i * 4 : i == 4 ? 16 : 32,
+                                           &fields[i].var);
+    // Explicit vec3 arrays use the std430 array stride, including length one.
+    fields[4].layout.stride = fields[4].layout.size = 16;
+    struct pl_shader_desc desc = {
+        .desc = { .name = "data", .type = PL_DESC_BUF_STORAGE,
+                  .access = PL_DESC_ACCESS_READWRITE },
+        .binding.object = buffer, .buffer = metadata,
+        .buffer_vars = fields, .num_buffer_vars = PL_ARRAY_SIZE(fields),
+    };
+    pl_shader sh = pl_dispatch_begin(dp);
+    REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .header = "void increment(inout uint x) { x += 2u; }",
+        .body = "history[0] = 5u; atomicAdd(history[0], 3u);"
+                "increment(history[0]); values[0] = 0.75;"
+                "array_count = uint(history.length() + values.length() + vectors.length());"
+                "vectors[0] = vec3(1.0, 2.0, 3.0); tail = neighbor;",
+        .compute = true, .compute_group_size = {1, 1},
+        .descriptors = &desc, .num_descriptors = 1,
+    }));
+    return sh;
+}
+
+static void test_explicit_arrays(pl_gpu gpu, pl_dispatch dp)
+{
+    uint32_t initial[9] = { [1] = 71 };
+    struct pl_buf_params metadata = {
+        .size = sizeof(initial), .storable = true, .host_readable = true,
+    };
+    pl_buf buffer = pl_buf_create(gpu, &(struct pl_buf_params) {
+        .size = sizeof(initial), .storable = true, .host_readable = true,
+        .initial_data = initial,
+    });
+    REQUIRE(buffer);
+    describe_only = forbid_compile = true;
+    pl_shader sh = array_shader(dp, NULL, &metadata);
+    pl_dispatch_description desc = NULL;
+    REQUIRE(pl_dispatch_describe_compute(dp,
+        pl_dispatch_compute_params(.shader = &sh, .dispatch_size = {1,1,1}),
+        &desc) == PL_DISPATCH_OK);
+    describe_only = forbid_compile = false;
+    pl_dispatch_preparation request = prepare(&desc);
+    pl_dispatch_prepared pass = take(&request);
+    forbid_compile = true;
+    sh = array_shader(dp, buffer, NULL);
+    REQUIRE(pl_dispatch_compute_prepared(dp, pass,
+        pl_dispatch_compute_params(.shader = &sh, .dispatch_size = {1,1,1})) == PL_DISPATCH_OK);
+    forbid_compile = false;
+    uint32_t result[9];
+    REQUIRE(pl_buf_read(gpu, buffer, 0, result, sizeof(result)));
+    REQUIRE(result[0] == 10 && result[1] == 71 && result[3] == 3 && result[8] == 71);
+    float value, vector[3];
+    memcpy(&value, &result[2], sizeof(value));
+    memcpy(vector, &result[4], sizeof(vector));
+    REQUIRE(value == 0.75f && vector[0] == 1.0f && vector[1] == 2.0f && vector[2] == 3.0f);
+    pl_dispatch_prepared_destroy(&pass);
+    pl_buf_destroy(gpu, &buffer);
+}
+
 static void test_compute(pl_gpu gpu, pl_dispatch dp)
 {
     struct pl_buf_params metadata = {
@@ -681,6 +755,7 @@ int main(void)
     REQUIRE(reference && output);
     test_sampled(gpu, dp, reference, output);
     test_compute(gpu, dp);
+    test_explicit_arrays(gpu, dp);
     test_cancel_and_retry(dp);
     test_finish_compute(gpu, dp);
     test_static_text(gpu, dp, output);
