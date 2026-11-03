@@ -286,6 +286,7 @@ enum pl_queue_plan_intent {
     PL_QUEUE_PLAN_INTENT_SINGLE,      // one nearest sample, no interpolation
     PL_QUEUE_PLAN_INTENT_LAST_DUE,    // one last sample at or before the target
     PL_QUEUE_PLAN_INTENT_PREFIX,      // available prefix starting at last-due
+    PL_QUEUE_PLAN_INTENT_BRACKET,     // exact sample or surrounding pair; waits for future input
 };
 
 struct pl_queue_plan_cadence {
@@ -325,6 +326,7 @@ PL_API enum pl_queue_plan_status pl_queue_plan_set_target(pl_queue_plan plan, do
 // Ordinary nearest, oversample and temporal modes select the visible frames
 // currently available. A full kernel window is not a readiness requirement.
 // Selected interlaced entries must still have their required references.
+// BRACKET explicitly requires an exact sample or a surrounding pair.
 // At EOF, ordinary modes expire after the terminal sample's ZOH lifetime
 // (PTS 0 single-image content remains indefinite).
 PL_API enum pl_queue_plan_status pl_queue_plan_check(pl_queue_plan plan);
