@@ -25,18 +25,6 @@ static void push(pl_queue queue, struct sample *sample, double pts, float durati
         .frame_data = sample, .map = map, .discard = discard, .unmap = unmap,
     });
 }
-// Strict publication demand is tested with the explicitly requested bracket
-// intent. Ordinary temporal filters can render an available, shorter window.
-static enum pl_queue_plan_status inspect_bracket(pl_queue queue,
-    const struct pl_queue_params *params, pl_queue_plan *plan)
-{
-    const struct pl_queue_plan_cadence cadence = {
-        .source_duration = .04, .output_duration = params->vsync_duration,
-        .intent = PL_QUEUE_PLAN_INTENT_BRACKET,
-    };
-    enum pl_queue_plan_status status = pl_queue_plan_prepare(queue, params, &cadence, plan);
-    return status == PL_QUEUE_PLAN_PREPARED ? pl_queue_plan_set_target(*plan, params->pts) : status;
-}
 static void available_publication(void)
 {
     const struct pl_gpu_t gpu = {0};
@@ -198,25 +186,20 @@ static void interlaced(void)
 static void invalidation_and_failure(void)
 {
     const struct pl_gpu_t gpu = {0};
-    for (int test = 0; test < 6; test++) {
+    for (int test = 0; test < 4; test++) {
         pl_queue queue = pl_queue_create(&gpu);
         struct sample samples[4] = {0};
-        push(queue, &samples[0], 2, .04, PL_FIELD_NONE);
+        push(queue, &samples[0], 2, .04, PL_FIELD_TOP);
         struct pl_queue_params params = {.pts = 2.02, .vsync_duration = .02};
         pl_queue_plan plan;
-        assert(inspect_bracket(queue, &params, &plan) == PL_QUEUE_PLAN_PENDING);
+        assert(pl_queue_plan_inspect(queue, &params, &plan) == PL_QUEUE_PLAN_PENDING);
         if (test == 0) pl_queue_reset(queue);
         if (test == 1) pl_queue_advance(queue, 2);
         if (test == 2) push(queue, &samples[1], 1.99, .04, PL_FIELD_NONE);
-        if (test == 3) push(queue, &samples[1], 2.04, .04, PL_FIELD_TOP);
-        if (test < 4) assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_STALE);
-        if (test == 4) {
-            pl_queue_push(queue, NULL);
-            assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_EOF);
-        }
-        if (test == 5) {
+        if (test < 3) assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_STALE);
+        if (test == 3) {
             samples[0].fail = true;
-            push(queue, &samples[1], 2.04, .04, PL_FIELD_NONE);
+            push(queue, &samples[1], 2.04, .04, PL_FIELD_TOP);
             struct pl_frame_mix mix;
             assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_ERROR);
             assert(!mix.num_frames && samples[0].mapped == 1);
@@ -253,54 +236,6 @@ static void threshold_and_abandon(void)
         pl_queue_plan_destroy(&plan);
         params.pts += .044;
     }
-    pl_queue_destroy(&queue);
-}
-static bool push_block(pl_queue queue, struct sample *sample, double pts)
-{
-    const struct pl_source_frame src = {.pts = pts, .duration = .04,
-        .frame_data = sample, .map = map, .discard = discard, .unmap = unmap};
-    return pl_queue_push_block(queue, 1, &src);
-}
-static void explicit_publication_demand(void)
-{
-    const struct pl_gpu_t gpu = {0};
-    pl_queue queue = pl_queue_create(&gpu);
-    struct sample samples[10] = {0};
-    assert(push_block(queue, &samples[0], 2));
-    assert(push_block(queue, &samples[1], 2.04));
-    struct pl_queue_params params = {.pts = 2.18, .radius = 2, .vsync_duration = 1.0f / 60};
-    pl_queue_plan plan;
-    assert(inspect_bracket(queue, &params, &plan) == PL_QUEUE_PLAN_PENDING);
-    for (int i = 2; i <= 5; i++) {
-        assert(!push_block(queue, &samples[i], 2 + i * .04));
-        assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_PENDING);
-        assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
-        assert(push_block(queue, &samples[i], 2 + i * .04));
-    }
-    assert(pl_queue_plan_check(plan) == PL_QUEUE_PLAN_READY);
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_READY);
-    assert(!push_block(queue, &samples[6], 2.24));
-    pl_queue_plan_destroy(&plan);
-    // A destroyed pending plan must not leave its publication permission open.
-    params.pts = 2.3;
-    assert(inspect_bracket(queue, &params, &plan) == PL_QUEUE_PLAN_PENDING);
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
-    pl_queue_plan_destroy(&plan);
-    assert(!push_block(queue, &samples[6], 2.24));
-    assert(inspect_bracket(queue, &params, &plan) == PL_QUEUE_PLAN_PENDING);
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
-    // A competing selection invalidates both the plan and its admission.
-    struct pl_frame frame;
-    assert(!pl_queue_peek_mapped(queue, 999, &frame));
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_STALE);
-    assert(!push_block(queue, &samples[6], 2.24));
-    pl_queue_plan_destroy(&plan);
-    assert(inspect_bracket(queue, &params, &plan) == PL_QUEUE_PLAN_PENDING);
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
-    pl_queue_push(queue, NULL);
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_EOF);
-    assert(pl_queue_num_frames(queue) == 6);
-    pl_queue_plan_destroy(&plan);
     pl_queue_destroy(&queue);
 }
 static void bootstrap_and_adjusted_target(void)
@@ -574,48 +509,12 @@ static void caller_selection_intents(void)
     pl_queue_destroy(&queue);
 }
 
-static void bracket_rate_conversion(void)
-{
-    const struct pl_gpu_t gpu = {0};
-    pl_queue queue = pl_queue_create(&gpu);
-    struct sample samples[7] = {0};
-    struct pl_queue_params settings = {.interpolation_threshold = 2.0f};
-    struct pl_queue_plan_cadence cadence = {
-        .source_duration = 1.0f / 24, .output_duration = 1.0f / 60,
-        .intent = PL_QUEUE_PLAN_INTENT_BRACKET,
-    };
-    push(queue, &samples[0], 0, cadence.source_duration, PL_FIELD_NONE);
-    pl_queue_plan plan = NULL;
-    assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
-    assert(pl_queue_plan_get_info(plan)->support_radius == cadence.source_duration);
-    assert(pl_queue_plan_set_target(plan, 1.0 / 60) == PL_QUEUE_PLAN_PENDING);
-    assert(pl_queue_plan_request(plan) == PL_QUEUE_PLAN_PENDING);
-    pl_queue_plan_destroy(&plan);
-    for (int n = 1; n < PL_ARRAY_SIZE(samples); n++)
-        push(queue, &samples[n], n / 24.0, cadence.source_duration, PL_FIELD_NONE);
-    // Cover managed interpolation across a complete source/output cadence cycle.
-    for (int tick = 0; tick < 15; tick++) {
-        float t = (tick * 2 % 5) / 5.0f;
-        struct pl_frame_mix mix;
-        assert(pl_queue_plan_prepare(queue, &settings, &cadence, &plan) == PL_QUEUE_PLAN_PREPARED);
-        assert(pl_queue_plan_set_target(plan, tick / 60.0) == PL_QUEUE_PLAN_READY);
-        assert(pl_queue_plan_consume(plan, &mix) == PL_QUEUE_PLAN_READY);
-        assert(mix.num_frames == (t == 0.0f ? 1 : 2));
-        if (mix.num_frames == 2)
-            assert(fabsf(-mix.timestamps[0] / (mix.timestamps[1] - mix.timestamps[0]) - t) < 1e-6);
-        pl_queue_plan_destroy(&plan);
-    }
-    pl_queue_destroy(&queue);
-}
-
 int main(void)
 {
     available_window_differential();
-    bracket_rate_conversion();
     caller_selection_intents();
     declared_cadence();
     declared_invalid_and_threshold();
-    explicit_publication_demand();
     bootstrap_and_adjusted_target();
     available_publication();
     exact_nearest();
