@@ -297,7 +297,6 @@ PL_API extern const struct pl_filter_config pl_filter_ewa_robidoux;
 PL_API extern const struct pl_filter_config pl_filter_ewa_robidouxsharp;
 // Special/opaque filters
 PL_API extern const struct pl_filter_config pl_filter_oversample;
-// Two-frame NVIDIA Vulkan optical-flow interpolation, at the output timestamp.
 
 // Backwards compatibility
 #define pl_filter_triangle          pl_filter_bilinear

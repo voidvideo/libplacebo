@@ -27,7 +27,6 @@
 
 struct cached_frame {
     uint64_t signature;
-    float timestamp;
     uint64_t params_hash; // for detecting `pl_render_params` changes
     struct pl_color_space color;
     struct pl_color_space target_color; // mapping intent, including original transfer
@@ -5276,7 +5275,6 @@ inter_pass_error:
 
         pl_assert(fidx < MAX_MIX_FRAMES);
         frames[fidx] = *f;
-        frames[fidx].timestamp = images->timestamps[i];
         weights[fidx] = weight;
         wsum += weight;
         fidx++;
@@ -5995,7 +5993,6 @@ static enum pl_renderer_prepare_result describe_temporal_mix(pl_renderer rendere
         }
         if (i < MAX_MIX_FRAMES) {
             frames[i] = p->sources[i]->mix_frame;
-            frames[i].timestamp = i == 0 ? 0.0f : 1.0f;
             weights[i] = 1.0f;
         }
     }
@@ -6355,7 +6352,6 @@ retry:
         next_frame = source->shader_frame_index;
         frames[i] = source->preview_frame;
         frames[i].signature = images->signatures[indices[i]];
-        frames[i].timestamp = images->timestamps[indices[i]];
         frames[i].tex = NULL;
     }
     p->checking = true;
@@ -6382,7 +6378,6 @@ retry:
         p->frame_index = source->frame_index;
         frames[i] = source->mix_frame;
         frames[i].signature = images->signatures[indices[i]];
-        frames[i].timestamp = images->timestamps[indices[i]];
         frames[i].tex = frames[i].prepared_tex->texture;
     }
     // Match native cache eviction, including retention of eligible frames
