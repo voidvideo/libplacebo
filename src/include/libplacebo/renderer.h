@@ -1099,7 +1099,8 @@ struct pl_renderer_capture {
 PL_API bool pl_renderer_get_capture(pl_renderer_preparation preparation,
     enum pl_hook_stage stage, int index, struct pl_renderer_capture *out);
 
-// Prepared external mixer integration. The host supplies the exact source window;
+// Prepared external mixer integration. The host supplies the ordinary variable
+// frame mix selected by the queue;
 // no filter weights, nearest-frame substitution, or presentation policy apply.
 // One output request is admitted per handle. Independent handles can overlap.
 // All calls are serialized. Describe/stage prepare shaders; begin/finish execute

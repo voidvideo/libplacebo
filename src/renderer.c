@@ -6712,7 +6712,7 @@ enum pl_renderer_prepare_result pl_renderer_mixer_describe(
     const struct pl_mixer_requirements *q = pl_mixer_get_requirements(mixer);
     if (snapshot->mode != PL_RENDERER_PREPARE_ASYNC || snapshot->params->disable_fbos ||
         images->num_frames > MAX_MIX_FRAMES || images->num_frames > q->max_frames ||
-        images->num_frames < q->min_frames || q->format->num_components != 4 ||
+        q->format->num_components != 4 ||
         !(q->format->caps & PL_FMT_CAP_SAMPLEABLE) || !(q->format->caps & PL_FMT_CAP_RENDERABLE))
         return PL_RENDERER_PREPARE_UNSUPPORTED;
     if (linear_mixer_input(snapshot->params) != (q->domain == PL_MIXER_COLOR_LINEAR))
@@ -6825,22 +6825,17 @@ enum pl_mixer_status pl_renderer_mixer_begin(pl_renderer_mixer m,
     if (m->active || m->leases) return PL_MIXER_BUSY;
     if (!mixer_target_configuration_matches(m, target)) return PL_MIXER_INVALID;
     pl_renderer_preparation p = m->graph;
-    if (images->num_frames < m->requirements.min_frames ||
-        images->num_frames > m->requirements.max_frames || images->num_frames > p->num_sources)
+    if (images->num_frames <= 0 || images->num_frames > m->requirements.max_frames ||
+        images->num_frames > p->num_sources)
         return PL_MIXER_INVALID;
     enum pl_pass_prepare_state ready = pl_renderer_prepare_poll(p);
     if (ready != PL_PASS_PREPARE_READY)
         return ready == PL_PASS_PREPARE_PENDING ? PL_MIXER_PENDING : PL_MIXER_FAILED;
-    unsigned past = 0, future = 0;
     for (int i = 0; i < images->num_frames; i++) {
         if (!images->frames[i] || !isfinite(source_pts[i]) ||
             (i && source_pts[i] <= source_pts[i - 1])) return PL_MIXER_INVALID;
         if (pl_rotation_normalize(images->frames[i]->rotation)) return PL_MIXER_UNSUPPORTED;
-        past += source_pts[i] < pts;
-        future += source_pts[i] > pts;
     }
-    if (past != m->requirements.past_frames || future != m->requirements.future_frames)
-        return PL_MIXER_INVALID;
     // Cache comparisons must use the same inferred target metadata as source
     // rendering. Raw unspecified HDR fields otherwise force source acquisition
     // again even when the prepared cache contains the required frame.

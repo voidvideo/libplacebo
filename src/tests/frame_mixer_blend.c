@@ -17,7 +17,7 @@ static enum pl_mixer_status negotiate(void *p, pl_gpu gpu,
     const struct blend_config *c = config->data;
     *out = (struct pl_mixer_requirements) {
         .backend = PL_MIXER_BACKEND_VULKAN, .domain = c->domain,
-        .past_frames = 1, .future_frames = 1, .min_frames = 2, .max_frames = 2,
+        .radius = 1, .max_frames = 2,
         .max_in_flight = 2, .format = pl_find_named_fmt(gpu, "rgba32f"),
     };
     return out->format ? PL_MIXER_OK : PL_MIXER_UNSUPPORTED;

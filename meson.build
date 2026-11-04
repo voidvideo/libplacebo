@@ -15,6 +15,7 @@ project('libplacebo', ['c', 'cpp'],
     # digits for VoidVideo ABI revisions. Exclude the five VoidVideo entries
     # from the upstream changelog count.
     ({
+      'voidvideo-5': 'give external mixers the ordinary variable frame window',
       'voidvideo-4': 'preserve explicit one-element buffer arrays',
       'voidvideo-3': 'connect external mixers to prepared source caches and output',
       'voidvideo-2': 'add external frame mixer registry and job lifecycle',
@@ -396,7 +397,7 @@ project('libplacebo', ['c', 'cpp'],
       '3': '',
       '2': '',
       '1': '',
-    }.keys().length() - 5) * 10000 + 4,
+    }.keys().length() - 6) * 10000 + 5,
     # Fix version
     0)
 )

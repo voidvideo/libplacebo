@@ -14,7 +14,7 @@ static enum pl_mixer_status negotiate(void *p, pl_gpu gpu,
 {
     *r = (struct pl_mixer_requirements) {
         .backend = PL_MIXER_BACKEND_VULKAN, .domain = PL_MIXER_COLOR_LINEAR,
-        .past_frames = 1, .future_frames = 1, .min_frames = 2, .max_frames = 2,
+        .radius = 1, .max_frames = 3,
         .max_in_flight = 1, .format = &format,
     };
     if (((struct state *)p)->cuda) {
@@ -88,9 +88,14 @@ int main(void)
         .retain = lease, .release = unlease,
     };
     pl_mixer_job j = NULL, second = NULL;
-    job.pts = 2; // insufficient future support must not be accepted
-    assert(pl_mixer_submit(m, &job, &j) == PL_MIXER_INVALID);
+    job.pts = 0;
+    job.num_frames = 1; // A normal queue selection may contain one exact frame.
+    assert(pl_mixer_submit(m, &job, &j) == PL_MIXER_PENDING);
+    assert(pl_mixer_poll(j) == PL_MIXER_PENDING);
+    assert(pl_mixer_poll(j) == PL_MIXER_OK);
+    assert(pl_mixer_job_destroy(&j) == PL_MIXER_OK);
     job.pts = .5;
+    job.num_frames = 2;
     job.color.transfer = PL_COLOR_TRC_SRGB;
     assert(pl_mixer_submit(m, &job, &j) == PL_MIXER_INVALID);
     job.color.transfer = PL_COLOR_TRC_LINEAR;
@@ -114,7 +119,7 @@ int main(void)
         assert(pl_mixer_job_destroy(&j) == PL_MIXER_OK && !j);
         assert(!state.leases);
     }
-    assert(state.releases == 2);
+    assert(state.releases == 3);
     assert(pl_mixer_destroy(&m) == PL_MIXER_OK && !m);
     assert(!state.instances);
     assert(pl_mixer_unregister(r, d.id) == PL_MIXER_OK);

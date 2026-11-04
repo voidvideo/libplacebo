@@ -4,7 +4,7 @@ The public contract in [frame_mixer.h](../src/include/libplacebo/frame_mixer.h)
 supplies registration, configuration negotiation, and retained asynchronous jobs.
 The adapter in [renderer.h](../src/include/libplacebo/renderer.h) connects those
 jobs to prepared source caches and the renderer's color-finishing stage.
-The application loads modules and supplies the exact source window. Existing
+The application loads modules and supplies the queue-selected frame mix. Existing
 `pl_render_image_mix` calls continue to use their ordinary filter path.
 
 ## Load and control an implementation
@@ -29,7 +29,7 @@ when creation fails. Creation is synchronous and may compile pipelines or load
 models. Call it on the application's preparation worker.
 
 The implementation chooses a Vulkan or CUDA backend, a completed or linear RGB
-contract, a texture format, a frame window, a maximum number of outstanding jobs,
+contract, a texture format, a temporal radius, a maximum input capacity and a maximum number of outstanding jobs,
 and an optional export handle type. Negotiate these before allocating shared
 frames. Linear input requires a floating-point format. CUDA requires an admitted
 export handle; that check alone does not prove CUDA device or format compatibility.
@@ -49,11 +49,11 @@ any input is invalid, including through another wrapper over the same allocation
 The core rejects identical input/output texture handles; the caller remains
 responsible for excluding storage aliases hidden behind different handles.
 
-The required past/future counts are exact counts strictly before/after the target.
-An exact timestamp sample is additional and counts toward the total frame limit.
-These are admission requirements, not instructions to fabricate missing frames.
-A caller that cannot assemble the required window must not submit the job.
-The interface does not prescribe a pair, a motion field, or an inference method.
+The implementation declares the same temporal radius used by an internal frame
+mixer and a maximum input capacity. The application uses the ordinary queue path
+to select a chronological `pl_frame_mix`. Every nonempty ordinary mix within the
+declared capacity is valid. The interface does not prescribe a pair, directional
+counts, a motion field, or an inference method.
 
 The core copies input descriptors and retains the supplied resource owner before
 calling the implementation. The owner must keep all textures and associated
@@ -87,7 +87,7 @@ domain must match the implementation's negotiated requirements.
    It describes source-cache and output passes without running the mixer.
 2. Call `pl_renderer_mixer_stage` to allocate textures and submit shader preparation.
    Poll `pl_renderer_mixer_prepare_poll` until ready. A failed preparation is not usable.
-3. Call `pl_renderer_mixer_begin` with the exact source window, source timestamps,
+3. Call `pl_renderer_mixer_begin` with the queue-selected mix, source timestamps,
    requested timestamp, epoch, and target. It renders cache misses and reserves
    those textures. It does not call the external implementation.
 4. Call `pl_renderer_mixer_submit`. Poll `pl_renderer_mixer_poll` while pending.
@@ -99,8 +99,8 @@ domain must match the implementation's negotiated requirements.
 
 Source timestamps and the requested timestamp are absolute seconds.
 `pl_frame_mix.timestamps` does not participate in this adapter. The application
-selects frames that satisfy the negotiated past/future counts. The adapter does
-not select presentation deadlines or invent missing source frames.
+passes the same ordinary queue selection it would give an internal frame mixer.
+The adapter does not select presentation deadlines or invent missing source frames.
 
 The adapter owns cached rendered textures, a separate output texture, and the
 prepared graph. It borrows source frame descriptors only during describe/begin;

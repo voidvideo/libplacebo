@@ -57,7 +57,7 @@ static struct pl_mixer_requirements requirements(void)
 {
     return (struct pl_mixer_requirements) {
         .backend = PL_MIXER_BACKEND_VULKAN, .domain = PL_MIXER_COLOR_LINEAR,
-        .past_frames = 1, .future_frames = 1, .min_frames = 2, .max_frames = 3,
+        .radius = 1, .max_frames = 3,
         .max_in_flight = 3, .format = &fmt,
     };
 }
@@ -323,7 +323,7 @@ static void invalid_jobs(void)
         case 2: in.frames[0].pts = NAN; break;
         case 3: in.frames[1].pts = -1; break;
         case 4: in.frames[1].pts = in.frames[0].pts; break;
-        case 5: in.job.num_frames = 1; break;
+        case 5: in.job.num_frames = 0; break;
         case 6: in.job.num_frames = 4; break;
         case 7: in.job.frames = NULL; break;
         case 8: in.job.retain = NULL; break;
@@ -383,24 +383,21 @@ static void negotiation_and_registry(void)
     assert(pl_mixer_unregister(r, "middle") == PL_MIXER_OK);
     assert(!strcmp(pl_mixer_registry_get(r, 1)->id, "last"));
     struct pl_mixer_config config = {0};
-    for (unsigned n = 0; n < 14; n++) {
+    for (unsigned n = 0; n < 11; n++) {
         module.requirements = requirements();
         struct pl_mixer_requirements *q = &module.requirements;
         switch (n) {
         case 0: q->format = NULL; break;
         case 1: q->format = &unorm; break; // linear needs float storage
-        case 2: q->min_frames = 0; break;
-        case 3: q->min_frames = 4; break;
+        case 2: q->radius = -1; break;
+        case 3: q->radius = NAN; break;
         case 4: q->max_frames = 0; break;
         case 5: q->max_in_flight = 0; break;
-        case 6: q->past_frames = 4; break;
-        case 7: q->future_frames = 3; break;
-        case 8: q->past_frames = UINT32_MAX; break;
-        case 9: q->domain = 99; break;
-        case 10: q->backend = 99; break;
-        case 11: q->export_handle = PL_HANDLE_FD | PL_HANDLE_WIN32; break;
-        case 12: q->export_handle = PL_HANDLE_FD; break; // device lacks export support
-        case 13: q->backend = PL_MIXER_BACKEND_CUDA; break; // no export request
+        case 6: q->domain = 99; break;
+        case 7: q->backend = 99; break;
+        case 8: q->export_handle = PL_HANDLE_FD | PL_HANDLE_WIN32; break;
+        case 9: q->export_handle = PL_HANDLE_FD; break; // device lacks export support
+        case 10: q->backend = PL_MIXER_BACKEND_CUDA; break; // no export request
         }
         pl_mixer m = NULL;
         assert(pl_mixer_create(r, "first", &gpu, &config, &m) == PL_MIXER_UNSUPPORTED);

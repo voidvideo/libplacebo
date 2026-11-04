@@ -118,10 +118,9 @@ enum pl_mixer_status pl_mixer_create(pl_mixer_registry r, const char *id,
     bool known_format = false;
     for (int i = 0; i < gpu->num_formats; i++)
         known_format |= gpu->formats[i] == q->format;
-    if (!known_format || !q->min_frames || q->min_frames > q->max_frames ||
+    if (!known_format || !isfinite(q->radius) || q->radius < 0 || !q->max_frames ||
         (q->domain == PL_MIXER_COLOR_LINEAR && q->format->type != PL_FMT_FLOAT) ||
-        !q->max_in_flight || q->past_frames > q->max_frames ||
-        q->future_frames > q->max_frames - q->past_frames ||
+        !q->max_in_flight ||
         (q->domain != PL_MIXER_COLOR_COMPLETED && q->domain != PL_MIXER_COLOR_LINEAR) ||
         (q->backend != PL_MIXER_BACKEND_VULKAN && q->backend != PL_MIXER_BACKEND_CUDA) ||
         (q->export_handle && ((q->export_handle & (q->export_handle - 1)) ||
@@ -163,22 +162,17 @@ enum pl_mixer_status pl_mixer_submit(pl_mixer m,
     if (!out) return PL_MIXER_INVALID;
     *out = NULL;
     if (!m || !p || !p->retain || !p->release || !p->frames ||
-        !isfinite(p->pts) || p->num_frames < m->req.min_frames ||
+        !isfinite(p->pts) || !p->num_frames ||
         p->num_frames > m->req.max_frames || !texture_valid(m, p->output) ||
         (m->req.domain == PL_MIXER_COLOR_LINEAR && p->color.transfer != PL_COLOR_TRC_LINEAR))
         return PL_MIXER_INVALID;
     if (m->jobs >= m->req.max_in_flight) return PL_MIXER_BUSY;
-    uint32_t past = 0, future = 0;
     for (uint32_t i = 0; i < p->num_frames; i++) {
         const struct pl_mixer_frame *f = &p->frames[i];
         if (!texture_valid(m, f->texture) || f->texture == p->output ||
             !isfinite(f->pts) || (i && f->pts <= p->frames[i-1].pts))
             return PL_MIXER_INVALID;
-        past += f->pts < p->pts;
-        future += f->pts > p->pts;
     }
-    if (past != m->req.past_frames || future != m->req.future_frames)
-        return PL_MIXER_INVALID;
     size_t bytes = (size_t) p->num_frames * sizeof(*p->frames);
     if (bytes / sizeof(*p->frames) != p->num_frames ||
         bytes > SIZE_MAX - sizeof(struct pl_mixer_job_t)) return PL_MIXER_INVALID;

@@ -25,7 +25,7 @@ PL_API_BEGIN
 
 // External implementations use the same libplacebo ABI as their host. This
 // additional version covers the callback table, not an ABI-independent GPU SDK.
-#define PL_MIXER_ABI_VERSION 1
+#define PL_MIXER_ABI_VERSION 2
 
 typedef struct pl_mixer_registry_t *pl_mixer_registry;
 typedef struct pl_mixer_t *pl_mixer;
@@ -61,10 +61,12 @@ struct pl_mixer_config {
 struct pl_mixer_requirements {
     enum pl_mixer_backend backend;
     enum pl_mixer_color_domain domain;
-    // Exact required counts strictly before/after the output timestamp. An
-    // exact source sample is additional. The caller supplies chronological frames.
-    uint32_t past_frames, future_frames;
-    uint32_t min_frames, max_frames;
+    // Temporal support in source-frame units, identical to an internal frame
+    // mixer's filter radius. The ordinary queue selects the chronological mix.
+    float radius;
+    // Maximum variable-length mix accepted by the implementation. Every
+    // nonempty ordinary mix up to this size must be accepted.
+    uint32_t max_frames;
     uint32_t max_in_flight;
     // One handle type or zero. Must be chosen BEFORE allocating shared images.
     enum pl_handle_type export_handle;
