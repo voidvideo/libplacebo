@@ -1445,12 +1445,14 @@ retry_ssbo:
     pl_color_space_infer(&csp);
     pl_shader_linearize(sh, &csp);
 
-    pl_matrix3x3 space_mat;
+    pl_matrix3x3 space_mat = pl_matrix3x3_identity;
     const struct pl_raw_primaries *space = pl_raw_primaries_get(csp.primaries);
-    if (use_mastering_space(&csp, &space_mat)) {
+    const bool use_mast_space = use_mastering_space(&csp, &space_mat);
+    if (use_mast_space)
         space = &csp.hdr.prim;
+    // Keep the prepared shader shape stable while HDR metadata changes.
+    if (use_mast_space || SH_PARAMS(sh).dynamic_constants)
         GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(space_mat));
-    }
 
     bool has_subgroups = sh_glsl(sh).subgroup_size > 0;
     const float cutoff = fmaxf(params->black_cutoff, 0.0f) * 1e-2f;
@@ -2054,7 +2056,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
 
     const int *lut3d_size_def = pl_color_map_default_params.lut3d_size;
     // Tone mapping and the gamut-mapping source extent share this space
-    pl_matrix3x3 space_mat;
+    pl_matrix3x3 space_mat = pl_matrix3x3_identity;
     const bool use_mast_space = use_mastering_space(&src, &space_mat);
     const struct pl_raw_primaries *src_space = use_mast_space
         ? &src.hdr.prim : pl_raw_primaries_get(src.primaries);
@@ -2180,7 +2182,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         pl_shader_color_convert_ex(sh, &input, &linear_src);
 
     // Convert the pixel into the tone-mapping RGB space.
-    if (use_mast_space && !args->skip_tone_mapping) {
+    // Keep the prepared shader shape stable while HDR metadata changes.
+    if ((use_mast_space || SH_PARAMS(sh).dynamic_constants) &&
+        !args->skip_tone_mapping) {
         GLSL("color.rgb = "$" * color.rgb; \n", SH_MAT3(space_mat));
         rgb2lms = pl_ipt_rgb2lms(src_space);
     }
@@ -2296,8 +2300,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                 .width      = tone.lut_size,
                 .comps      = 1,
                 .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params),
-                .dynamic    = adaptive_peak || tone.input_avg > 0, // dynamic metadata
-                .update_prepared = adaptive_peak,
+                .dynamic    = SH_PARAMS(sh).dynamic_constants ||
+                              adaptive_peak || tone.input_avg > 0,
+                .update_prepared = SH_PARAMS(sh).dynamic_constants || adaptive_peak,
                 .fill       = fill_tone_lut,
                 .priv       = &tone,
             ));

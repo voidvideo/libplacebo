@@ -2347,16 +2347,28 @@ static void test_stage_capture(pl_gpu gpu, struct pl_frame image, const uint8_t 
 
 // Reuse one prepared mix across the exact one-frame mastering-metadata loss
 // observed on the HTPC, including the cached-source graph used with hooks.
-static void test_bt1886_metadata_loss(pl_gpu gpu, struct pl_frame image, bool direct, bool present)
+static void test_mastering_metadata_loss(pl_gpu gpu, struct pl_frame image,
+                                         bool pq, bool peak, bool direct, bool present)
 {
-    image.color = pl_color_space_bt709;
+    image.color = pq ? pl_color_space_hdr10 : pl_color_space_bt709;
+    const struct pl_hdr_metadata base_hdr = image.color.hdr;
     const struct pl_raw_primaries mastering = {
         .red = {0.68f, 0.32f}, .green = {0.265f, 0.69f},
         .blue = {0.15f, 0.06f}, .white = {0.3127f, 0.329f},
     };
-    if (present) image.color.hdr.prim = mastering;
+    if (present) {
+        image.color.hdr.prim = mastering;
+        if (pq) {
+            image.color.hdr.max_luma = 1000.0f;
+            image.color.hdr.max_cll = 696.0f;
+            image.color.hdr.max_fall = 205.0f;
+        }
+    } else {
+        image.color.hdr = pq ? (struct pl_hdr_metadata) {0} : base_hdr;
+    }
     struct snapshot_owner *owner = new_snapshot(gpu, true);
     owner->params.dynamic_constants = true;
+    owner->params.peak_detect_params = peak ? &pl_peak_detect_default_params : NULL;
     owner->params.skip_caching_single_frame = direct;
     owner->params.dither_params = NULL;
     pl_renderer renderer = pl_renderer_create(gpu->log, gpu);
@@ -2382,11 +2394,20 @@ static void test_bt1886_metadata_loss(pl_gpu gpu, struct pl_frame image, bool di
     describing = false;
     wait_prepared(preparation);
     for (int step = 0; step < 3; step++) {
-        image.color.hdr.prim = (present != (step == 1))
-            ? mastering : (struct pl_raw_primaries) {0};
+        if (present != (step == 1)) {
+            image.color.hdr.prim = mastering;
+            if (pq) {
+                image.color.hdr.max_luma = 1000.0f;
+                image.color.hdr.max_cll = 696.0f;
+                image.color.hdr.max_fall = 205.0f;
+            }
+        } else {
+            image.color.hdr = pq ? (struct pl_hdr_metadata) {0} : base_hdr;
+        }
         signature++;
         describing = forbid_compile = true;
-        REQUIRE(pl_renderer_preflight_image_mix(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
+        REQUIRE(pl_renderer_preflight_image_mix(preparation, &mix, &target) ==
+                PL_RENDERER_PREPARE_OK);
         describing = false;
         REQUIRE(pl_render_image_mix_prepared(preparation, &mix, &target) == PL_RENDERER_PREPARE_OK);
         forbid_compile = false;
@@ -2468,9 +2489,12 @@ int main(void)
     pl_tex_destroy(gpu, &previous);
     pl_tex_destroy(gpu, &next);
     test_multiplane_target(gpu, frame(source));
-    for (int direct = 0; direct < 2; direct++)
-        for (int present = 0; present < 2; present++)
-            test_bt1886_metadata_loss(gpu, frame(source), direct, present);
+    for (int pq = 0; pq < 2; pq++)
+        for (int peak = 0; peak <= pq; peak++)
+            for (int direct = 0; direct < 2; direct++)
+                for (int present = 0; present < 2; present++)
+                    test_mastering_metadata_loss(gpu, frame(source), pq, peak,
+                                                 direct, present);
     for (int linear = 0; linear < 2; linear++) {
         test_linear_cache(gpu, false, false, false, linear);
         test_linear_cache(gpu, false, true, false, linear);
